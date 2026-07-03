@@ -10,9 +10,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
 
@@ -25,9 +25,9 @@ jobs:
       matrix:
         project: [common, sorry-tracker, summary, review]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
 
@@ -38,9 +38,9 @@ jobs:
   validate-actions:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
 
@@ -53,6 +53,12 @@ jobs:
         run: |
           for f in triage.md triage_tiered.md summarize_file.md additional_instructions.md synthesize_summary.md; do
             test -f "summary/prompts/$f" || { echo "Missing prompt template: $f"; exit 1; }
+          done
+
+      - name: Verify review prompt templates exist
+        run: |
+          for f in _operating_contract.md analyze_spec.md triage.md review_file.md review_code_with_spec.md cross_file_analysis.md dependent_impact.md verify_finding.md synthesize_summary.md lean4_checklist.md verdict_rules.md; do
+            test -f "review/prompts/$f" || { echo "Missing prompt template: $f"; exit 1; }
           done
 
       - name: Verify action.yml env vars match summary.py expectations
@@ -86,4 +92,44 @@ jobs:
               print(f'FAIL: summary.py reads env vars not provided by action.yml: {missing}')
               exit(1)
           print(f'OK: all {len(read_vars)} env vars summary.py reads are provided by action.yml')
+          "
+
+      - name: Verify action.yml env vars match review.py expectations
+        working-directory: review
+        run: |
+          uv run --frozen python -c "
+          import yaml, re
+
+          with open('action.yml') as f:
+              action = yaml.safe_load(f)
+
+          # The review action runs three scripts across three steps; collect the
+          # env vars provided to any of them.
+          scripts = ('review.py', 'discover_files.py', 'lean_info_extractor.py')
+          steps = action['runs']['steps']
+          env_vars = set()
+          for s in steps:
+              run = s.get('run', '')
+              if any(sc in run for sc in scripts):
+                  env_vars |= set(s.get('env', {}).keys())
+          assert env_vars, 'Could not find any review script step in action.yml'
+
+          # Collect env vars the review scripts read
+          read_vars = set()
+          for sc in scripts:
+              with open(sc) as f:
+                  src = f.read()
+              read_vars |= set(re.findall(r'os\.environ(?:\.get)?\(?[\"\\']([A-Z_]+)', src))
+              read_vars |= set(re.findall(r'os\.getenv\([\"\\']([A-Z_]+)', src))
+              read_vars |= set(re.findall(r'[\"\\']([A-Z_]+)[\"\\'] in os\.environ', src))
+
+          # Optional tuning overrides (read with a default, intentionally not
+          # wired into action.yml) and GitHub Actions runner built-ins are exempt.
+          optional = {'MAX_FILE_REVIEW_CHARS', 'MAX_PROMPT_CHARS', 'CONTEXT_LIMIT', 'BUILD_OUTPUT', 'GITHUB_OUTPUT'}
+
+          missing = read_vars - env_vars - optional
+          if missing:
+              print(f'FAIL: review scripts read env vars not provided by action.yml: {sorted(missing)}')
+              exit(1)
+          print(f'OK: all {len(read_vars - optional)} required env vars the review scripts read are provided by action.yml')
           "

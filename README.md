@@ -33,9 +33,9 @@ endpoint, so you never need per-provider credentials.
    - **PR summaries:** copy the example workflow from
      [`summary/README.md`](summary/README.md#usage) to
      `.github/workflows/pr_summary.yml`.
-   - **AI review:** copy the ready-made
-     [`review/examples/ai-review.yml`](review/examples/ai-review.yml) to
-     `.github/workflows/ai-review.yml`.
+   - **AI review:** copy the recommended combined workflow from
+     [`review/README.md`](review/README.md#recommended-combined-workflow-auto--chatops)
+     to `.github/workflows/ai-review.yml`.
 3. Open a pull request — the summary/review is posted as a PR comment. The
    review can also be re-run on demand by commenting `/review` on the PR.
 

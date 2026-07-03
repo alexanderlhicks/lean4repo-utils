@@ -1,4 +1,4 @@
-# PR Summary Action
+# summary — AI-generated PR summaries for Lean 4 projects
 
 This GitHub Action generates a concise, high-level summary for a pull request using an LLM, accessed through [OpenRouter](https://openrouter.ai). It analyzes the PR's title, body, and git diff to produce a structured summary, and includes special features for analyzing [Lean](https://lean-lang.org/) projects.
 
@@ -68,10 +68,10 @@ jobs:
 1.  **Checkout & Setup:** Checks out the PR code with full Git history and installs [uv](https://docs.astral.sh/uv/) (which provisions Python and the dependencies).
 2.  **Generate Diff:** Computes the merge base between the PR head and base branches, then generates `pr.diff`. The merge base SHA is exported for source-level lookups.
 3.  **Analyze Diff:** The `DiffAnalyzer` parses the full diff to extract statistics, sorry tracking (with source-level declaration attribution), declaration changes, and quality signal warnings. Nested block comments are correctly handled.
-4.  **Triage Files:** A Triage Agent reviews the file list and filters out noise. For large PRs (50+ files), files are classified into high/low priority tiers. Files containing proof-relevant signals are always promoted to high priority.
+4.  **Triage Files:** A Triage Agent reviews the file list and filters out noise. For large PRs (more than 50 files), files are classified into high/low priority tiers. Files containing proof-relevant signals are always promoted to high priority.
 5.  **Parallel Summarization:** Each high-priority file's diff is summarized concurrently by a Summarizer Agent. Cached summaries from previous runs are reused when the diff hash matches. Large individual file diffs are truncated at hunk boundaries.
 6.  **Additional-Instructions Analysis (optional):** If an instructions file is available and the diff is within the analysis size budget, an Additional-Instructions Agent applies those instructions (e.g. a style guide) to the diff concurrently with file summarization.
-7.  **Synthesis:** The Synthesis Agent generates a structured, self-contained overview from per-file summaries, PR title, and body. For very large PRs (40+ summaries), uses two-stage synthesis: per-directory groups first, then global. Files triaged out entirely are still noted, so the file count reconciles and nothing is invisible.
+7.  **Synthesis:** The Synthesis Agent generates a structured, self-contained overview from per-file summaries, PR title, and body. For very large PRs (more than 40 summaries), uses two-stage synthesis: per-directory groups first, then global. Files triaged out entirely are still noted, so the file count reconciles and nothing is invisible.
 8.  **Post Comment:** The final summary (including sorry delta, statistics, declaration changes, quality signals, coverage notes, additional analysis, and per-file summaries) is posted as a PR comment. Declaration and `sorry` listings are grouped by file, sorted deterministically, and capped with an overflow note on very large PRs. The comment body is kept under GitHub's size limit by shedding regenerable content (cache, then per-file summaries) if needed. Previous summary comments are found and updated.
 
 ## Features
@@ -87,7 +87,7 @@ jobs:
     *   **Declaration tracking:** Reports new, removed, and affected declarations.
     *   **Quality signals:** Warns on `admit`, `native_decide`, debug commands (`#check`/`#eval`), and `set_option autoImplicit true` in added lines.
     *   **Issue linking:** Links affected sorries to open GitHub issues labeled `proof wanted`.
-*   **Large-PR Scaling:** For PRs with many files (50+), automatically switches to tiered triage (high/low priority) and two-stage synthesis (per-directory then global). Individual file diffs exceeding the per-file size budget are truncated at a hunk boundary where possible (otherwise at a line boundary), with a coverage note in the output. The additional-instructions analysis is skipped entirely when the overall diff exceeds its size budget, to avoid misleading partial results.
+*   **Large-PR Scaling:** For PRs with many files (more than 50), automatically switches to tiered triage (high/low priority) and two-stage synthesis (per-directory then global, above 40 summaries). Individual file diffs exceeding the per-file size budget are truncated at a hunk boundary where possible (otherwise at a line boundary), with a coverage note in the output. The additional-instructions analysis is skipped entirely when the overall diff exceeds its size budget, to avoid misleading partial results.
 *   **Per-File Summary Caching:** Caches file summaries in a hidden HTML comment on the PR. On subsequent runs (e.g., `synchronize` events), only files whose diffs changed are re-summarized. Cache is invalidated when the model or prompt template changes, and is pruned each run to the files in the current diff so it cannot accumulate stale entries (e.g. from renamed/removed files) and bloat the comment.
 *   **Optional Additional-Instructions Analysis:** Applies deployment-supplied instructions (via `additional_instructions_path`) to the diff — e.g. a style guide such as `CONTRIBUTING.md`, a progress tracker, or any project-specific guidance. The instructions themselves tell the agent what to produce.
 *   **Optional PR Title Validation:** Validates PR titles against conventional commit format (`type[(scope)]: subject`) and uses the parsed type to inform summary structure.
@@ -103,7 +103,7 @@ summary/                   # workspace member of the leanrepo-utils repository
   pyproject.toml           # Project metadata + dependencies (uv workspace member)
   prompts/
     triage.md              # Triage agent: file filtering
-    triage_tiered.md       # Triage agent: high/low priority classification (50+ files)
+    triage_tiered.md       # Triage agent: high/low priority classification (>50 files)
     summarize_file.md          # Summarizer agent: per-file summary generation
     additional_instructions.md # Additional-instructions agent: applies deployment-supplied instructions to the diff
     synthesize_summary.md      # Synthesis agent: self-contained overview from per-file summaries
@@ -124,7 +124,7 @@ The behavior of each AI agent is governed by Markdown prompt templates in the `p
 | Prompt | Agent | Placeholders |
 |--------|-------|-------------|
 | `triage.md` | Triage (normal) | `{{FILE_LIST}}` |
-| `triage_tiered.md` | Triage (50+ files) | `{{FILE_LIST}}` |
+| `triage_tiered.md` | Triage (>50 files) | `{{FILE_LIST}}` |
 | `summarize_file.md` | Summarizer | `{{FILE_PATH}}`, `{{FILE_DIFF}}` |
 | `additional_instructions.md` | Additional-instructions | `{{INSTRUCTIONS_CONTENT}}`, `{{DIFF_CONTENT}}` |
 | `synthesize_summary.md` | Synthesizer | `{{PR_TITLE}}`, `{{PR_BODY}}`, `{{PER_FILE_SUMMARIES}}`, `{{PR_TYPE_HINT}}` |
@@ -146,12 +146,12 @@ Declared in `pyproject.toml` (pinned in the workspace `uv.lock`): `leanrepo-comm
 
 ### CI
 
-The repository includes a CI workflow (`.github/workflows/ci.yml`) that runs:
-- `ruff` linting on `summary.py`
-- `action.yml` YAML validation
-- Prompt template existence checks
-- Env var cross-validation (ensures every env var `summary.py` reads is provided by `action.yml`)
-- Dry-run tests (DiffAnalyzer, split_diff, config fingerprint, title validation, sorry delta)
+The repository's shared CI workflow (`.github/workflows/ci.yml`) runs, on every push and PR:
+- `ruff` linting across the whole repository
+- the unit-test suite per workspace member (`pytest tests/` for `common`, `sorry-tracker`, `summary`, `review`)
+- `action.yml` YAML validation for both actions
+- prompt-template existence checks (including this action's templates)
+- env-var cross-validation — ensures every env var `summary.py` reads is provided by `action.yml` (the review action gets the same check)
 
 ## License
 

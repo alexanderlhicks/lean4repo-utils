@@ -79,17 +79,17 @@ runs:
   using: "composite"
   steps:
     - name: Checkout repository
-      uses: actions/checkout@v6.0.2
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@v8.2.0
       with:
         enable-cache: true
 
     - name: Set up Lean and Build
-      uses: leanprover/lean-action@v1.4.0
+      uses: leanprover/lean-action@v1.5.0
       with:
         build: true
         test: false
@@ -170,7 +170,7 @@ runs:
         echo "$EOF_MARKER" >> $GITHUB_OUTPUT
 
     - name: Post Review
-      uses: actions/github-script@v8
+      uses: actions/github-script@v9
       env:
         REVIEW_TEXT: ${{ steps.run_review.outputs.review_text }}
         ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}

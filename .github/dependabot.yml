@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Keep the GitHub Actions we depend on up to date. Dependabot scans workflow
+  # files in .github/workflows (directory "/") and action manifests; the two
+  # composite actions in this repo live in subdirectories, so those are listed
+  # explicitly alongside "/".
+  - package-ecosystem: "github-actions"
+    directories:
+      - "/"        # .github/workflows/*.yml
+      - "/review"  # review/action.yml
+      - "/summary" # summary/action.yml
+    schedule:
+      interval: "weekly"
+    groups:
+      # Fold routine minor/patch bumps into a single PR; major bumps (which may
+      # carry breaking changes, e.g. actions/checkout v7's fork-PR guard) still
+      # arrive as their own PRs so they can be reviewed and CI-tested in isolation.
+      actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"

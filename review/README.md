@@ -1,8 +1,8 @@
-# AI Code Review Workflow for Lean Projects
+# review — AI code review for Lean 4 pull requests
 
 This GitHub Action provides an AI-powered code review for Pull Requests in Lean 4 projects, with a strong focus on detecting misformalization issues. It reaches any LLM through [OpenRouter](https://openrouter.ai) and analyzes code changes against formal specifications and project dependencies through a multi-agent pipeline.
 
-**Fastest start:** copy [`examples/ai-review.yml`](examples/ai-review.yml) to `.github/workflows/ai-review.yml` in your repository and add an `OPENROUTER_API_KEY` Actions secret. The sections below explain the workflow, every input, and how the pipeline works.
+**Fastest start:** add an `OPENROUTER_API_KEY` Actions secret, then copy the [recommended combined workflow](#recommended-combined-workflow-auto--chatops) below to `.github/workflows/ai-review.yml` in your repository. The sections below explain the workflow, every input, and how the pipeline works.
 
 - [Usage](#usage)
   - [Recommended: Combined Workflow (Auto + ChatOps)](#recommended-combined-workflow-auto--chatops)
@@ -60,7 +60,11 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The budget is mostly for the multi-agent LLM review (many API calls). The
+    # Lean build is quick — lean-action fetches the prebuilt Mathlib cache
+    # (`lake exe cache get`) rather than compiling Mathlib from source. Very
+    # large PRs (many files/dependents) may want 150.
+    timeout-minutes: 120
     permissions:
       contents: read
       pull-requests: write
@@ -85,9 +89,33 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_API_KEY }}
-          # model / verify_model default to open-weight deepseek/deepseek-v4-pro + z-ai/glm-5.2; override with any slug.
+
+          # --- Models (open-weight, a two-family combination) ---------------
+          # These two are the action's DEFAULTS (shown for clarity — you can omit
+          # them). `model` runs the deep agents (spec, per-file review, cross-file,
+          # dependent-impact). `verify_model` is a DIFFERENT family so the
+          # verification pass is an independent check (less self-agreement bias).
+          # Both MUST support tool-calling (for lean_tools) + structured output;
+          # confirm current slugs and the per-model "Tool Call Error Rate" at
+          # https://openrouter.ai/models.
+          model: deepseek/deepseek-v4-pro   # deep agents — top open intelligence, 1M ctx, prompt caching
+          verify_model: z-ai/glm-5.2        # verifier — a top model of a DIFFERENT family
+          # Optional cost tier — light structural agents on a cheaper open model:
+          # triage_model: minimax/minimax-m3
+          # synthesis_model: minimax/minimax-m3
+
           pr_number: ${{ github.event.issue.number || github.event.pull_request.number }}
+
+          # URLs and repo paths mentioned in the /review comment are extracted
+          # into external/spec/repo context automatically; the text itself
+          # reaches the reviewers as focus instructions.
           additional_comments: "${{ steps.get_args.outputs.instructions }}"
+
+          # --- Behaviour ----------------------------------------------------
+          lean_tools: true          # check claims against the real compiler (kills FP typecheck claims)
+          verify_findings: true     # adversarial precision pass
+          # See the "Recommended deployment" section below to tune spec_refs,
+          # escape_hatch_allowlist, and dependent_impact_max by project.
 ```
 
 **Key features of this workflow:**
@@ -148,7 +176,7 @@ jobs:
 
 ### Recommended deployment
 
-A ready-to-use combined (auto + ChatOps) workflow for Mathlib-based Lean 4 projects is in [`examples/ai-review.yml`](examples/ai-review.yml). Its defaults:
+The [combined (auto + ChatOps) workflow above](#recommended-combined-workflow-auto--chatops) is ready to use as-is for Mathlib-based Lean 4 projects. Its defaults:
 
 - **A two-family, open-weight model combination** — the deep agents share a strong `model`, and the verification pass runs on a *different* family (`verify_model`), because an independent, different-family verifier catches false positives a same-model one rationalizes away. (A single model everywhere works and is simpler, but forgoes that benefit; optionally, put the light structural agents — `triage_model`/`synthesis_model` — on a cheaper variant.) Any strong open model qualifies as long as it supports **tool-calling** (for `lean_tools`) and **structured output**; confirm the current slug and the per-model *Tool Call Error Rate* at [openrouter.ai/models](https://openrouter.ai/models). Good open-weight picks as of mid-2026 (pick two *different families* for `model` and `verify_model`): `deepseek/deepseek-v4-pro` (deep agents — top open intelligence, 1M context, prompt caching) and `z-ai/glm-5.2` (verifier — a different top model), with `minimax/minimax-m3` or `deepseek/deepseek-v4-flash` for the optional cheap `triage`/`synthesis` tier. Cheaper strong-agentic verifier alternatives: `xiaomi/mimo-v2.5-pro`, `minimax/minimax-m3`. (`moonshotai/kimi-k2.6` is exceptional at tool-call *throughput* but ranks a notch lower on raw intelligence, so it's a weaker choice for the judgement-heavy verifier.) Avoid `*-max`-style tiers that are proprietary — they aren't open-weight. The pipeline runs tool-calling and structured output in **separate phases**, so it avoids the known issue where models given both at once mis-emit tool arguments.
 - **`lean_tools: true`** — the reviewer/verifier check claims against the real compiler, so "won't typecheck / lemma doesn't exist" claims are grounded, not guessed. Fails open to a tool-free review if the model can't call tools.
@@ -163,7 +191,7 @@ Tune to your project's characteristics:
 | **CI enforces zero `sorry`/`axiom`** | keep the allowlist empty — the strict deterministic verdict aligns with that policy. |
 | bridges **computable representations to Mathlib** (`RingEquiv`/`AlgEquiv`, etc.) | focus the reviewer (via `additional_comments`) on those equivalences — a vacuous or wrong bridge is the central misformalization risk. |
 | has **shared tactics / core definitions** that fan out to many dependent files | raise `dependent_impact_max` so the second-order pass covers the unchanged consumers a change can break. |
-| is **large**, with big PRs and slow Mathlib cold builds | raise `timeout-minutes`; chunked review and budget-guards already handle the size. |
+| is **large**, with big PRs (many files and dependents to review) | raise `timeout-minutes` — the multi-agent review, not the Lean build, is what grows (`lean-action` fetches the prebuilt Mathlib cache, so Mathlib isn't rebuilt). Chunked review and budget-guards already handle the size. |
 
 **Prerequisites & caveats:**
 - **Dependency discovery needs `lake exe graph`** (from `import-graph`, a Mathlib dependency, so it resolves in most Mathlib-based projects — confirm for yours). If missing, discovery and the dependent-impact pass degrade gracefully to changed-files-only.
@@ -213,7 +241,7 @@ Tune to your project's characteristics:
 ## How it Works
 
 1.  **Checkout & Environment Setup:** Fetches full Git history, installs [uv](https://docs.astral.sh/uv/) (which provisions Python), and sets up Lean/Lake via `lean-action`.
-2.  **Build:** Builds the Lean project with `lake build` (with optional linting).
+2.  **Build:** `lean-action` fetches the prebuilt Mathlib cache (`lake exe cache get`, auto-detected) so Mathlib isn't compiled from source, then builds the project's own files with `lake build` (with optional linting).
 3.  **Discover Related Files:** Identifies changed `.lean` files, then uses the Lake dependency graph for BFS-based transitive dependency and dependent discovery. Splits results into full-context and summary-context tiers.
 4.  **Extract Lean Toolchain Info:** Runs `#print axioms` per declaration, scans for `sorry`/`admit`, and captures compiler diagnostics for changed files. Performs lightweight sorry/admit scanning on summary-context overflow files. Operates within a configurable time budget (default 300s).
 5.  **Run Multi-Agent Review Pipeline:**

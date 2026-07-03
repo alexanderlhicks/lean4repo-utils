@@ -1,4 +1,4 @@
-# Lean `sorry` Issue Creator
+# sorry-tracker — GitHub issues for Lean 4 `sorry`s
 
 This script automates the process of finding `sorry` proof obligations in a Lean project, analyzing them with an LLM (any model, via [OpenRouter](https://openrouter.ai)), and creating detailed, context-rich GitHub issues.
 
@@ -121,7 +121,9 @@ The code is organized into focused, independently testable modules:
 
 The pure logic (detection, import resolution, prompt assembly, dedup) is unit-tested
 directly; the `gh` and OpenRouter calls are isolated so the orchestration can be
-tested with mocks. Each module has a matching `tests/test_<module>.py`.
+tested with mocks. Most modules have a matching `tests/test_<module>.py`
+(`test_detection.py`, `test_analysis.py`, `test_github_issues.py`, `test_issues.py`);
+reference fetching is currently exercised indirectly through the orchestration tests.
 
 ## License
 
