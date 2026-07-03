@@ -1,0 +1,43 @@
+[project]
+name = "sorry-tracker"
+version = "0.1.0"
+description = "Automates creating detailed GitHub issues for Lean 'sorry' proofs using an LLM via OpenRouter."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "leanrepo-common",
+    "requests",
+]
+
+[project.scripts]
+sorry-tracker = "issues:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Flat top-level modules (no src/ package dir); list them explicitly.
+include = [
+    "issues.py",
+    "detection.py",
+    "analysis.py",
+    "references.py",
+    "github_issues.py",
+]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+leanrepo-common = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+# Run tests against the source tree at the project root.
+pythonpath = ["."]

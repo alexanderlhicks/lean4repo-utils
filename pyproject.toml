@@ -1,0 +1,21 @@
+[project]
+name = "leanrepo-utils"
+version = "0.1.0"
+description = "Lean 4 repository utilities: PR summary and review GitHub Actions and a sorry-tracker CLI, sharing one OpenRouter LLM layer."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+# Workspace root only: the tools live in the member projects below.
+package = false
+
+[tool.uv.workspace]
+members = ["common", "sorry-tracker", "summary", "review"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "pyyaml",
+]

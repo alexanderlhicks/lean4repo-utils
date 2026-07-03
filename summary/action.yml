@@ -1,0 +1,121 @@
+name: PR Summary Action
+description: 'Generates a summary for a Pull Request'
+inputs:
+  github_token:
+    description: 'GitHub Token for API calls'
+    required: true
+  api_key:
+    description: 'OpenRouter API key'
+    required: true
+  github_repository:
+    description: 'The GitHub repository (e.g., owner/repo)'
+    required: true
+  pr_number:
+    description: 'The Pull Request number'
+    required: true
+  model:
+    description: 'OpenRouter model slug (e.g., anthropic/claude-opus-4.8, google/gemini-3-pro-preview, openai/gpt-5)'
+    required: true
+  lean_keywords:
+    description: 'Comma-separated list of Lean keywords (e.g., theorem, def) to track for declaration changes and sorries'
+    required: false
+    default: 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom'
+  additional_instructions_path:
+    description: 'Optional: Path to a file with deployment-supplied instructions for the analysis agent. Use it for style guides, progress trackers, framework cross-checks, doc/wiki references, or any project-specific guidance the LLM should apply to the PR diff.'
+    required: false
+    default: 'CONTRIBUTING.md'
+  reasoning_effort:
+    description: 'Optional reasoning/thinking effort applied to every model call: low, medium, or high. Empty (default) uses the model default. Ignored by models that do not support reasoning.'
+    required: false
+    default: ''
+  validate_title:
+    description: 'Validate PR title against conventional commit format: type[(scope)]: subject (scope is optional)'
+    required: false
+    default: 'false'
+  upstream_path:
+    description: 'Path prefix for upstream-bound files (e.g., ToMathlib/). If changed files match, a reminder is shown.'
+    required: false
+    default: ''
+  max_file_diff_chars:
+    description: >-
+      Max characters of a single file's diff sent to the summarizer before it
+      is truncated at a hunk boundary (with a coverage note). Rough guide: Lean
+      averages ~50 chars/line and ~4 chars/token, so the 60000 default ≈ ~1200
+      lines ≈ ~15k tokens. Raise to truncate large files less (higher token
+      cost); lower for a smaller-context model.
+    required: false
+    default: '60000'
+  max_instructions_diff_chars:
+    description: >-
+      Max characters of the whole-PR diff sent to the additional-instructions
+      agent in one call; above this the analysis is skipped (a partial result
+      would mislead). Must fit the model's context alongside the instructions
+      file and the response. Rough guide: ~50 chars/line, so the 400000 default
+      ≈ ~8000 changed lines ≈ ~100k tokens (fits a ~128k-token model). Lower for
+      a smaller-context model.
+    required: false
+    default: '400000'
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout PR Code
+      uses: actions/checkout@v6.0.2
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        fetch-depth: 0 # Fetch all history to enable diffing against base
+
+    - name: Mask secrets
+      run: |
+        echo "::add-mask::${{ inputs.api_key }}"
+        echo "::add-mask::${{ inputs.github_token }}"
+      shell: bash
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      run: uv sync --project "${{ github.action_path }}" --no-dev --frozen
+      shell: bash
+
+    - name: Generate diff
+      run: |
+        # Under pull_request_target the checkout is the PR (possibly fork) head;
+        # the base commit is often not in the local object graph, which makes
+        # `git merge-base` fail. Fetch it from origin (the base repo) first,
+        # falling back to the base branch ref.
+        BASE_SHA="${{ github.event.pull_request.base.sha }}"
+        git fetch --no-tags origin "$BASE_SHA" \
+          || git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
+        MERGE_BASE=$(git merge-base "$BASE_SHA" HEAD)
+        echo "MERGE_BASE=$MERGE_BASE" >> "$GITHUB_ENV"
+        git diff "$MERGE_BASE" HEAD > pr.diff
+      shell: bash
+
+    - name: Generate summary
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        API_KEY: ${{ inputs.api_key }}
+        GITHUB_REPOSITORY: ${{ inputs.github_repository }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_LEAN_KEYWORDS: ${{ inputs.lean_keywords }}
+        INPUT_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
+        INPUT_ADDITIONAL_INSTRUCTIONS_PATH: ${{ inputs.additional_instructions_path }}
+        INPUT_VALIDATE_TITLE: ${{ inputs.validate_title }}
+        INPUT_UPSTREAM_PATH: ${{ inputs.upstream_path }}
+        INPUT_MAX_FILE_DIFF_CHARS: ${{ inputs.max_file_diff_chars }}
+        INPUT_MAX_INSTRUCTIONS_DIFF_CHARS: ${{ inputs.max_instructions_diff_chars }}
+        # MERGE_BASE is set in the preceding "Generate diff" step via
+        # `echo "MERGE_BASE=..." >> "$GITHUB_ENV"`. Re-declaring it here
+        # makes the dependency explicit (the CI env-var consistency check
+        # only inspects this env block) and is a runtime no-op.
+        MERGE_BASE: ${{ env.MERGE_BASE }}
+      run: uv run --project "${{ github.action_path }}" --no-dev --frozen python "${{ github.action_path }}/summary.py"
+      shell: bash
+
+    - name: Clean up artifacts
+      if: always()
+      run: rm -f pr.diff
+      shell: bash

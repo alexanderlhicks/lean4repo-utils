@@ -1,0 +1,30 @@
+[project]
+name = "lean-review"
+version = "0.1.0"
+description = "GitHub Action: AI code review for Lean 4 pull requests, via OpenRouter."
+requires-python = ">=3.11"
+dependencies = [
+    "leanrepo-common",
+    "requests",
+    "beautifulsoup4",
+    "pydantic",
+]
+
+[tool.uv]
+# Script-runner action, not an installable package: uv manages the dependency
+# venv only and never tries to build/install this project itself.
+package = false
+
+[tool.uv.sources]
+leanrepo-common = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+# The scripts live at the project root (not an installed package), so put it
+# on sys.path for `uv run pytest`.
+pythonpath = ["."]

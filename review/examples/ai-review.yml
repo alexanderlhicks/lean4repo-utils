@@ -1,0 +1,135 @@
+# Recommended deployment for a Mathlib-based Lean 4 project.
+#
+# Drop this at .github/workflows/ai-review.yml. It runs an automatic review when
+# a PR opens and an on-demand, spec-grounded review when a maintainer comments
+# `/review` (optionally with paper/spec references — see the bottom of this file).
+#
+# Tuning lives in the single `with:` block near the end; the defaults below are
+# sensible for most projects, and the comments call out how to tune by project
+# characteristic. See the README "Recommended deployment" section for details.
+
+name: AI Review
+
+on:
+  pull_request:
+    types: [opened]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Only owners/members/collaborators can trigger (prevents abuse on public repos).
+    if: >-
+      (
+        github.event_name == 'pull_request' &&
+        (
+          github.event.pull_request.author_association == 'OWNER' ||
+          github.event.pull_request.author_association == 'MEMBER' ||
+          github.event.pull_request.author_association == 'COLLABORATOR'
+        )
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/review') &&
+        (
+          github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'COLLABORATOR'
+        )
+      )
+    runs-on: ubuntu-latest
+    # Mathlib-dependent projects build slowly on a cold cache; give the build +
+    # multi-agent review room. Very large projects may want 150.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # Everything after `/review` is freeform: plaintext focus instructions,
+      # and any URLs or repo paths it mentions are picked up as review context
+      # automatically by the action.
+      - name: Extract instructions from /review comment
+        id: get_args
+        if: github.event_name == 'issue_comment'
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          EOF=$(openssl rand -hex 8)
+          {
+            echo "instructions<<$EOF"
+            printf '%s\n' "$COMMENT_BODY" | sed -E '1s|^/review[[:space:]]*||'
+            echo "$EOF"
+          } >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - uses: alexanderlhicks/leanrepo-utils/review@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          api_key: ${{ secrets.OPENROUTER_API_KEY }}
+
+          # --- Models (open-weight, a two-family combination) ---------------
+          # These two are the action's DEFAULTS (shown here for clarity — you can
+          # omit them entirely). `model` runs the deep agents (spec, per-file review, cross-file,
+          # dependent-impact). `verify_model` is a DIFFERENT family so the
+          # verification pass is an independent check (less self-agreement bias).
+          # Both MUST support tool-calling (for lean_tools) + structured output;
+          # confirm current slugs and the per-model "Tool Call Error Rate" at
+          # https://openrouter.ai/models. (Pinned dated variants exist for
+          # reproducibility, e.g. deepseek/deepseek-v4-pro-20260423.)
+          model: deepseek/deepseek-v4-pro        # deep agents — #1 open intelligence, 1M ctx, cheap + prompt caching
+          verify_model: z-ai/glm-5.2             # verifier — a top model of a DIFFERENT family (independent judgement)
+          # Optional cost tier — run the light structural agents on a cheaper open model:
+          # triage_model: minimax/minimax-m3
+          # synthesis_model: minimax/minimax-m3
+          #
+          # Cheaper agentic alternatives for the verifier (open-weight, strong tool use):
+          #   xiaomi/mimo-v2.5-pro  ($0.435/$0.87)  ·  minimax/minimax-m3  ($0.30/$1.20)
+          #   moonshotai/kimi-k2.6  — pick only if you want maximal tool-call throughput over raw intelligence
+
+          pr_number: ${{ github.event.issue.number || github.event.pull_request.number }}
+
+          # --- Grounding (passed through from the /review comment) ----------
+          # URLs and repo paths mentioned in the comment are extracted into
+          # external/spec/repo context automatically; the text itself reaches
+          # the reviewers as focus instructions.
+          additional_comments: "${{ steps.get_args.outputs.instructions }}"
+
+          # --- Behaviour ----------------------------------------------------
+          lean_tools: true          # check claims against the real compiler (kills FP typecheck claims)
+          verify_findings: true     # adversarial precision pass
+          dependency_depth: 2
+
+          # Tune by project characteristic (uncomment as needed):
+          #
+          #   Has a knowledge base / LaTeX blueprint / spec docs, or formalizes papers:
+          #     spec_refs: docs/kb,blueprint/src   # drives the checklist and grounds every reviewer
+          #     (point at whatever your repo maintains: a kb/ of markdown notes,
+          #      a blueprint/ of LaTeX, a references/ of paper PDFs, SPEC.md, ...)
+          #   Native FFI backends that use implemented_by/opaque intentionally:
+          #     escape_hatch_allowlist: implemented_by,opaque
+          #   Shared tactics / core defs fan out to many dependent files:
+          #     dependent_impact_max: 20          # (default 10)
+          #   Computable↔Mathlib bridges (RingEquiv/AlgEquiv): focus the reviewer via additional_comments.
+          #   CI enforces 0 sorry/0 axiom: keep escape_hatch_allowlist empty (strict verdict aligns).
+
+# ---------------------------------------------------------------------------
+# On-demand review — comment `/review` on a PR, optionally followed by anything:
+#
+#   /review Verify the soundness bound in Foo/Bar.lean matches Theorem 5.1 of
+#   https://eprint.iacr.org/2024/XXXX.pdf, and check the error terms compose
+#   correctly across the reduction. Conventions are in CONTRIBUTING.md.
+#
+# The text is freeform. URLs it mentions are fetched as external references,
+# existing repo paths (like references/AGL24.pdf or docs/kb/) are loaded as
+# spec/repo context, and the text itself guides the reviewers. A bare
+# `/review` re-runs the review with no extra context.
+#
+# The project knowledge base belongs in `spec_refs` above (static, applies to
+# every review); the comment is for per-PR extras — the paper being
+# formalized, a file to focus on, or plain instructions.
+# ---------------------------------------------------------------------------

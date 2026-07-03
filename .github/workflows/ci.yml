@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Lint with ruff
+        run: uv run --frozen ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        project: [common, sorry-tracker, summary, review]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Run unit tests
+        working-directory: ${{ matrix.project }}
+        run: uv run --frozen pytest tests/ -q
+
+  validate-actions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Validate action.yml structure
+        run: |
+          uv run --frozen python -c "import yaml; yaml.safe_load(open('summary/action.yml'))"
+          uv run --frozen python -c "import yaml; yaml.safe_load(open('review/action.yml'))"
+
+      - name: Verify summary prompt templates exist
+        run: |
+          for f in triage.md triage_tiered.md summarize_file.md additional_instructions.md synthesize_summary.md; do
+            test -f "summary/prompts/$f" || { echo "Missing prompt template: $f"; exit 1; }
+          done
+
+      - name: Verify action.yml env vars match summary.py expectations
+        working-directory: summary
+        run: |
+          uv run --frozen python -c "
+          import yaml, re
+
+          with open('action.yml') as f:
+              action = yaml.safe_load(f)
+
+          # Collect env vars the action passes to summary.py
+          steps = action['runs']['steps']
+          summary_step = [s for s in steps if 'summary.py' in s.get('run', '')]
+          assert summary_step, 'Could not find summary.py step in action.yml'
+          env_vars = set(summary_step[0].get('env', {}).keys())
+
+          # Collect env vars summary.py reads
+          with open('summary.py') as f:
+              src = f.read()
+          # Match os.environ.get/os.environ[]/os.getenv patterns
+          read_vars = set(re.findall(r'os\.environ(?:\.get)?\(?[\"\\']([A-Z_]+)', src))
+          read_vars |= set(re.findall(r'os\.getenv\([\"\\']([A-Z_]+)', src))
+
+          # GITHUB_TOKEN is checked via 'in os.environ' — also capture that
+          read_vars |= set(re.findall(r'[\"\\']([A-Z_]+)[\"\\'] in os\.environ', src))
+
+          # Every var summary.py reads should be provided by action.yml
+          missing = read_vars - env_vars
+          if missing:
+              print(f'FAIL: summary.py reads env vars not provided by action.yml: {missing}')
+              exit(1)
+          print(f'OK: all {len(read_vars)} env vars summary.py reads are provided by action.yml')
+          "
