@@ -26,6 +26,7 @@ Public surface (kept stable for callers):
 import base64
 import json
 import logging
+import math
 import os
 import threading
 from dataclasses import dataclass
@@ -53,12 +54,67 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Cap on the number of concurrent in-flight API calls across all threads.
-# OpenRouter rate-limits per account; the OpenAI SDK handles 429/Retry-After
-# backoff, this just keeps us from stampeding it. Defaults to 5 to match
-# review.py's default --max-workers, so per-file review threads aren't silently
-# throttled below the pool size. Set LLM_MAX_CONCURRENCY to tune both together.
-_api_semaphore = threading.Semaphore(_env_int("LLM_MAX_CONCURRENCY", 5))
+# Per-attempt request timeout (seconds) applied to the OpenAI/OpenRouter client.
+# OpenRouter documents no server-side timeout, so an unresponsive upstream would
+# otherwise hold a concurrency slot for the SDK default (~10 min). The SDK retries
+# a timed-out attempt up to `max_retries` times *while the slot is held*, so the
+# worst-case slot-hold is timeout * (max_retries + 1). With the defaults below
+# (180 * (2 + 1)) that is ~9 min — bounded, yet generous enough for the slowest
+# legitimate call (large escalated structured outputs, web-search grounding).
+DEFAULT_REQUEST_TIMEOUT = 180.0
+
+# Ceiling on the SDK retry budget. max_retries is the co-equal factor in the
+# worst-case slot-hold (timeout * (max_retries + 1)), so an oversized value would
+# silently defeat the bound the timeout guard protects. Operator-trusted config.
+_MAX_RETRIES_CEILING = 8
+
+# Upper ceiling on any single provider's configured concurrency, so one oversized
+# value can't build a thousand-slot semaphore. NOTE this bounds each provider, not
+# the aggregate: N explicitly-overridden providers can still reach N * ceiling
+# in-flight. timeout/max_concurrency are operator-trusted config only — re-examine
+# this bound before wiring max_concurrency from a leanrepo.toml PR checkout (X2).
+_MAX_CONCURRENCY_CEILING = 32
+
+# Cap on the number of concurrent in-flight API calls. OpenRouter rate-limits per
+# account; the OpenAI SDK handles 429/Retry-After backoff, this just keeps us from
+# stampeding it. Providers that don't pass an explicit `max_concurrency` share one
+# process-wide default semaphore (preserving the historical global cap), sized from
+# LLM_MAX_CONCURRENCY read at *construction* — not at import, so callers that set
+# the env in main() before creating a provider are honored. Default 5 matches
+# review.py's --max-workers. An explicit `max_concurrency` gets its own semaphore.
+_default_semaphore_lock = threading.Lock()
+_default_semaphore = None       # created on first default-provider construction
+_default_semaphore_n = None     # the size the shared default was fixed at
+
+
+def _clamp_concurrency(n) -> int:
+    """Coerce a concurrency value into [1, _MAX_CONCURRENCY_CEILING].
+
+    A floor of 1 is critical: Semaphore(0) would deadlock every API call across
+    every tool. int() truncates a float and raises on a non-numeric value (a
+    hard error is the right response to a malformed operator config).
+    """
+    return max(1, min(int(n), _MAX_CONCURRENCY_CEILING))
+
+
+def _resolve_concurrency(max_concurrency):
+    """Return (resolved_int, semaphore) for a provider.
+
+    Explicit override → its own semaphore. Otherwise → the shared process-wide
+    default, sized from LLM_MAX_CONCURRENCY at the first default-provider
+    construction (subsequent default providers reuse that same object, so the
+    global cap is preserved rather than multiplied per instance).
+    """
+    global _default_semaphore, _default_semaphore_n
+    if max_concurrency is not None:
+        n = _clamp_concurrency(max_concurrency)
+        return n, threading.Semaphore(n)
+    n = _clamp_concurrency(_env_int("LLM_MAX_CONCURRENCY", 5))
+    with _default_semaphore_lock:
+        if _default_semaphore is None:
+            _default_semaphore = threading.Semaphore(n)
+            _default_semaphore_n = n
+        return _default_semaphore_n, _default_semaphore
 
 # Tool-calling loop bounds (used only when an agent is given tools).
 DEFAULT_MAX_TOOL_ROUNDS = 4      # model↔tool exchanges before forcing the answer
@@ -88,6 +144,14 @@ class TokenUsage:
     thinking_tokens: int = 0
     cached_tokens: int = 0
     cost: float = 0.0
+    # Fail-CLOSED integrity signal for spend control (C3): True whenever a
+    # completion returned but reported no usable cost figure (absent usage block,
+    # or a missing/non-numeric/negative/NaN cost) — independent of token count. An
+    # explicit finite 0.0 (a `:free` model) is KNOWN and does not set this. Cost
+    # alone can't distinguish "genuinely free" from "cost unknown", so downstream
+    # aggregate caps must be able to tell the difference rather than silently
+    # under-counting to $0 on exactly the untrusted PRs the spend cap exists to bound.
+    cost_missing: bool = False
 
 
 def _sum_usage(a: "TokenUsage", b: "TokenUsage") -> "TokenUsage":
@@ -98,6 +162,7 @@ def _sum_usage(a: "TokenUsage", b: "TokenUsage") -> "TokenUsage":
         thinking_tokens=a.thinking_tokens + b.thinking_tokens,
         cached_tokens=a.cached_tokens + b.cached_tokens,
         cost=a.cost + b.cost,
+        cost_missing=a.cost_missing or b.cost_missing,
     )
 
 
@@ -116,7 +181,7 @@ class OpenRouterProvider:
         self,
         api_key: str,
         *,
-        max_retries: int = 4,
+        max_retries: int = 2,
         max_tokens: int = 16384,
         reasoning_default: Optional[dict] = None,
         require_parameters: bool = False,
@@ -125,10 +190,40 @@ class OpenRouterProvider:
         length_retry_attempts: int = 2,
         length_retry_max_tokens: int = 65536,
         enable_web_search: bool = False,
+        timeout: Optional[float] = None,
+        max_concurrency: Optional[int] = None,
     ):
         from openai import OpenAI
 
         self.max_tokens = max_tokens
+        # Per-attempt request timeout (see DEFAULT_REQUEST_TIMEOUT). The worst-case
+        # concurrency-slot hold is timeout * (max_retries + 1) because the SDK
+        # retries a timed-out attempt while the semaphore is held; max_retries is
+        # kept low (2) so that product stays ~9 min. `timeout` is operator-trusted
+        # config only — never sourced from an untrusted PR checkout.
+        # Only a finite, positive number is a usable timeout. A non-positive value
+        # (0 → httpx immediate expiry) or a non-finite one (inf/NaN → silently
+        # defeats the slot-hold bound) falls back to the default rather than let a
+        # mistyped config value brick the provider or disable the DoS mitigation.
+        self.timeout = (
+            timeout
+            if (isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+                and math.isfinite(timeout) and timeout > 0)
+            else DEFAULT_REQUEST_TIMEOUT
+        )
+        # Clamp the retry budget: it is the co-equal factor in the worst-case
+        # slot-hold, ~= self.timeout * (self.max_retries + 1) (the SDK retries a
+        # timed-out attempt while the concurrency slot is held), so an oversized or
+        # negative value must not silently defeat the bound the timeout guard
+        # protects. The bound EXCLUDES inter-retry backoff / Retry-After sleeps
+        # (also held) and httpx applies `timeout` per read, not per whole request,
+        # so it is a rough upper bound.
+        self.max_retries = max(0, min(int(max_retries), _MAX_RETRIES_CEILING))
+        # Resolve concurrency at construction (not import): a shared process-wide
+        # default sized from LLM_MAX_CONCURRENCY, or a dedicated semaphore for an
+        # explicit override. self._max_concurrency is the introspectable size;
+        # self._api_semaphore is what the generation paths acquire.
+        self._max_concurrency, self._api_semaphore = _resolve_concurrency(max_concurrency)
         # Opt-in web-search grounding via OpenRouter's `web` plugin: lets agents
         # look up definitions/results they aren't otherwise given, and returns
         # citations. Off by default (adds cost).
@@ -158,7 +253,8 @@ class OpenRouterProvider:
         self.client = OpenAI(
             base_url=OPENROUTER_BASE_URL,
             api_key=api_key,
-            max_retries=max_retries,  # SDK retries 429/5xx, honoring Retry-After
+            max_retries=self.max_retries,  # clamped; SDK retries 429/5xx/timeout, honoring Retry-After
+            timeout=self.timeout,     # per-attempt; bounds a stuck upstream (C2)
             default_headers=default_headers,
         )
 
@@ -207,6 +303,14 @@ class OpenRouterProvider:
 
     def _build_extra_body(self, thinking_budget: Optional[int], has_pdf: bool, healing: bool = True) -> dict:
         extra_body: dict = {}
+        # Request usage accounting. Per the OpenRouter usage-accounting docs
+        # (https://openrouter.ai/docs/api/reference/overview, fetched 2026-07-06)
+        # this flag is now DEPRECATED and a no-op: `cost` and the token details are
+        # returned on every response automatically. We still set it for literal
+        # forward/backward-compatibility, but it is NOT what makes cost non-zero —
+        # `_usage_from` reading the response `cost` field is. Real cost is proven by
+        # the OPENROUTER_API_KEY-gated live test, since no mock can validate this.
+        extra_body["usage"] = {"include": True}
         if self.require_parameters:
             extra_body["provider"] = {"require_parameters": True}
 
@@ -283,7 +387,7 @@ class OpenRouterProvider:
         max_tokens = self._max_tokens_for(thinking_budget)
         completion = None
         for attempt in range(self.length_retry_attempts + 1):
-            with _api_semaphore:
+            with self._api_semaphore:
                 try:
                     completion = self._parse(
                         model=model,
@@ -293,6 +397,14 @@ class OpenRouterProvider:
                         extra_body=extra_body,
                     )
                 except _LENGTH_ERRORS as e:
+                    # A truncated attempt is still a real, billed generation (it
+                    # produced a full max_tokens of output). Account for its usage
+                    # before escalating so large-output spend isn't silently dropped
+                    # from the returned total. The error carries the completion; if
+                    # usage is absent, _usage_from fails closed (cost_missing).
+                    truncated = getattr(e, "completion", None)
+                    if truncated is not None:
+                        usage_total = _sum_usage(usage_total, self._usage_from(truncated))
                     # Truncated before complete structured output. Retry with a
                     # larger cap so the review's findings aren't lost wholesale.
                     if attempt >= self.length_retry_attempts or max_tokens >= self.length_retry_max_tokens:
@@ -341,7 +453,7 @@ class OpenRouterProvider:
         total_calls = 0
 
         for _round in range(max_rounds):
-            with _api_semaphore:
+            with self._api_semaphore:
                 completion = self.client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -399,7 +511,7 @@ class OpenRouterProvider:
         messages = [{"role": "user", "content": blocks}]
         extra_body = self._build_extra_body(thinking_budget, has_pdf, healing=False)
 
-        with _api_semaphore:
+        with self._api_semaphore:
             completion = self.client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -419,18 +531,51 @@ class OpenRouterProvider:
 
     @staticmethod
     def _usage_from(completion) -> TokenUsage:
+        # Only ever called on a completion that actually returned, so a real
+        # generation always happened here. If no usage block came back at all, the
+        # cost is *unknown* — fail CLOSED so the aggregate spend cap (C3) can't be
+        # tricked into recording hidden spend as a known $0.
         usage = getattr(completion, "usage", None)
         if usage is None:
-            return TokenUsage()
+            logging.warning(
+                "OpenRouter completion carried no usage block; treating its cost as "
+                "unknown for spend control."
+            )
+            return TokenUsage(cost_missing=True)
         data = usage.model_dump() if hasattr(usage, "model_dump") else dict(usage)
         completion_details = data.get("completion_tokens_details") or {}
         prompt_details = data.get("prompt_tokens_details") or {}
+        input_tokens = data.get("prompt_tokens", 0) or 0
+        output_tokens = data.get("completion_tokens", 0) or 0
+        # Cost is KNOWN only when a finite, non-negative numeric figure is present
+        # (an explicit 0.0 — e.g. a `:free` model — is known-free). Everything else
+        # on a real generation is UNKNOWN → fail closed: a missing, non-numeric,
+        # negative, or NaN cost, and a degenerate/empty usage block, all read
+        # cost_missing=True (symmetric with the usage-None path above). bool is
+        # excluded (it is an int subclass). The magnitude is clamped to 0 so a bogus
+        # negative can never reduce the running aggregate the spend cap depends on.
+        raw_cost = data.get("cost")
+        cost_present = (
+            isinstance(raw_cost, (int, float))
+            and not isinstance(raw_cost, bool)
+            and math.isfinite(raw_cost)
+            and raw_cost >= 0.0
+        )
+        cost = float(raw_cost) if cost_present and raw_cost > 0 else 0.0
+        cost_missing = not cost_present
+        if cost_missing:
+            logging.warning(
+                "OpenRouter usage reported %d prompt + %d completion tokens but no usable "
+                "cost figure; treating this generation's cost as unknown for spend control.",
+                input_tokens, output_tokens,
+            )
         return TokenUsage(
-            input_tokens=data.get("prompt_tokens", 0) or 0,
-            output_tokens=data.get("completion_tokens", 0) or 0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             thinking_tokens=completion_details.get("reasoning_tokens", 0) or 0,
             cached_tokens=prompt_details.get("cached_tokens", 0) or 0,
-            cost=data.get("cost", 0.0) or 0.0,
+            cost=cost,
+            cost_missing=cost_missing,
         )
 
 
@@ -439,7 +584,19 @@ LLMProvider = OpenRouterProvider
 
 
 def create_provider(api_key: str, **kwargs) -> OpenRouterProvider:
-    """Create the OpenRouter-backed LLM provider."""
+    """Create the OpenRouter-backed LLM provider.
+
+    Extra keyword arguments are forwarded to ``OpenRouterProvider``. Notably:
+
+    - ``timeout`` (float, seconds): per-attempt request timeout. Defaults to
+      ``DEFAULT_REQUEST_TIMEOUT``. Worst-case slot-hold is ``timeout * (max_retries + 1)``.
+    - ``max_concurrency`` (int): in-flight-call cap for this provider. Omit to
+      share the process-wide default sized from ``LLM_MAX_CONCURRENCY`` (read at
+      construction); pass a value to give this provider its own semaphore.
+
+    ``timeout`` and ``max_concurrency`` are operator-trusted configuration — do
+    not source them from an untrusted PR checkout.
+    """
     if not api_key:
         raise ValueError("An OpenRouter API key is required.")
     return OpenRouterProvider(api_key=api_key, **kwargs)
