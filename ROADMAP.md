@@ -192,7 +192,62 @@ Everything imports `common`, so its bugs are everyone's bugs. Land this first.
 - **Acceptance:** test proves the per-run ceiling trips and degrades gracefully;
   test proves usage from completed tool rounds is counted even when a subsequent
   round raises; test proves a 402/quota failure is surfaced (not swallowed).
-- **Depends on:** C1 (cost signal — code landed; live-cost proof pending credits).
+- **Depends on:** C1 — **DONE** (cost signal landed + live-verified $0.000124,
+  merged to `main` in PR #1 alongside C2).
+
+#### Gate-1 APPROVED (2026-07-07) — execute in a fresh session
+
+Plan gate passed (session-runner PLAN mode); maintainer approved **full scope in
+one session**, on working branch **`session-2-c3`** (off `main` @ 4ef9174; the
+lean product PR excludes the planning docs + runner). Execution checklist lives in
+the tracked tasks; the resolved adversarial findings that MUST shape the code:
+
+- **R1 — loud ≠ exit code.** Default loud signal = a posted banner + a
+  non-Approved verdict + a GH `::error::` annotation (job stays green). Non-zero
+  exit only behind an explicit opt-in env (default **off**); document "do not set
+  as a required check if the loud-exit is enabled." No `sys.exit()` inside a
+  `finally` (it masks tracebacks and, in `review/action.yml`, kills the comment).
+- **R2 — record usage on EVERY completion via ONE authoritative sink.** The draft
+  recorded only inside `_gather_with_tools`, so `summary`'s tool-less
+  `generate_structured` never accumulated and the ceiling could never trip. Record
+  `self._usage_from(completion)` after each `create`/`_parse` on ALL paths (each
+  tool round, the phase-2 structured parse, `generate_text`); derive the returned
+  per-call `TokenUsage` from the same values — never re-record the aggregate.
+- **R3 — invert the fail-open default.** Add `_reraise_if_fatal(e)` (re-raises
+  `BudgetExceededError` and `is_hard_llm_failure(e)`) as the FIRST line of every
+  LLM-touching broad `except Exception` in `review.py` (triage/spec/cross-file/
+  dependent/synthesis/verify/per-file) and `summary.py` (triage/sub-synthesis/
+  per-file/synthesis). EXCLUDE comment/annotation-write and URL/doc-read sites.
+- **R4 — one graceful contract.** Budget trip mid-tool-loop → break + exactly ONE
+  final phase-2 answer from gathered evidence (bounded overshoot); only a
+  fresh-entry-already-over budget raises `BudgetExceededError` before any call.
+- **R5 — gate on FRESH success.** The loud-failure trigger counts fresh (non-cache,
+  non-fallback) successful generations vs hard-LLM failures — a cache hit must not
+  suppress the banner in an all-402 run.
+- **R6 — no exception bodies in public output.** Drop `{exc}`/`{e}` interpolation
+  from PR-visible comments (`summary.py:~1249`, `review.py:~2245`); generic label
+  in the comment, full detail server-side only.
+- **R7 — wire it, don't ship it dark.** Add `LLM_MAX_RUN_COST`/`LLM_MAX_RUN_TOKENS`
+  (+ the loud-exit opt-in) as inputs to BOTH `summary/action.yml` and
+  `review/action.yml`, sourced from workflow/secrets ONLY (never the PR checkout);
+  add `if: always()` to review's Post-Review step so the banner posts on a
+  non-green run.
+- **R8 — token ceiling is authoritative.** Reject a cost-only budget (`max_cost`
+  without `max_tokens`) at construction; the token cap is the trustworthy bound
+  (BYOK `cost` may be fee-only/absent). `cost_missing` sets a sticky
+  `cost_unreliable`; warn if it flips under an active cost cap.
+- **R9 — no Approve on total outage.** Set `review_incomplete` at the ORCHESTRATION
+  level on any hard-LLM failure / empty-due-to-failure, so `compute_deterministic_verdict`
+  cannot Approve an all-402 run.
+
+New primitives in `common`: `RunBudget` (thread-safe, token-authoritative,
+`cost_reliable`, rejects cost-only), `BudgetExceededError(.usage)`,
+`is_hard_llm_failure(exc)` (401/402/403 or Auth/PermissionDenied or a
+credit/quota/payment message substring; 429/timeout/5xx are NOT hard). Seed
+`_bare_provider` with a disabled budget. Docs (STEP 10): key limits = hard cap,
+BYOK cost caveat, and the honest soft-bound note (the ceiling caps extra *rounds*,
+not ~`max_workers` in-flight maximal calls). Full step-by-step + test list is in
+the PLAN-gate output; re-run the runner PLAN mode if that context is lost.
 
 ### C4 · Lean source-scanning correctness  — `TODO` · effort M · P1
 - **Need:** silent false negatives/positives in the shared scanners corrupt every

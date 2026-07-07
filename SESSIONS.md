@@ -271,6 +271,12 @@ met — keep coupled items (e.g. S1+S2) in a single session/commit. 64 sessions 
 
 ---
 
+## Progress
+- **Session 1 (C1, C2)** — ✅ **DONE**, merged to `main` in PR #1 (`4ef9174`); C1
+  live-verified ($0.000124). Reviewed across three adversarial passes.
+- **Session 2 (C3)** — Gate-1 **APPROVED** (full scope, one session); ready to
+  execute on branch `session-2-c3`. Approved plan + R1–R9 in [`ROADMAP.md`](ROADMAP.md) C3.
+
 ## Recommended start
 Sessions **1 → 2 → 3 → 4** (Wave 0), then **6** (the security blocker). Session 11
 (spine) can begin any time and should land before Wave 3 so tool fixes adopt the
