@@ -28,13 +28,28 @@ from leanrepo_common.lean_utils import is_in_comment, file_path_to_module_name
 
 provider = create_provider(api_key)                 # OPENROUTER_API_KEY
 parsed, usage = provider.generate_structured(
-    model, [ContentPart(type="text", text=prompt)], schema,
+    model, [ContentPart(type="text", data=prompt)], schema,
 )
 ```
 
-`generate_structured` returns a validated Pydantic instance plus a `TokenUsage`.
-The public surface (`ContentPart`, `TokenUsage`, `OpenRouterProvider`,
-`create_provider`) is kept stable for callers.
+`ContentPart`'s payload field is `data` (not `text`). `generate_structured`
+returns a validated Pydantic instance plus a `TokenUsage` — whose `cost` is the
+real per-generation spend (OpenRouter returns it automatically) and whose
+`cost_missing` flag is `True` whenever a completion returned but reported no usable
+cost figure (an explicit `0.0` from a `:free` model is treated as known), so spend
+control can fail closed instead of silently counting $0. The public surface
+(`ContentPart`, `TokenUsage`, `OpenRouterProvider`, `create_provider`) is kept
+stable for callers.
+
+`create_provider` also accepts two operator-trusted tuning knobs (**never source
+them from an untrusted PR checkout**):
+
+- `timeout` (seconds, default 180) — per-attempt request timeout. The worst-case
+  time a call holds a concurrency slot is `timeout * (max_retries + 1)`.
+- `max_concurrency` — cap on in-flight API calls for this provider. Omit it to
+  share a **process-wide** default sized from the `LLM_MAX_CONCURRENCY` env var
+  (read when the first *default* provider is constructed, default 5); pass a value
+  to give the provider its own independent limit.
 
 ## Development
 
