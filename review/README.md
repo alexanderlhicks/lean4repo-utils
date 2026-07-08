@@ -85,7 +85,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - uses: alexanderlhicks/leanrepo-utils/review@main
+      - uses: alexanderlhicks/lean4repo-utils/review@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_API_KEY }}
@@ -166,7 +166,7 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: alexanderlhicks/leanrepo-utils/review@main
+      - uses: alexanderlhicks/lean4repo-utils/review@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_API_KEY }}

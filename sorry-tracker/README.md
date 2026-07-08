@@ -40,7 +40,7 @@ This rich context is then sent to the model via OpenRouter, which generates a de
 
 ```bash
 # Clone the leanrepo-utils repository (sorry-tracker lives in its sorry-tracker/ member)
-git clone https://github.com/alexanderlhicks/leanrepo-utils.git
+git clone https://github.com/alexanderlhicks/lean4repo-utils.git
 cd leanrepo-utils/sorry-tracker
 
 # Sync dependencies (optional, checks setup)
