@@ -1,4 +1,4 @@
-# leanrepo-utils
+# lean4repo-utils
 
 [![CI](https://github.com/alexanderlhicks/lean4repo-utils/actions/workflows/ci.yml/badge.svg)](https://github.com/alexanderlhicks/lean4repo-utils/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -60,7 +60,7 @@ any OpenRouter slug can be substituted.
 
 ```bash
 git clone https://github.com/alexanderlhicks/lean4repo-utils.git
-cd leanrepo-utils/sorry-tracker
+cd lean4repo-utils/sorry-tracker
 
 export OPENROUTER_API_KEY=sk-or-...
 uv run sorry-tracker --repo-path /path/to/your/lean/project --dry-run

@@ -97,7 +97,7 @@ jobs:
 ## Project Structure
 
 ```
-summary/                   # workspace member of the leanrepo-utils repository
+summary/                   # workspace member of the lean4repo-utils repository
   action.yml               # GitHub Actions composite action definition
   summary.py               # Main summary orchestration (multi-agent pipeline)
   pyproject.toml           # Project metadata + dependencies (uv workspace member)

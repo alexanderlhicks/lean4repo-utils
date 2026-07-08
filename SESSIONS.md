@@ -1,4 +1,4 @@
-# leanrepo-utils — session plan & execution protocol
+# lean4repo-utils — session plan & execution protocol
 
 Companion to [`ROADMAP.md`](ROADMAP.md). ROADMAP says *what* and *why* (with
 `file:line` refs, acceptance criteria, prior art). This doc says *how we work*:
@@ -274,8 +274,21 @@ met — keep coupled items (e.g. S1+S2) in a single session/commit. 64 sessions 
 ## Progress
 - **Session 1 (C1, C2)** — ✅ **DONE**, merged to `main` in PR #1 (`4ef9174`); C1
   live-verified ($0.000124). Reviewed across three adversarial passes.
-- **Session 2 (C3)** — Gate-1 **APPROVED** (full scope, one session); ready to
-  execute on branch `session-2-c3`. Approved plan + R1–R9 in [`ROADMAP.md`](ROADMAP.md) C3.
+- **Session 2 (C3)** — 🚧 **WIP** on branch `session-2-c3`. Re-gated 2026-07-08
+  (GO on the *corrected* plan). Common-layer **[1/2] committed** (`d64432f`, 159
+  tests green). **[2/2] remains**: tool-layer wiring + `action.yml` + live DoD tests
+  (need `OPENROUTER_API_KEY`). Corrected 13-step spec is the PLAN-gate output; the
+  step checklist + corrected site inventory live in project memory. Repo folder was
+  renamed to `lean4repo-utils` to match the GitHub slug.
+
+### Deployment-readiness of the review workflow (priority thread, decided 2026-07-08)
+The fleet still runs the *old* split Gemini actions; nothing consumes the
+consolidated `review/`+`summary/` yet. Chosen path: **full-security-first** —
+C3 → full **Session 6 (S1+S2 together)** → **dogfood on `lean4repo-utils` itself**
+→ then point fleet repos at it (Session 13, still needs go-ahead). S1 is *not*
+decoupled for an early trusted-author-only ship. R2 (idempotent/dedupe review) is a
+fast-follow. New security item **S7** (sandbox `lean_tools`) was found during C3 and
+added to M1.
 
 ## Recommended start
 Sessions **1 → 2 → 3 → 4** (Wave 0), then **6** (the security blocker). Session 11

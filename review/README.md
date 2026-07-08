@@ -301,7 +301,7 @@ Model capabilities (which slugs support `response_format`, `reasoning`, etc.) ca
 ## Project Structure
 
 ```
-review/                       # workspace member of the leanrepo-utils repository
+review/                       # workspace member of the lean4repo-utils repository
   action.yml                  # GitHub Actions composite action definition
   review.py                   # Main review orchestration (multi-agent pipeline)
   discover_files.py           # Dependency discovery via lake graph (BFS)

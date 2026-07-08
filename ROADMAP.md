@@ -1,4 +1,4 @@
-# leanrepo-utils — action plan & roadmap
+# lean4repo-utils — action plan & roadmap
 
 Plan of record for improving the three existing utilities and growing the set.
 Derived from (1) a per-package code review, (2) a survey of how a real large Lean
@@ -159,7 +159,19 @@ Everything imports `common`, so its bugs are everyone's bugs. Land this first.
 - **Acceptance:** timeout is set by default and overridable; concurrency no longer
   a module global; tests cover both.
 
-### C3 · Per-run cost/token ceiling + graceful degradation + usage accounting  — `TODO` · effort M · P0
+### C3 · Per-run cost/token ceiling + graceful degradation + usage accounting  — `WIP` · effort M · P0
+> **Progress (2026-07-08):** plan **re-gated** (full session-runner PLAN, GO on the
+> *corrected* plan — the draft's `summary.py` R3 site list was inverted, R3 re-raises
+> needed a top-level catch, `LLM_LOUD_EXIT` needed `sys.exit(main())` + a heredoc
+> rc-capture in `review/action.yml`, and review-side `::error::` must come from the
+> shell step). Common-layer **[1/2] committed** (`d64432f`): `RunBudget`,
+> `BudgetExceededError`, `is_hard_llm_failure`, `_reraise_if_fatal`, `TokenUsage.byok`,
+> the single `_record_usage` sink, fresh-entry raise, mid-loop break, mid-raise usage
+> survival, length-retry budget guard — 28 tests, 159 pass/1 live-skip, ruff clean.
+> **Remaining [2/2]:** tool-layer wiring (R3/containment/loud-on-402/R6 leak sweep in
+> `review.py`+`summary.py`, `action.yml` plumbing + security hardenings), STEP 9 live
+> DoD tests (need `OPENROUTER_API_KEY`), docs, REVIEW gate, close-out. BYOK deferred
+> item **resolved** (fee-only `cost`; `is_byok`/`cost_details.upstream_inference_cost`).
 - **Rescoped (2026-07-07):** the *hard* account/per-key spend cap belongs on
   OpenRouter (per-key credit limits + account balance are server-side and
   bug-proof — verified: they return `402` when depleted), so we **wrap, don't
@@ -348,6 +360,24 @@ checkout bug currently masks.
 - **Actions:** add a security section to the READMEs: the two-stage pattern, when
   secrets are/aren't present, chatops authorization, safe example workflows.
 - **Refs:** [GitHub Security Lab](https://securitylab.github.com/resources/github-actions-new-patterns-and-mitigations/).
+
+### S7 · Sandbox `lean_tools` model-directed Lean execution  — `TODO` · effort M · P1
+- **Found during C3 (2026-07-08), out of that scope; recorded here.** The review
+  reviewer/verifier agents can run model-chosen Lean code via `lean_typecheck`
+  (`lake env lean --stdin`), which is arbitrary IO (filesystem/network) directed by
+  a model that has ingested untrusted PR content. `_scrubbed_env()` removes secrets
+  from the child env, but the checkout's `GITHUB_TOKEN` persists in `.git/config`
+  and the process cwd is the repo, so exfiltration/tampering surface remains.
+- **Shipped now as touched-file hardenings in C3 [2/2]** (not full mitigation):
+  `persist-credentials: false` on the review checkout, a startup delete of any
+  pre-existing `review_annotations.json`/`review_comments.json`, and a README
+  warning not to wire the action under `pull_request_target` with a privileged
+  token until this lands.
+- **Actions (this item):** run model-directed Lean in a network-denied, cwd-pinned
+  sandbox with a scrubbed `.git/config`; treat all tool output as data. Composes
+  with S2's two-stage split.
+- **Files:** `review/lean_tools.py`, `review/action.yml`.
+- **Depends on / relates to:** S2.
 
 ---
 
@@ -578,7 +608,7 @@ capability (M2–M6) plugs into them.
   repo (e.g. `leanrepo.toml`) that all tools read: model slugs, spend caps, area
   path→label map, warning budget, sorry policy, citation/KB toggles. Replaces
   scattered per-action inputs. (Enables principle #6.)
-- **X3 · One-command bootstrapper** `TODO` · L · P1 — `leanrepo-utils init`
+- **X3 · One-command bootstrapper** `TODO` · L · P1 — `lean4repo-utils init`
   inspects a target repo (lakefile, layout, blueprint presence) and drops in the
   right workflow files + a starter `leanrepo.toml`; `--check`/`--update` modes for
   keeping several repos in sync. The core "one-stop shop" feature.
