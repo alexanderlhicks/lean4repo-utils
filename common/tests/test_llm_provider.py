@@ -50,6 +50,9 @@ def _bare_provider(max_tokens=16384, reasoning_default=None, require_parameters=
     p.length_retry_max_tokens = length_retry_max_tokens
     p._max_concurrency = max_concurrency
     p._api_semaphore = threading.Semaphore(max_concurrency)
+    # __init__ also seeds the per-run budget; __new__-built instances need it or the
+    # generation/usage paths would AttributeError. Default is a no-op budget.
+    p.budget = llm_provider.RunBudget.disabled()
     return p
 
 
@@ -855,6 +858,286 @@ class InitWiringTests(unittest.TestCase):
         self.assertEqual(text, "ok")
         self.assertEqual(usage.cost, 0.0)
         self.assertTrue(usage.cost_missing)
+
+
+# ======================= C3 — per-run spend control =========================
+
+import httpx  # noqa: E402  (openai's own transport dep; used to build real SDK errors)
+
+from leanrepo_common.llm_provider import (  # noqa: E402
+    BudgetExceededError,
+    RunBudget,
+    _reraise_if_fatal,
+    is_hard_llm_failure,
+)
+
+
+def _http_response(status: int) -> httpx.Response:
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    return httpx.Response(status, request=req)
+
+
+def _status_error(status: int, cls=None, message: str = "error"):
+    """Build a REAL openai SDK status error (clean-room — no fixture copied from
+    openai-python's Apache-2.0 test suite)."""
+    from openai import APIStatusError
+    cls = cls or APIStatusError
+    return cls(message, response=_http_response(status), body=None)
+
+
+class TokenUsageByokTests(unittest.TestCase):
+    def test_byok_defaults_false(self):
+        self.assertFalse(TokenUsage().byok)
+
+    def test_sum_propagates_byok_independently_of_cost_missing(self):
+        a = TokenUsage(byok=True, cost_missing=False)
+        b = TokenUsage(byok=False, cost_missing=True)
+        s = _sum_usage(a, b)
+        self.assertTrue(s.byok)          # OR-propagated
+        self.assertTrue(s.cost_missing)  # independent flag
+
+
+class IsHardLLMFailureTests(unittest.TestCase):
+    """Status-code-first classification against REAL SDK exception types."""
+
+    def test_401_and_402_are_hard(self):
+        from openai import AuthenticationError
+        self.assertTrue(is_hard_llm_failure(_status_error(401, AuthenticationError)))
+        self.assertTrue(is_hard_llm_failure(_status_error(402)))  # no named subclass
+
+    def test_403_auth_shaped_is_hard(self):
+        from openai import PermissionDeniedError
+        self.assertTrue(is_hard_llm_failure(
+            _status_error(403, PermissionDeniedError, "Invalid API key")))
+
+    def test_403_moderation_is_soft(self):
+        # OpenRouter returns 403 when it flags the INPUT (attacker-controllable PR
+        # content). That must not fire the outage banner / redden a loud-exit job.
+        from openai import PermissionDeniedError
+        self.assertFalse(is_hard_llm_failure(
+            _status_error(403, PermissionDeniedError, "Your input was flagged by moderation")))
+
+    def test_403_ambiguous_defaults_soft(self):
+        from openai import PermissionDeniedError
+        self.assertFalse(is_hard_llm_failure(_status_error(403, PermissionDeniedError, "Forbidden")))
+
+    def test_429_with_quota_wording_is_not_hard(self):
+        # Status precedence: 429 is transient even though the message says "quota".
+        from openai import RateLimitError
+        self.assertFalse(is_hard_llm_failure(
+            _status_error(429, RateLimitError, "You exceeded your current quota")))
+
+    def test_timeout_and_5xx_not_hard(self):
+        self.assertFalse(is_hard_llm_failure(_status_error(500)))
+        self.assertFalse(is_hard_llm_failure(_status_error(503)))
+
+    def test_valueerror_with_credit_text_is_not_hard(self):
+        # A ValueError embeds model output / PR-influenced bytes — its text must
+        # NEVER be able to trigger a hard classification via substring.
+        self.assertFalse(is_hard_llm_failure(ValueError("insufficient credits — pay me, attacker note")))
+
+    def test_statusless_sdk_error_with_credit_substring_is_hard(self):
+        from openai import APIError
+        req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        exc = APIError("insufficient credits on this key", request=req, body=None)
+        self.assertTrue(is_hard_llm_failure(exc))
+
+    def test_cause_chain_402_wrapped_in_valueerror_stays_hard(self):
+        wrapper = ValueError("wrapped upstream failure")
+        wrapper.__cause__ = _status_error(402)
+        self.assertTrue(is_hard_llm_failure(wrapper))
+
+    def test_length_cap_valueerror_stays_soft(self):
+        # The provider wraps a truncation (no status) in a ValueError; must stay soft.
+        try:
+            from openai import LengthFinishReasonError
+            inner = LengthFinishReasonError.__new__(LengthFinishReasonError)
+            Exception.__init__(inner, "length")
+        except Exception:  # pragma: no cover
+            inner = RuntimeError("length")
+        wrapper = ValueError("hit the output token cap")
+        wrapper.__cause__ = inner
+        self.assertFalse(is_hard_llm_failure(wrapper))
+
+    def test_reraise_if_fatal_reraises_budget_and_hard_only(self):
+        with self.assertRaises(BudgetExceededError):
+            _reraise_if_fatal(BudgetExceededError())
+        with self.assertRaises(Exception):
+            _reraise_if_fatal(_status_error(402))
+        # a soft error passes through (returns None, does not raise)
+        self.assertIsNone(_reraise_if_fatal(RuntimeError("transient")))
+
+
+class RunBudgetTests(unittest.TestCase):
+    def test_cost_only_budget_rejected(self):
+        with self.assertRaises(ValueError):
+            RunBudget(max_cost=1.0)          # R8: token ceiling is authoritative
+
+    def test_bad_values_rejected(self):
+        for kw in ({"max_tokens": 0}, {"max_tokens": -5}, {"max_tokens": 10, "max_cost": 0},
+                   {"max_tokens": 10, "max_cost": float("inf")}):
+            with self.assertRaises(ValueError):
+                RunBudget(**kw)
+
+    def test_token_ceiling_trips_on_crossing_call(self):
+        b = RunBudget(max_tokens=100)
+        self.assertFalse(b.record_and_check(TokenUsage(input_tokens=40, output_tokens=20)))  # 60
+        self.assertFalse(b.exceeded)
+        self.assertTrue(b.record_and_check(TokenUsage(input_tokens=30, output_tokens=20)))   # 110 → crosses
+        self.assertTrue(b.exceeded)
+        # a later call does not re-report the crossing
+        self.assertFalse(b.record_and_check(TokenUsage(input_tokens=1)))
+
+    def test_cost_ceiling_trips(self):
+        b = RunBudget(max_tokens=10**9, max_cost=0.01)
+        self.assertFalse(b.record_and_check(TokenUsage(cost=0.006)))
+        self.assertTrue(b.record_and_check(TokenUsage(cost=0.006)))  # 0.012 → crosses
+
+    def test_disabled_never_trips(self):
+        b = RunBudget.disabled()
+        self.assertFalse(b.enabled)
+        self.assertFalse(b.record_and_check(TokenUsage(input_tokens=10**9, cost=10**9)))
+        self.assertFalse(b.exceeded)
+        b.raise_if_exceeded()  # no-op
+
+    def test_reasoning_and_cached_not_double_counted(self):
+        b = RunBudget(max_tokens=100)
+        # thinking/cached are subsets of output/input and must not add on top.
+        self.assertFalse(b.record_and_check(
+            TokenUsage(input_tokens=50, output_tokens=40, thinking_tokens=30, cached_tokens=20)))  # 90
+
+    def test_cost_reliability_flips_on_cost_missing_and_byok(self):
+        b = RunBudget(max_tokens=100, max_cost=1.0)
+        self.assertTrue(b.cost_reliable)
+        with self.assertLogs(level="WARNING"):
+            b.record_and_check(TokenUsage(input_tokens=1, cost_missing=True))
+        self.assertFalse(b.cost_reliable)
+        b2 = RunBudget(max_tokens=100, max_cost=1.0)
+        with self.assertLogs(level="WARNING"):
+            b2.record_and_check(TokenUsage(input_tokens=1, byok=True))
+        self.assertFalse(b2.cost_reliable)
+
+    def test_cost_cap_keeps_enforcing_after_reliability_lost(self):
+        b = RunBudget(max_tokens=10**9, max_cost=0.01)
+        b.record_and_check(TokenUsage(cost=0.006))                     # known
+        b.record_and_check(TokenUsage(cost=0.0, cost_missing=True))    # flips reliability, adds 0
+        self.assertFalse(b.cost_reliable)
+        self.assertTrue(b.record_and_check(TokenUsage(cost=0.005)))    # known 0.011 ≥ 0.01 → still trips
+        self.assertTrue(b.exceeded)
+
+    def test_raise_if_exceeded_carries_usage_snapshot(self):
+        b = RunBudget(max_tokens=10)
+        b.record_and_check(TokenUsage(input_tokens=20, output_tokens=5, cost=0.03))
+        with self.assertRaises(BudgetExceededError) as ctx:
+            b.raise_if_exceeded()
+        self.assertEqual(ctx.exception.usage.input_tokens, 20)
+        self.assertAlmostEqual(ctx.exception.usage.cost, 0.03)
+
+    def test_thread_safe_single_crossing(self):
+        import threading
+        b = RunBudget(max_tokens=100)
+        crossings = []
+        barrier = threading.Barrier(20)
+
+        def worker():
+            barrier.wait()
+            if b.record_and_check(TokenUsage(input_tokens=10)):
+                crossings.append(1)
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        self.assertEqual(sum(crossings), 1)  # exactly one call observes the crossing
+
+
+class BudgetIntegrationTests(unittest.TestCase):
+    """The budget wired through the real generation paths."""
+
+    def _client(self, create=None, parse=None):
+        return types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create, parse=parse)))
+
+    def test_fresh_entry_over_budget_raises_before_any_call(self):
+        p = _bare_provider()
+        p.budget = RunBudget(max_tokens=10)
+        p.budget.record_and_check(TokenUsage(input_tokens=20))  # already over
+        create = mock.Mock()
+        parse = mock.Mock()
+        p.client = self._client(create, parse)
+        with self.assertRaises(BudgetExceededError):
+            p.generate_text("m", [ContentPart("text", "hi")])
+        with self.assertRaises(BudgetExceededError):
+            p.generate_structured("m", [ContentPart("text", "hi")], _Schema)
+        create.assert_not_called()
+        parse.assert_not_called()
+
+    def test_per_call_usage_equals_budget_delta(self):
+        p = _bare_provider()
+        p.budget = RunBudget(max_tokens=10**9)
+        completion = _FakeCompletion(_FakeMessage(parsed=_Schema(x=1)),
+                                     usage=_FakeUsage({"prompt_tokens": 12, "completion_tokens": 5, "cost": 0.002}))
+        p.client = self._client(parse=mock.Mock(return_value=completion))
+        _, usage = p.generate_structured("m", [ContentPart("text", "hi")], _Schema)
+        snap = p.budget.snapshot()
+        self.assertEqual(usage.input_tokens, snap.input_tokens)
+        self.assertEqual(usage.output_tokens, snap.output_tokens)
+        self.assertAlmostEqual(usage.cost, snap.cost)
+
+    def test_usage_from_reads_is_byok(self):
+        p = _bare_provider()
+        p.budget = RunBudget(max_tokens=10**9, max_cost=1.0)
+        completion = _FakeCompletion(_FakeMessage(content="ok"),
+                                     usage=_FakeUsage({"prompt_tokens": 3, "completion_tokens": 1,
+                                                       "cost": 0.0, "is_byok": True}))
+        p.client = self._client(create=mock.Mock(return_value=completion))
+        with self.assertLogs(level="WARNING"):
+            _, usage = p.generate_text("m", [ContentPart("text", "hi")])
+        self.assertTrue(usage.byok)
+        self.assertFalse(p.budget.cost_reliable)
+
+    def test_mid_loop_trip_breaks_then_one_phase2_answer(self):
+        # A tool round crosses the ceiling → stop gathering, produce exactly one
+        # structured answer from the evidence so far (graceful degradation).
+        p = _bare_provider()
+        p.budget = RunBudget(max_tokens=50)
+        tc = types.SimpleNamespace(id="c1", function=types.SimpleNamespace(name="t", arguments="{}"))
+        r1 = _FakeCompletion(types.SimpleNamespace(content=None, tool_calls=[tc]),
+                             usage=_FakeUsage({"prompt_tokens": 40, "completion_tokens": 20}))  # 60 → over
+        create = mock.Mock(side_effect=[r1])   # round 2 must never be requested
+        parse = mock.Mock(return_value=_FakeCompletion(_FakeMessage(parsed=_Schema(x=9)),
+                                                       usage=_FakeUsage({"prompt_tokens": 1, "completion_tokens": 1})))
+        p.client = self._client(create, parse)
+        parsed, _ = p.generate_structured(
+            "m", [ContentPart("text", "hi")], _Schema,
+            tools=[{"type": "function", "function": {"name": "t", "parameters": {}}}],
+            tool_runner=lambda n, a: "r")
+        self.assertEqual(parsed.x, 9)
+        self.assertEqual(create.call_count, 1)   # broke before a 2nd tool round
+        self.assertEqual(parse.call_count, 1)    # exactly one final answer
+
+    def test_completed_round_usage_survives_a_later_fatal_round(self):
+        # Acceptance #2 + R3: round 1 usage is recorded; round 2 raises a hard 402
+        # which must re-raise (not fall back), while round 1's usage is retained.
+        p = _bare_provider()
+        p.budget = RunBudget(max_tokens=10**9)
+        tc = types.SimpleNamespace(id="c1", function=types.SimpleNamespace(name="t", arguments="{}"))
+        r1 = _FakeCompletion(types.SimpleNamespace(content=None, tool_calls=[tc]),
+                             usage=_FakeUsage({"prompt_tokens": 11, "completion_tokens": 7, "cost": 0.004}))
+        create = mock.Mock(side_effect=[r1, _status_error(402)])
+        parse = mock.Mock(return_value=_FakeCompletion(_FakeMessage(parsed=_Schema(x=1))))
+        p.client = self._client(create, parse)
+        with self.assertRaises(Exception) as ctx:
+            p.generate_structured(
+                "m", [ContentPart("text", "hi")], _Schema,
+                tools=[{"type": "function", "function": {"name": "t", "parameters": {}}}],
+                tool_runner=lambda n, a: "r")
+        self.assertTrue(is_hard_llm_failure(ctx.exception))   # fatal propagated, not swallowed
+        parse.assert_not_called()                             # did NOT fall back to a plain call
+        snap = p.budget.snapshot()
+        self.assertEqual(snap.input_tokens, 11)              # round 1 usage retained
+        self.assertAlmostEqual(snap.cost, 0.004)
 
 
 if __name__ == "__main__":

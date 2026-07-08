@@ -15,6 +15,7 @@ requires touching this file.
 Public surface (kept stable for callers):
 
     ContentPart, TokenUsage, LLMProvider, create_provider
+    RunBudget, BudgetExceededError, is_hard_llm_failure   # per-run spend control (C3)
 
     provider = create_provider(api_key)
     parsed, usage = provider.generate_structured(model, contents, schema,
@@ -45,6 +46,16 @@ try:
     _FILTER_ERRORS = (ContentFilterFinishReasonError,)
 except ImportError:  # openai is always present in production (it's the client)
     _LENGTH_ERRORS = _FILTER_ERRORS = ()
+
+# The base SDK error type, used to gate the statusless credit/billing substring
+# branch of is_hard_llm_failure so it can NEVER fire on a ValueError / pydantic
+# ValidationError (those embed model output, i.e. PR-influenced bytes). Imported
+# defensively so the module stays importable without `openai`.
+try:
+    from openai import APIError as _OpenAIAPIError
+    _API_ERRORS = (_OpenAIAPIError,)
+except ImportError:
+    _API_ERRORS = ()
 
 def _env_int(name: str, default: int) -> int:
     """Read a positive int from the environment, falling back on bad/missing values."""
@@ -152,6 +163,13 @@ class TokenUsage:
     # aggregate caps must be able to tell the difference rather than silently
     # under-counting to $0 on exactly the untrusted PRs the spend cap exists to bound.
     cost_missing: bool = False
+    # True when OpenRouter reports this generation ran under BYOK (bring-your-own-key).
+    # Verified 2026-07-08 against https://openrouter.ai/docs/use-cases/byok: under BYOK
+    # `cost` is only OpenRouter's 5% fee (and can be 0.0 while real upstream spend
+    # occurs), so a cost cap cannot be trusted — the token ceiling is authoritative
+    # (R8). Distinct from cost_missing: the fee IS a known figure, the semantics
+    # differ. OR-propagated in _sum_usage independently of cost_missing.
+    byok: bool = False
 
 
 def _sum_usage(a: "TokenUsage", b: "TokenUsage") -> "TokenUsage":
@@ -163,7 +181,200 @@ def _sum_usage(a: "TokenUsage", b: "TokenUsage") -> "TokenUsage":
         cached_tokens=a.cached_tokens + b.cached_tokens,
         cost=a.cost + b.cost,
         cost_missing=a.cost_missing or b.cost_missing,
+        byok=a.byok or b.byok,
     )
+
+
+# ---- per-run spend control (C3) -------------------------------------------
+
+class BudgetExceededError(Exception):
+    """Raised when a run's per-run token/cost ceiling (RunBudget) is exceeded.
+
+    Carries `.usage` — a TokenUsage snapshot of the run totals at raise time — so
+    the orchestration layer can report what was spent. The snapshot deliberately
+    carries NO configured limit, so nothing renders the operator's ceiling into a
+    PR-visible comment.
+    """
+
+    def __init__(self, message: str = "per-run LLM budget exceeded", *, usage: Optional[TokenUsage] = None):
+        super().__init__(message)
+        self.usage = usage if usage is not None else TokenUsage()
+
+
+# 403 disambiguation. OpenRouter returns 403 for BOTH an auth/permission failure
+# and a *moderation-flagged input* (docs/api/reference/errors, verified 2026-07-08).
+# The input is attacker-controllable PR content, so a bare 403 must NOT be treated
+# as a hard account failure (it would let any PR fire the outage banner / redden a
+# loud-exit job — content-dependent griefing). Only an auth-shaped 403 is hard.
+_MODERATION_403_MARKERS = ("moderat", "flagged")
+_AUTH_403_MARKERS = (
+    "api key", "invalid key", "unauthorized", "not authorized",
+    "authentication", "no auth credentials", "permission denied",
+)
+# Statusless credit/billing markers. Only consulted for genuine SDK/HTTP-layer
+# errors (see _API_ERRORS gate) — NEVER for a ValueError/ValidationError, whose
+# text can contain PR-influenced model output. "quota" is intentionally excluded:
+# OpenAI 429s say "exceeded your current quota" and 429 is a soft/transient status.
+_HARD_STATUSLESS_MARKERS = (
+    "insufficient credit", "insufficient_quota", "payment required",
+    "out of credits", "billing hard limit",
+)
+
+
+def _status_code_of(exc) -> Optional[int]:
+    """Best-effort HTTP status for an SDK exception, across SDK versions."""
+    sc = getattr(exc, "status_code", None)
+    if isinstance(sc, int) and not isinstance(sc, bool):
+        return sc
+    resp = getattr(exc, "response", None)
+    rc = getattr(resp, "status_code", None)
+    return rc if isinstance(rc, int) and not isinstance(rc, bool) else None
+
+
+def _is_auth_shaped_403(exc) -> bool:
+    msg = str(exc).lower()
+    if any(m in msg for m in _MODERATION_403_MARKERS):
+        return False  # moderation-flagged input — attacker-controllable, not hard
+    return any(a in msg for a in _AUTH_403_MARKERS)
+
+
+def is_hard_llm_failure(exc: BaseException, _depth: int = 0) -> bool:
+    """True for a spend/auth/quota failure that must be surfaced loudly, not swallowed.
+
+    Status-code FIRST (the trustworthy signal): 401 (invalid key) and 402
+    (insufficient credits / per-key limit) are hard; 403 is hard only when
+    auth-shaped (moderation-403 is attacker-controllable PR content, so soft);
+    408/429/5xx are NEVER hard even if their message mentions "quota" (status
+    precedence). Only for a genuine SDK error carrying no status is a NARROW
+    credit/billing substring set consulted — never for a ValueError/ValidationError
+    (those embed model output). The `__cause__` chain is walked up to 2 levels so
+    `raise ValueError(...) from <402>` stays fatal while the provider's own
+    length-cap ValueError (wrapping LengthFinishReasonError, no status) stays soft.
+    """
+    status = _status_code_of(exc)
+    if status is not None:
+        if status in (401, 402):
+            return True
+        if status == 403:
+            return _is_auth_shaped_403(exc)
+        return False  # 400/404/408/409/422/429/5xx — soft/transient
+    if _API_ERRORS and isinstance(exc, _API_ERRORS):
+        msg = str(exc).lower()
+        if any(m in msg for m in _HARD_STATUSLESS_MARKERS):
+            return True
+    if _depth < 2:
+        cause = getattr(exc, "__cause__", None)
+        if cause is not None and cause is not exc:
+            return is_hard_llm_failure(cause, _depth + 1)
+    return False
+
+
+def _reraise_if_fatal(exc: BaseException) -> None:
+    """First line of every LLM-touching broad ``except`` (R3): re-raise a budget
+    trip or a hard LLM failure so it reaches the orchestration containment layer
+    instead of being swallowed into a green check. Everything else is left for the
+    caller's existing fail-soft handling."""
+    if isinstance(exc, BudgetExceededError) or is_hard_llm_failure(exc):
+        raise exc
+
+
+class RunBudget:
+    """Thread-safe per-run token/cost ceiling (C3).
+
+    The TOKEN ceiling is authoritative (R8): OpenRouter `cost` can be unreliable
+    (absent, or BYOK fee-only), so a cost-only budget is rejected at construction.
+    All spend paths funnel usage through :meth:`record_and_check`; the provider
+    consults :attr:`exceeded` before each extra call and :meth:`raise_if_exceeded`
+    at fresh entry. Enforcement is conservative: the cost cap keeps enforcing
+    against accumulated KNOWN cost even after cost reliability is lost.
+    """
+
+    def __init__(self, max_tokens: Optional[int] = None, max_cost: Optional[float] = None):
+        if max_cost is not None and max_tokens is None:
+            raise ValueError(
+                "RunBudget rejects a cost-only budget: set max_tokens too. The token "
+                "ceiling is the authoritative bound because OpenRouter cost can be "
+                "absent or (under BYOK) fee-only."
+            )
+        if max_tokens is not None and not (
+            isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0
+        ):
+            raise ValueError("max_tokens must be a positive int or None")
+        if max_cost is not None and not (
+            isinstance(max_cost, (int, float)) and not isinstance(max_cost, bool)
+            and math.isfinite(max_cost) and max_cost > 0
+        ):
+            raise ValueError("max_cost must be a positive, finite number or None")
+        self.max_tokens = max_tokens
+        self.max_cost = float(max_cost) if max_cost is not None else None
+        self._lock = threading.Lock()
+        self._usage = TokenUsage()
+        # Sticky: flips False on the first cost_missing/BYOK generation and never
+        # flips back. The token cap is unaffected; only cost-cap trust is lost.
+        self.cost_reliable = True
+        self._warned_unreliable = False
+
+    @classmethod
+    def disabled(cls) -> "RunBudget":
+        """A no-op budget (no ceilings). Still accumulates usage harmlessly."""
+        return cls(None, None)
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_tokens is not None or self.max_cost is not None
+
+    @staticmethod
+    def _count(u: TokenUsage) -> int:
+        # Authoritative token count = input + output. reasoning_tokens are a SUBSET
+        # of output (completion) tokens and cached_tokens a subset of input, per the
+        # OpenRouter usage schema (verified 2026-07-08), so they must not be re-added.
+        return (u.input_tokens or 0) + (u.output_tokens or 0)
+
+    def _over_locked(self) -> bool:
+        if self.max_tokens is not None and self._count(self._usage) >= self.max_tokens:
+            return True
+        if self.max_cost is not None and self._usage.cost >= self.max_cost:
+            return True
+        return False
+
+    def record_and_check(self, usage: TokenUsage) -> bool:
+        """Accumulate `usage`; return True iff THIS call is the one that crossed a
+        ceiling (atomic and observable — this is the signal the race test asserts on)."""
+        with self._lock:
+            was_over = self._over_locked()
+            self._usage = _sum_usage(self._usage, usage)
+            if (usage.cost_missing or usage.byok) and self.cost_reliable:
+                self.cost_reliable = False
+                if self.max_cost is not None and not self._warned_unreliable:
+                    self._warned_unreliable = True
+                    logging.warning(
+                        "RunBudget: cost is no longer reliable (%s); the token ceiling "
+                        "is authoritative for the rest of this run.",
+                        "BYOK fee-only cost" if usage.byok else "a generation reported no cost",
+                    )
+            return (not was_over) and self._over_locked()
+
+    @property
+    def exceeded(self) -> bool:
+        with self._lock:
+            return self._over_locked()
+
+    def raise_if_exceeded(self) -> None:
+        with self._lock:
+            if self._over_locked():
+                raise BudgetExceededError(usage=self._snapshot_locked())
+
+    def snapshot(self) -> TokenUsage:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> TokenUsage:
+        u = self._usage
+        return TokenUsage(
+            input_tokens=u.input_tokens, output_tokens=u.output_tokens,
+            thinking_tokens=u.thinking_tokens, cached_tokens=u.cached_tokens,
+            cost=u.cost, cost_missing=u.cost_missing, byok=u.byok,
+        )
 
 
 def _data_url(data: Union[str, bytes], mime_type: str) -> str:
@@ -192,9 +403,15 @@ class OpenRouterProvider:
         enable_web_search: bool = False,
         timeout: Optional[float] = None,
         max_concurrency: Optional[int] = None,
+        budget: Optional["RunBudget"] = None,
     ):
         from openai import OpenAI
 
+        # Per-run spend ceiling (C3). Default is a no-op budget so existing callers
+        # (including sorry-tracker) are behaviourally unchanged; pass a configured
+        # RunBudget to bound a single run's tokens/cost. Every generation path funnels
+        # its usage through self._record_usage, the ONE authoritative sink.
+        self.budget = budget if budget is not None else RunBudget.disabled()
         self.max_tokens = max_tokens
         # Per-attempt request timeout (see DEFAULT_REQUEST_TIMEOUT). The worst-case
         # concurrency-slot hold is timeout * (max_retries + 1) because the SDK
@@ -366,21 +583,40 @@ class OpenRouterProvider:
         the tool phase errors (e.g. the model can't do tool calls), it falls back
         to a plain structured generation.
         """
+        # Fresh entry already over budget → raise before spending anything (R4).
+        # A trip that happens mid-run degrades gracefully instead (see below).
+        self.budget.raise_if_exceeded()
+
         blocks, has_pdf = self._to_message_content(contents)
         messages = [{"role": "user", "content": blocks}]
         usage_total = TokenUsage()
 
         if tools and tool_runner:
+            # rounds_usage collects each completed tool round's usage as it happens,
+            # so a later-round exception can't lose the usage from earlier rounds
+            # (the mid-raise usage-loss fix): the `finally` folds whatever was
+            # gathered into usage_total on every exit path. The budget itself is
+            # already updated per round inside _gather_with_tools via _record_usage.
+            rounds_usage: List[TokenUsage] = []
             try:
-                usage_total = _sum_usage(usage_total, self._gather_with_tools(
-                    model, messages, tools, tool_runner, thinking_budget, has_pdf, max_tool_rounds,
-                ))
+                self._gather_with_tools(
+                    model, messages, tools, tool_runner, thinking_budget, has_pdf,
+                    max_tool_rounds, rounds_usage,
+                )
                 messages.append({
                     "role": "user",
                     "content": "Now provide your final answer as JSON matching the required schema, using the evidence gathered above.",
                 })
             except Exception as e:
+                # R3: a budget trip or a hard LLM failure (402/auth/quota) must NOT be
+                # swallowed into a fail-open tool-less retry — re-raise it to the
+                # orchestration containment layer. Only genuinely soft failures (a
+                # model that can't do tool calls, a transient blip) fall back.
+                _reraise_if_fatal(e)
                 logging.warning(f"Tool phase failed for '{model}'; continuing without tools: {e}")
+            finally:
+                for u in rounds_usage:
+                    usage_total = _sum_usage(usage_total, u)
 
         extra_body = self._build_extra_body(thinking_budget, has_pdf)
 
@@ -404,10 +640,15 @@ class OpenRouterProvider:
                     # usage is absent, _usage_from fails closed (cost_missing).
                     truncated = getattr(e, "completion", None)
                     if truncated is not None:
-                        usage_total = _sum_usage(usage_total, self._usage_from(truncated))
-                    # Truncated before complete structured output. Retry with a
-                    # larger cap so the review's findings aren't lost wholesale.
-                    if attempt >= self.length_retry_attempts or max_tokens >= self.length_retry_max_tokens:
+                        usage_total = _sum_usage(usage_total, self._record_usage(truncated))
+                    # Truncated before complete structured output. Normally retry with
+                    # a larger cap so the review's findings aren't lost wholesale — but
+                    # if the run is now over budget, do NOT escalate (each escalation is
+                    # another billed generation up to length_retry_max_tokens); take the
+                    # output-cap failure path so the overshoot stays bounded (decision 3).
+                    if (attempt >= self.length_retry_attempts
+                            or max_tokens >= self.length_retry_max_tokens
+                            or self.budget.exceeded):
                         raise ValueError(
                             f"Model '{model}' hit the output token cap ({max_tokens}) before "
                             f"producing complete structured output, even after "
@@ -440,19 +681,28 @@ class OpenRouterProvider:
                 )
             parsed = schema.model_validate_json(content)
 
-        return parsed, _sum_usage(usage_total, self._usage_from(completion))
+        return parsed, _sum_usage(usage_total, self._record_usage(completion))
 
-    def _gather_with_tools(self, model, messages, tools, tool_runner, thinking_budget, has_pdf, max_rounds) -> TokenUsage:
+    def _gather_with_tools(self, model, messages, tools, tool_runner, thinking_budget,
+                           has_pdf, max_rounds, rounds_usage: List[TokenUsage]) -> None:
         """Phase 1: let the model call tools to gather evidence. Appends the
-        assistant/tool exchange to `messages` in place and returns accumulated
-        TokenUsage. Bounded by `max_rounds` and MAX_TOTAL_TOOL_CALLS; tool errors
-        are returned to the model as data rather than raised."""
+        assistant/tool exchange to `messages` in place, and appends EACH completed
+        round's usage to `rounds_usage` as it happens so the caller retains it even
+        if a later round raises. Bounded by `max_rounds`, MAX_TOTAL_TOOL_CALLS, and
+        the run budget (checked before each round — a mid-loop trip breaks the loop
+        so exactly one phase-2 answer still runs); tool errors are returned to the
+        model as data rather than raised."""
         extra_body = self._build_extra_body(thinking_budget, has_pdf, healing=False)
         max_tokens = self._max_tokens_for(thinking_budget)
-        usage_total = TokenUsage()
         total_calls = 0
 
         for _round in range(max_rounds):
+            # Budget trip mid-loop: stop gathering and let the caller produce one
+            # final phase-2 answer from the evidence already collected (R4). We break
+            # rather than raise — a fresh-entry raise is handled at the top of
+            # generate_structured instead.
+            if self.budget.exceeded:
+                break
             with self._api_semaphore:
                 completion = self.client.chat.completions.create(
                     model=model,
@@ -462,7 +712,7 @@ class OpenRouterProvider:
                     max_tokens=max_tokens,
                     extra_body=extra_body,
                 )
-            usage_total = _sum_usage(usage_total, self._usage_from(completion))
+            rounds_usage.append(self._record_usage(completion))
             message = completion.choices[0].message
             tool_calls = getattr(message, "tool_calls", None)
             if not tool_calls:
@@ -498,8 +748,6 @@ class OpenRouterProvider:
             if total_calls > MAX_TOTAL_TOOL_CALLS:
                 break
 
-        return usage_total
-
     def generate_text(
         self,
         model: str,
@@ -507,6 +755,8 @@ class OpenRouterProvider:
         thinking_budget: Optional[int] = None,
     ) -> Tuple[str, TokenUsage]:
         """Generate free-form text (no schema). Returns (text, TokenUsage)."""
+        self.budget.raise_if_exceeded()  # fresh entry already over budget → raise (R4)
+
         blocks, has_pdf = self._to_message_content(contents)
         messages = [{"role": "user", "content": blocks}]
         extra_body = self._build_extra_body(thinking_budget, has_pdf, healing=False)
@@ -520,7 +770,7 @@ class OpenRouterProvider:
             )
 
         text = completion.choices[0].message.content or ""
-        return text.strip(), self._usage_from(completion)
+        return text.strip(), self._record_usage(completion)
 
     def _parse(self, **kwargs):
         """Call the SDK's structured-output parse helper across SDK versions."""
@@ -528,6 +778,17 @@ class OpenRouterProvider:
         if parse is None:  # older SDK: parse lives under .beta
             parse = self.client.beta.chat.completions.parse
         return parse(**kwargs)
+
+    def _record_usage(self, completion) -> TokenUsage:
+        """THE authoritative usage sink (R2). Parse this completion's usage exactly
+        once, record it into the run budget, and return that SAME TokenUsage for the
+        caller to accumulate. Every real generation on every path — each tool round,
+        the length-retry truncated completion, the phase-2 parse, generate_text —
+        must go through here, so the returned per-call usage always equals the budget
+        delta and nothing is double-recorded."""
+        usage = self._usage_from(completion)
+        self.budget.record_and_check(usage)
+        return usage
 
     @staticmethod
     def _usage_from(completion) -> TokenUsage:
@@ -563,6 +824,11 @@ class OpenRouterProvider:
         )
         cost = float(raw_cost) if cost_present and raw_cost > 0 else 0.0
         cost_missing = not cost_present
+        # Under BYOK the reported `cost` is only OpenRouter's fee (can be 0.0 while
+        # real upstream spend occurs), so a cost cap cannot be trusted — mark it and
+        # let RunBudget fall back to the authoritative token ceiling (R8). Verified
+        # 2026-07-08: https://openrouter.ai/docs/use-cases/byok.
+        byok = bool(data.get("is_byok"))
         if cost_missing:
             logging.warning(
                 "OpenRouter usage reported %d prompt + %d completion tokens but no usable "
@@ -576,6 +842,7 @@ class OpenRouterProvider:
             cached_tokens=prompt_details.get("cached_tokens", 0) or 0,
             cost=cost,
             cost_missing=cost_missing,
+            byok=byok,
         )
 
 
@@ -593,9 +860,14 @@ def create_provider(api_key: str, **kwargs) -> OpenRouterProvider:
     - ``max_concurrency`` (int): in-flight-call cap for this provider. Omit to
       share the process-wide default sized from ``LLM_MAX_CONCURRENCY`` (read at
       construction); pass a value to give this provider its own semaphore.
+    - ``budget`` (RunBudget): per-run token/cost ceiling (C3). Omit for a no-op
+      budget (unchanged behaviour). A configured budget stops further LLM calls
+      once the ceiling is crossed and raises :class:`BudgetExceededError` on a
+      fresh call made when already over. The token ceiling is authoritative; a
+      cost-only budget is rejected at ``RunBudget`` construction.
 
-    ``timeout`` and ``max_concurrency`` are operator-trusted configuration — do
-    not source them from an untrusted PR checkout.
+    ``timeout``, ``max_concurrency`` and ``budget`` are operator-trusted
+    configuration — do not source them from an untrusted PR checkout.
     """
     if not api_key:
         raise ValueError("An OpenRouter API key is required.")
