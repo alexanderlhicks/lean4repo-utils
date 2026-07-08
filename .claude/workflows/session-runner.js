@@ -16,7 +16,7 @@ export const meta = {
 // aren't silently lost and the review gate can't be misrouted to plan.
 let A = args || {}
 if (typeof A === 'string') { try { A = JSON.parse(A) } catch (_e) { A = {} } }
-const REPO = '/home/alh/lscripts/leanrepo-utils'
+const REPO = '/home/alh/lscripts/lean4repo-utils'
 const session = String(A.session ?? 'unspecified')
 const items = String(A.items ?? '')
 const gate = (A.phase === 'review') ? 'review' : 'plan'
