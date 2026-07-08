@@ -55,6 +55,18 @@ inputs:
       a smaller-context model.
     required: false
     default: '400000'
+  llm_max_run_tokens:
+    description: 'Per-run token ceiling (C3). Once exceeded, no further LLM calls are made and the summary degrades gracefully (partial results + a loud banner) instead of consuming unbounded spend on a shared key. Empty = disabled. The token ceiling is authoritative; source from workflow/secrets config, NEVER from PR content.'
+    required: false
+    default: ''
+  llm_max_run_cost:
+    description: 'Per-run cost ceiling in OpenRouter credits (C3). Requires llm_max_run_tokens (a cost-only budget is rejected — cost can be BYOK-fee-only or absent). Empty = disabled.'
+    required: false
+    default: ''
+  llm_loud_exit:
+    description: 'When "true", the action exits non-zero if the run degraded (spend/quota/auth failure or budget exhausted), AFTER posting the comment. Default "false" keeps the job green with a banner + error annotation. Do NOT mark this action as a required check with loud-exit enabled.'
+    required: false
+    default: 'false'
 runs:
   using: "composite"
   steps:
@@ -118,6 +130,13 @@ runs:
         # makes the dependency explicit (the CI env-var consistency check
         # only inspects this env block) and is a runtime no-op.
         MERGE_BASE: ${{ env.MERGE_BASE }}
+        # Per-run spend control (C3). Env-only (never interpolated into a run: body).
+        # Empty == unset == disabled. summary.py handles loud-exit itself (it posts the
+        # comment inline before returning a non-zero code), and prints its own ::error::
+        # to stdout. Names must match summary.py's ENV_MAX_RUN_* constants exactly.
+        LLM_MAX_RUN_TOKENS: ${{ inputs.llm_max_run_tokens }}
+        LLM_MAX_RUN_COST: ${{ inputs.llm_max_run_cost }}
+        LLM_LOUD_EXIT: ${{ inputs.llm_loud_exit }}
       run: uv run --project "${{ github.action_path }}" --no-dev --frozen python "${{ github.action_path }}/summary.py"
       shell: bash
 

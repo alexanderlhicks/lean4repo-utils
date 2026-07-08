@@ -727,5 +727,132 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("pnpm-lock.yaml", posted)
 
 
+def _status_error(status, message="error"):
+    """A REAL openai SDK status error (clean-room — no copied fixture)."""
+    import httpx
+    from openai import APIStatusError
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    return APIStatusError(message, response=httpx.Response(status, request=req), body=None)
+
+
+class TestC3SummaryLoud(unittest.TestCase):
+    """C3 [2/2]: summary.py degrades in place but stays LOUD (banner + ::error:: +
+    optional loud-exit) on a hard/budget LLM failure — never a silent green check."""
+
+    def setUp(self):
+        summary.run_health = summary.RunHealth()
+
+    def test_note_failure_records_hard(self):
+        summary._note_failure(_status_error(402))
+        self.assertTrue(summary.run_health.degraded)
+        self.assertEqual(summary.run_health.hard_failures, 1)
+
+    def test_note_failure_records_budget(self):
+        summary._note_failure(summary.BudgetExceededError())
+        self.assertTrue(summary.run_health.budget_exceeded)
+
+    def test_note_failure_ignores_soft(self):
+        summary._note_failure(ValueError("just a bug"))       # not spend/auth/quota
+        summary._note_failure(_status_error(429, "rate limited"))
+        self.assertFalse(summary.run_health.degraded)
+
+    def _run_main_capture(self, diff, pr, summarize_side_effect, extra_env=None):
+        import contextlib
+        import io
+        env = {
+            "API_KEY": "k", "GITHUB_TOKEN": "t", "GITHUB_REPOSITORY": "owner/repo",
+            "PR_NUMBER": "1", "INPUT_MODEL": "anthropic/claude-haiku-4.5",
+        }
+        env.update(extra_env or {})
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "pr.diff"), "w") as f:
+                f.write(diff)
+            cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                with mock.patch.dict(os.environ, env, clear=False), \
+                     mock.patch.object(summary, "create_provider",
+                                       return_value=types.SimpleNamespace(name="fake")), \
+                     mock.patch.object(summary, "get_github_objects", return_value=(object(), pr)), \
+                     mock.patch.object(summary, "find_sorry_issues", return_value=[]), \
+                     mock.patch.object(summary, "triage_files", return_value=(["Big.lean"], [])), \
+                     mock.patch.object(summary, "summarize_file_diff", side_effect=summarize_side_effect), \
+                     mock.patch.object(summary, "synthesize_summary", return_value="FINAL AI SUMMARY"), \
+                     contextlib.redirect_stdout(buf):
+                    rc = summary.main()
+            finally:
+                os.chdir(cwd)
+        return rc, (pr.created[0] if pr.created else ""), buf.getvalue()
+
+    _DIFF = "diff --git a/Big.lean b/Big.lean\n@@ -1,1 +1,1 @@\n+theorem t : True := trivial\n"
+
+    def test_all_402_is_loud_not_green(self):
+        pr = FakeOrchestrationPR()
+        rc, posted, out = self._run_main_capture(
+            self._DIFF, pr, lambda *a: (_ for _ in ()).throw(_status_error(402)))
+        self.assertIn("did not complete normally", posted)   # banner prepended to comment
+        self.assertIn("::error::", out)                      # annotation to stdout
+        self.assertTrue(summary.run_health.degraded)
+        self.assertEqual(rc, 0)                              # loud-exit OFF by default
+
+    def test_loud_exit_returns_nonzero(self):
+        pr = FakeOrchestrationPR()
+        rc, posted, out = self._run_main_capture(
+            self._DIFF, pr, lambda *a: (_ for _ in ()).throw(_status_error(402)),
+            extra_env={"LLM_LOUD_EXIT": "true"})
+        self.assertIn("did not complete normally", posted)   # comment STILL posted first
+        self.assertEqual(rc, summary.LOUD_EXIT_CODE)
+        self.assertNotEqual(rc, 0)
+
+    def test_exception_body_not_leaked(self):
+        # R6: a summarization exception body must not reach the posted comment.
+        pr = FakeOrchestrationPR()
+        rc, posted, out = self._run_main_capture(
+            self._DIFF, pr, lambda *a: (_ for _ in ()).throw(RuntimeError("SENTINEL_SUM_777")))
+        self.assertNotIn("SENTINEL_SUM_777", posted)
+
+    def test_clean_run_no_banner(self):
+        pr = FakeOrchestrationPR()
+        rc, posted, out = self._run_main_capture(
+            self._DIFF, pr, lambda *a: "a fine summary", extra_env={"LLM_LOUD_EXIT": "1"})
+        self.assertNotIn("did not complete normally", posted)
+        self.assertNotIn("::error::", out)
+        self.assertEqual(rc, 0)
+
+
+class TestC3SummaryActionWiring(unittest.TestCase):
+    def _action(self):
+        import yaml
+        p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "action.yml")
+        with open(p) as f:
+            return yaml.safe_load(f)
+
+    def _gen_step(self, doc):
+        return next(s for s in doc["runs"]["steps"] if s.get("name") == "Generate summary")
+
+    def test_new_inputs_declared(self):
+        doc = self._action()
+        for name in ("llm_max_run_tokens", "llm_max_run_cost", "llm_loud_exit"):
+            self.assertIn(name, doc["inputs"])
+
+    def test_env_names_match_python_constants(self):
+        env = self._gen_step(self._action())["env"]
+        self.assertIn(summary.ENV_MAX_RUN_TOKENS, env)
+        self.assertIn(summary.ENV_MAX_RUN_COST, env)
+        self.assertIn(summary.ENV_LOUD_EXIT, env)
+        self.assertEqual(env[summary.ENV_MAX_RUN_TOKENS], "${{ inputs.llm_max_run_tokens }}")
+
+    def test_budget_inputs_never_in_run_body(self):
+        doc = self._action()
+        for s in doc["runs"]["steps"]:
+            self.assertNotIn("inputs.llm_max_run", s.get("run", ""))
+            self.assertNotIn("inputs.llm_loud_exit", s.get("run", ""))
+
+    def test_entrypoint_is_sys_exit_main(self):
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "summary.py")).read()
+        self.assertIn("sys.exit(main())", src)
+
+
 if __name__ == "__main__":
     unittest.main()

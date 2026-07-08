@@ -1542,6 +1542,232 @@ class TestMainOrchestration:
         assert "Verdict (deterministic): Approved" in out
 
 
+def _status_error(status, message="error"):
+    """A REAL openai SDK status error (clean-room; no fixture copied from
+    openai-python's test suite)."""
+    import httpx
+    from openai import APIStatusError
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    return APIStatusError(message, response=httpx.Response(status, request=req), body=None)
+
+
+class TestC3Containment:
+    """C3 [2/2] acceptance + orchestration tests, driven through review.main() with a
+    stub provider and the REAL ThreadPoolExecutor / containment path. Assertions target
+    the rendered comment, the health flag, and the process exit code — never a leaf
+    re-raise. The banner/exit assertions would FAIL on pre-C3 HEAD (which fails open)."""
+
+    _SINGLE = TestMainOrchestration._SINGLE
+    _TWO = TestMainOrchestration._TWO
+
+    def _run(self, monkeypatch, tmp_path, capsys, extra_argv=(), env=None):
+        argv = ["review.py", "--pr-number", "1", "--model", "anthropic/claude-haiku-4.5", *extra_argv]
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setenv("API_KEY", "sk-test")
+        for var in ("SUMMARY_FILES", "LEAN_INFO", "DISCOVERED_FILES", "BUILD_OUTPUT",
+                    "LAKE_GRAPH", "LLM_MAX_RUN_TOKENS", "LLM_MAX_RUN_COST", "LLM_LOUD_EXIT"):
+            monkeypatch.delenv(var, raising=False)
+        for k, v in (env or {}).items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setattr(review, "get_pr_diff", lambda pr: (self._TWO, []))
+        monkeypatch.setattr(review, "create_provider", lambda key, **kw: SimpleNamespace(name="fake"))
+        monkeypatch.setattr(review, "analyze_specification", lambda *a, **k: "")
+        cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            rc = review.main()
+        finally:
+            os.chdir(cwd)
+        out = capsys.readouterr().out
+        health = None
+        hp = tmp_path / "review_health.json"
+        if hp.exists():
+            health = json.loads(hp.read_text())
+        return out, rc, health
+
+    def test_all_hard_failures_are_loud_not_green(self, monkeypatch, tmp_path, capsys):
+        # acceptance #3: every per-file call 402s → the run stays LOUD (banner + health
+        # flag + non-Approved), NOT a silent green. Exit 0 without loud-exit.
+        monkeypatch.setattr(review, "analyze_file_changes_with_context",
+                            lambda *a, **k: (_ for _ in ()).throw(_status_error(402)))
+        out, rc, health = self._run(monkeypatch, tmp_path, capsys)
+        assert "did not complete normally" in out          # the fixed banner
+        assert "Verdict (deterministic): Approved" not in out
+        assert health is not None and health["degraded"] is True
+        # Counted exactly once at the top-level containment (the leaf sites only
+        # re-raise) — a single aborting failure must not inflate the telemetry.
+        assert health["hard_failures"] == 1
+        assert rc == 0                                      # loud-exit OFF by default
+
+    def test_synthesis_only_failure_cannot_render_approved(self, monkeypatch, tmp_path, capsys):
+        # A hard failure confined to synthesis (which runs AFTER the verdict) must not
+        # leave an "Approved" verdict standing under the CAUTION banner — the verdict is
+        # re-derived once degraded flips post-verdict.
+        fr = review.FileReview(verdict="Approved", analysis="fine")
+        monkeypatch.setattr(review, "analyze_file_changes_with_context",
+                            lambda *a, **k: (fr, "FORMATTED::ok"))
+        monkeypatch.setattr(review, "analyze_cross_file", lambda *a, **k: (None, ""))
+        monkeypatch.setattr(review, "verify_findings", lambda *a, **k: [])
+        monkeypatch.setattr(review, "synthesize_overall_summary",
+                            lambda *a, **k: (_ for _ in ()).throw(_status_error(402)))
+        out, rc, health = self._run(monkeypatch, tmp_path, capsys)
+        assert "did not complete normally" in out
+        assert "Verdict (deterministic): Approved" not in out   # not Approved under the banner
+        assert health["degraded"] is True and health["hard_failures"] == 1
+        assert rc == 0
+
+    def test_loud_exit_returns_nonzero_after_comment(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr(review, "analyze_file_changes_with_context",
+                            lambda *a, **k: (_ for _ in ()).throw(_status_error(402)))
+        out, rc, health = self._run(monkeypatch, tmp_path, capsys, env={"LLM_LOUD_EXIT": "1"})
+        assert "did not complete normally" in out          # comment STILL printed
+        assert rc == review.LOUD_EXIT_CODE and rc != 0      # ...then a non-zero exit
+
+    def test_budget_trip_partial_results_and_skip_marker(self, monkeypatch, tmp_path, capsys):
+        # acceptance #1: file 1 completes and records; a later file trips the budget →
+        # graceful degrade: partial result kept, skipped file listed, non-Approved, exit 0.
+        fr = review.FileReview(verdict="Approved", analysis="fine")
+
+        def fake_review(provider, ctx, fp, fd, fc, spec, ext, chk, vr):
+            if fp == "Foo.lean":
+                return fr, f"FORMATTED::{fp}"
+            raise review.BudgetExceededError(usage=review.TokenUsage(input_tokens=10**9))
+        monkeypatch.setattr(review, "analyze_file_changes_with_context", fake_review)
+        out, rc, health = self._run(monkeypatch, tmp_path, capsys, extra_argv=["--max-workers", "1"])
+        assert "FORMATTED::Foo.lean" in out                 # partial result preserved
+        assert "did not complete normally" in out           # banner fires
+        assert "Bar.lean" in out and "Skipped (per-run budget)" in out
+        assert "Verdict (deterministic): Approved" not in out
+        assert health["budget_exceeded"] is True and rc == 0
+
+    def test_verify_budget_trip_forces_incomplete_R9(self, monkeypatch, tmp_path, capsys):
+        # R9: per-file reviews all Approve, but a budget trip during verification (which
+        # runs BEFORE the verdict) must flip review_incomplete so the run cannot Approve.
+        fr = review.FileReview(verdict="Approved", analysis="fine")
+        monkeypatch.setattr(review, "analyze_file_changes_with_context",
+                            lambda *a, **k: (fr, "FORMATTED::ok"))
+        monkeypatch.setattr(review, "analyze_cross_file", lambda *a, **k: (None, ""))
+        monkeypatch.setattr(review, "synthesize_overall_summary",
+                            lambda *a, **k: (review.SynthesisSummary(tldr="t", precheck_summary="p", overall_verdict="Approved"), "S"))
+        monkeypatch.setattr(review, "verify_findings",
+                            lambda *a, **k: (_ for _ in ()).throw(review.BudgetExceededError()))
+        out, rc, health = self._run(monkeypatch, tmp_path, capsys)
+        assert "Verdict (deterministic): Approved" not in out   # R9: outage can't Approve
+        assert "did not complete normally" in out
+        assert health["degraded"] is True and rc == 0
+
+    def test_exception_body_not_leaked_R6(self, monkeypatch, tmp_path, capsys):
+        # R6 invariant: a (non-fatal) exception body must not reach the PR comment.
+        monkeypatch.setattr(review, "analyze_file_changes_with_context",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("SENTINEL_LEAK_9999")))
+        out, rc, health = self._run(monkeypatch, tmp_path, capsys)
+        assert "SENTINEL_LEAK_9999" not in out
+        # Contrast with the 402 case: a plain (non-spend/auth) error degrades GRACEFULLY
+        # — review_errors flag it, but it is NOT a loud outage (no banner, health clean).
+        assert "did not complete normally" not in out
+        assert (health is None or health["degraded"] is False)
+        assert rc == 0
+
+    def test_clean_run_has_no_banner(self, monkeypatch, tmp_path, capsys):
+        # No false alarm: a fully-successful run shows no banner and exits 0 even if
+        # loud-exit is enabled.
+        fr = review.FileReview(verdict="Approved", analysis="fine")
+        monkeypatch.setattr(review, "analyze_file_changes_with_context",
+                            lambda *a, **k: (fr, "FORMATTED::ok"))
+        monkeypatch.setattr(review, "analyze_cross_file", lambda *a, **k: (None, ""))
+        monkeypatch.setattr(review, "synthesize_overall_summary",
+                            lambda *a, **k: (review.SynthesisSummary(tldr="t", precheck_summary="p", overall_verdict="Approved"), "S"))
+        monkeypatch.setattr(review, "verify_findings", lambda *a, **k: [])
+        out, rc, health = self._run(monkeypatch, tmp_path, capsys, env={"LLM_LOUD_EXIT": "1"})
+        assert "did not complete normally" not in out
+        assert (health is None or health["degraded"] is False) and rc == 0
+
+
+class TestC3ActionWiring:
+    """Static + cross-boundary checks on review/action.yml and the entrypoint. No CI
+    exercises the action, so these guard the wiring: names matching Python constants,
+    env-only threading (no expression-injection), the heredoc rc-capture, the Post
+    Review condition, and the security drive-bys."""
+
+    def _action(self):
+        import yaml
+        p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "action.yml")
+        with open(p) as f:
+            return yaml.safe_load(f), open(p).read()
+
+    def _run_step(self, doc):
+        return next(s for s in doc["runs"]["steps"] if s.get("id") == "run_review")
+
+    def test_new_inputs_declared(self):
+        doc, _ = self._action()
+        for name in ("llm_max_run_tokens", "llm_max_run_cost", "llm_loud_exit"):
+            assert name in doc["inputs"]
+
+    def test_env_names_match_python_constants(self):
+        # Cross-boundary: the env keys the action sets must be exactly the names
+        # review.py reads — a LLM_MAX_RUN_TOKEN vs _TOKENS typo would ship it dark.
+        doc, _ = self._action()
+        env = self._run_step(doc)["env"]
+        assert review.ENV_MAX_RUN_TOKENS in env
+        assert review.ENV_MAX_RUN_COST in env
+        assert review.ENV_LOUD_EXIT in env
+        assert env[review.ENV_MAX_RUN_TOKENS] == "${{ inputs.llm_max_run_tokens }}"
+
+    def test_budget_inputs_never_interpolated_into_run_body(self):
+        # Expression-injection guard: the budget inputs must reach Python via env only,
+        # never spliced into a run: script.
+        doc, _ = self._action()
+        for s in doc["runs"]["steps"]:
+            run = s.get("run", "")
+            assert "inputs.llm_max_run" not in run
+            assert "inputs.llm_loud_exit" not in run
+
+    def test_run_step_captures_rc_and_closes_heredoc(self):
+        doc, _ = self._action()
+        run = self._run_step(doc)["run"]
+        assert "|| rc=$?" in run                       # errexit must not abort early
+        assert 'echo "$EOF_MARKER" >> $GITHUB_OUTPUT' in run
+        assert "exit $rc" in run
+        # rc-capture must come before the EOF echo, or review_text is unterminated.
+        assert run.index("|| rc=$?") < run.index('echo "$EOF_MARKER"')
+
+    def test_shell_emits_error_from_health_file(self):
+        doc, _ = self._action()
+        run = self._run_step(doc)["run"]
+        assert "review_health.json" in run and "::error::" in run
+
+    def test_post_review_condition_and_checkout_hardening(self):
+        doc, raw = self._action()
+        post = next(s for s in doc["runs"]["steps"] if s.get("name") == "Post Review")
+        cond = post["if"]
+        assert "!cancelled()" in cond and "outcome != 'skipped'" in cond
+        checkout = next(s for s in doc["runs"]["steps"] if s.get("name") == "Checkout repository")
+        assert checkout["with"]["persist-credentials"] is False
+        assert any("add-mask" in s.get("run", "") for s in doc["runs"]["steps"])
+
+    def test_entrypoint_is_sys_exit_main(self):
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "review.py")).read()
+        assert "sys.exit(main())" in src
+
+    def test_no_sys_exit_inside_any_finally(self):
+        # sys.exit in a finally masks tracebacks and (in review/action.yml) would kill
+        # the comment. Assert the AST has none in either tool.
+        import ast
+        for fn in ("review.py", "summary.py"):
+            path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                fn.split(".")[0], fn)
+            tree = ast.parse(open(path).read(), fn)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Try):
+                    for stmt in node.finalbody:
+                        for sub in ast.walk(stmt):
+                            if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                                    and sub.func.attr == "exit"
+                                    and isinstance(sub.func.value, ast.Name) and sub.func.value.id == "sys"):
+                                raise AssertionError(f"sys.exit inside a finally in {fn}")
+
+
 # --- extract_refs_from_instructions (freeform /review parsing) ---
 
 class TestExtractRefsFromInstructions:

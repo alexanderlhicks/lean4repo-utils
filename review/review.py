@@ -20,7 +20,11 @@ from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 
 from leanrepo_common.lean_utils import strip_comments, FileCache, file_path_to_module_name
-from leanrepo_common.llm_provider import LLMProvider, ContentPart, TokenUsage, create_provider
+from leanrepo_common.llm_provider import (
+    LLMProvider, ContentPart, TokenUsage, create_provider,
+    RunHealth, BudgetExceededError, is_hard_llm_failure, _reraise_if_fatal,
+    parse_run_budget, describe_exc,
+)
 from lean_tools import LeanToolbox, lean_available
 
 # --- Logging Setup ---
@@ -157,6 +161,101 @@ THINKING_BUDGET_LOW = 2048     # structural agents (Triage, Synthesis)
 # Whether agents may call the Lean toolchain (set by main() — enabled when
 # requested and `lake` is available). See _make_toolbox.
 LEAN_TOOLS_ENABLED = False
+
+# --- Per-run spend control + loud-on-failure (C3) ---
+# Env-var NAMES the entrypoint reads. Module constants so a test can import them and
+# assert action.yml wires the EXACT same names (a LLM_MAX_RUN_TOKEN vs _TOKENS typo
+# would otherwise ship the whole feature dark). Operator-config only — sourced from
+# the workflow/secrets env, NEVER from the untrusted PR checkout.
+ENV_MAX_RUN_TOKENS = "LLM_MAX_RUN_TOKENS"
+ENV_MAX_RUN_COST = "LLM_MAX_RUN_COST"
+ENV_LOUD_EXIT = "LLM_LOUD_EXIT"
+# Process exit code when loud-exit is enabled AND the run degraded. Applied ONLY at
+# the entrypoint via sys.exit(main()) — never inside a finally, and only after the
+# comment has been written. Do NOT set this action as a required check with loud-exit
+# on (a spend/quota outage would then block merges).
+LOUD_EXIT_CODE = 2
+# The health flag file review.py writes for the action's shell step to read (its
+# stdout is the PR-comment channel, so it cannot print ::error:: itself).
+REVIEW_HEALTH_FILE = "review_health.json"
+# Per-run health tracker; a fresh one is installed at the top of main(). Module-global
+# so the ThreadPool worker functions can record into it (thread-safe).
+run_health = RunHealth()
+
+# FIXED loud-failure strings (no interpolation — they render in the PR comment and,
+# for the annotation, in the checks UI / a workflow command; dynamic content there is
+# an injection channel). At most a status-code integer is ever added, never a message.
+_LOUD_BANNER = (
+    "> [!CAUTION]\n"
+    "> **This review did not complete normally.** One or more AI calls failed for a "
+    "spend, quota, or authentication reason, or the per-run budget was exhausted. The "
+    "results below are PARTIAL and must not be read as a clean review — see the Actions "
+    "log for details."
+)
+_LOUD_ANNOTATION = (
+    "AI review degraded: an LLM spend/quota/auth failure or per-run budget exhaustion "
+    "left the review incomplete — results are partial (see the run log)."
+)
+
+
+def _safe_md_path(s: str) -> str:
+    """Neutralise markdown-breaking characters in a PR-author-controlled file path
+    before it is rendered inside a code span in the bot's comment (git permits
+    backticks and newlines in path names, which could otherwise break out of the span
+    and inject attacker-authored markdown into a comment the review bot appears to own)."""
+    return s.replace("`", "").replace("\n", " ").replace("\r", " ")
+
+
+def _skipped_marker() -> str:
+    """A deterministic, orchestration-derived list of files skipped by a budget trip.
+    Pure run state — never LLM text — so a model-emitted fake 'budget exceeded'
+    narrative cannot impersonate it."""
+    if not run_health.skipped_files:
+        return ""
+    files = ", ".join(f"`{_safe_md_path(fp)}`" for fp in run_health.skipped_files)
+    return f"\n> **Skipped (per-run budget):** {files}\n"
+
+
+def _write_review_health() -> None:
+    """Write the health flag file for the action's shell step to read. review.py's own
+    stdout is the PR-comment channel (redirected to $GITHUB_OUTPUT), so it cannot print
+    the ::error:: workflow command itself — the shell step emits it from this file."""
+    try:
+        with open(REVIEW_HEALTH_FILE, "w") as f:
+            json.dump({
+                "degraded": run_health.degraded,
+                "budget_exceeded": run_health.budget_exceeded,
+                "hard_failures": run_health.hard_failures,
+            }, f)
+    except Exception as e:
+        logging.warning(f"Failed to write review health flag: {describe_exc(e)}")
+
+
+def _emit_degraded_review(per_file_reviews: dict) -> None:
+    """Render + print a degraded review comment after a fatal aborted the run
+    mid-flight (C3, STEP 5a). Leads with the CAUTION banner and a NOT-approved basis,
+    then whatever per-file reviews completed before the abort, plus the budget
+    skipped-files marker. The comment is STILL written, so the failure is loud and
+    visible rather than a silent red job with no explanation (acceptance #3)."""
+    comment = "### 🤖 AI Review\n\n" + _LOUD_BANNER + "\n"
+    comment += _skipped_marker()
+    comment += "\n" + _format_verdict_basis(
+        "Changes Requested",
+        ["The automated review did not complete (see the notice above); treat this PR as NOT reviewed."],
+    ) + "\n\n---\n"
+    completed = {fp: t for fp, t in (per_file_reviews or {}).items() if t}
+    if completed:
+        comment += "\n**Partial results — reviews that completed before the run stopped:**\n"
+        for fp, text in completed.items():
+            comment += f"\n<details><summary>📄 **Review for `{fp}`**</summary>\n\n{text}\n</details>\n"
+    comments = split_into_comments(comment, MAX_GITHUB_COMMENT_SIZE)
+    print(comments[0])
+    if len(comments) > 1:
+        try:
+            with open('review_comments.json', 'w') as f:
+                json.dump(comments[1:], f)
+        except Exception as e:
+            logging.warning(f"Failed to write overflow comments: {describe_exc(e)}")
 
 
 def _make_toolbox(module: Optional[str]) -> Optional[LeanToolbox]:
@@ -492,9 +591,10 @@ def get_document_content(urls_str: str) -> Tuple[List[ContentPart], List[str]]:
                 parts.append(ContentPart(type="text", data=f"--- Content from {url} ---\n{content}\n"))
                 logging.info(f"Added plain text part from: {url}")
         except Exception as e:
-            error_message = f"Error processing document '{url}': {e}"
-            logging.error(error_message)
-            errors.append(error_message)
+            # R6: the errors list renders into the PR comment's Context Warnings —
+            # keep the exception body out of it; log the detail (class/status/truncated).
+            logging.error(f"Error processing document '{url}': {describe_exc(e)}")
+            errors.append(f"Error processing document '{url}'.")
     return parts, errors
 
 def get_local_reference_parts(paths_str: str) -> Tuple[List[ContentPart], List[str]]:
@@ -533,7 +633,8 @@ def get_local_reference_parts(paths_str: str) -> Tuple[List[ContentPart], List[s
                 parts.append(ContentPart(type="text", data=f"--- Specification reference: {fp} ---\n{content}\n"))
             logging.info(f"Added local spec reference: {fp}")
         except Exception as e:
-            errors.append(f"Error reading spec reference {fp}: {e}")
+            logging.warning(f"Error reading spec reference {fp}: {describe_exc(e)}")
+            errors.append(f"Error reading spec reference {fp}.")
     return parts, errors
 
 
@@ -938,7 +1039,10 @@ def run_triage(provider: LLMProvider, diff_by_file: Dict[str, str], spec_checkli
         logging.info(f"Triage complete: {len(triage.clusters)} clusters identified.")
         return triage.clusters
     except Exception as e:
-        logging.error(f"Triage failed, falling back to per-file: {e}")
+        # R3: count a hard spend/auth/quota failure, then re-raise budget/hard into
+        # the top-level containment catch — never silently fall back on those.
+        _reraise_if_fatal(e)  # budget/hard → re-raised to the handler that records + contains it
+        logging.error(f"Triage failed, falling back to per-file: {describe_exc(e)}")
         return [ReviewCluster(name=f, files=[f], review_question="Review this file independently.", priority="medium")
                 for f in diff_by_file if f.endswith('.lean')]
 
@@ -988,7 +1092,8 @@ def analyze_specification(provider: LLMProvider, external_parts: List[ContentPar
         logging.info("Spec checklist generated successfully.")
         return checklist_str
     except Exception as e:
-        logging.error(f"Error during Spec Analysis: {e}")
+        _reraise_if_fatal(e)  # budget/hard → re-raised to the handler that records + contains it
+        logging.error(f"Error during Spec Analysis: {describe_exc(e)}")
         return ""
 
 def get_pr_diff(pr_number: str) -> Tuple[str, List[str]]:
@@ -1007,9 +1112,10 @@ def get_pr_diff(pr_number: str) -> Tuple[str, List[str]]:
         logging.info("Successfully fetched PR diff.")
         return diff, errors
     except subprocess.CalledProcessError as e:
-        error_message = f"Failed to fetch PR diff for PR #{pr_number}: {e.stderr}"
-        logging.error(error_message)
-        errors.append(error_message)
+        # R6/public-log: do not echo raw git stderr (may carry token-adjacent detail);
+        # log a sanitized description, surface a generic error upward.
+        logging.error(f"Failed to fetch PR diff for PR #{pr_number}: {describe_exc(e)}")
+        errors.append(f"Failed to fetch PR diff for PR #{pr_number}.")
         return "", errors
 
 
@@ -1286,8 +1392,11 @@ def _run_file_review(provider: LLMProvider, prompt_file: str, base_replacements:
                                 thinking_budget=THINKING_BUDGET_HIGH, toolbox=toolbox)
         return review, None
     except Exception as e:
-        logging.error(f"Error during API call for {context_label}: {e}")
-        return None, f"An error occurred while analyzing `{context_label}`: {e}"
+        _reraise_if_fatal(e)  # budget/hard → re-raised to the handler that records + contains it
+        # R6: the returned string is rendered into the PR comment — keep the exception
+        # body (model-influenced / provider payload) out of it; full detail to the log.
+        logging.error(f"Error during API call for {context_label}: {describe_exc(e)}")
+        return None, f"An error occurred while analyzing `{context_label}`."
 
 
 def analyze_file_changes_with_context(provider: LLMProvider, review_context: dict, file_path: str, file_diff: str, full_content: str, spec_checklist: str, external_parts: list, lean4_checklist: str, verdict_rules: str) -> Tuple[FileReview, str]:
@@ -1464,8 +1573,9 @@ def analyze_cross_file(provider: LLMProvider, diff_by_file: Dict[str, str], spec
         formatted = _format_cross_file(analysis)
         return analysis, formatted
     except Exception as e:
-        logging.error(f"Error during cross-file analysis: {e}")
-        return None, f"Cross-file analysis failed: {e}"
+        _reraise_if_fatal(e)  # budget/hard → re-raised to the handler that records + contains it
+        logging.error(f"Error during cross-file analysis: {describe_exc(e)}")
+        return None, "Cross-file analysis failed."
 
 
 def find_dependent_files(lake_graph_str: str, changed_files: set, repo_files_by_path: Dict[str, str],
@@ -1536,7 +1646,8 @@ def analyze_dependent_impact(provider: LLMProvider, dependents: Dict[str, str], 
             try:
                 results.append(future.result())
             except Exception as e:
-                logging.warning(f"Dependent-impact review failed for {path}: {e}")
+                _reraise_if_fatal(e)  # budget/hard → re-raised to the recording handler
+                logging.warning(f"Dependent-impact review failed for {path}: {describe_exc(e)}")
 
     merged = CrossFileAnalysis(
         analysis="\n\n".join(r.analysis for r in results if r and r.analysis),
@@ -1640,8 +1751,9 @@ def synthesize_overall_summary(provider: LLMProvider, per_file_reviews: Dict[str
         formatted = _format_synthesis(summary)
         return summary, formatted
     except Exception as e:
-        logging.error(f"Error during summary synthesis: {e}")
-        return None, f"An error occurred while synthesizing the summary: {e}"
+        _reraise_if_fatal(e)  # budget/hard → re-raised to the handler that records + contains it
+        logging.error(f"Error during summary synthesis: {describe_exc(e)}")
+        return None, "An error occurred while synthesizing the summary."
 
 
 def _verify_one_finding(provider: LLMProvider, finding: Finding, context: str, model: str,
@@ -1737,7 +1849,8 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
             try:
                 verdicts[id(finding)] = future.result()
             except Exception as e:
-                logging.warning(f"Verification errored for a finding (keeping it): {e}")
+                _reraise_if_fatal(e)  # budget/hard → re-raised to the recording handler
+                logging.warning(f"Verification errored for a finding (keeping it): {describe_exc(e)}")
                 verdicts[id(finding)] = None  # fail-open
 
     refuted: List[Tuple[Finding, FindingVerdict]] = []
@@ -2095,9 +2208,37 @@ def main():
         sys.exit(1)
 
     enable_web_search = args.enable_web_search or os.environ.get("ENABLE_WEB_SEARCH", "").lower() in ("1", "true", "yes")
-    provider = create_provider(api_key, enable_web_search=enable_web_search)
+
+    # Per-run spend ceiling (C3). Operator-config from the workflow/secrets env only.
+    # Empty/whitespace == unset == disabled (the value a default action run sends);
+    # a non-empty invalid value or a cost-only budget fails fast here, before any LLM
+    # call, rather than shipping the feature dark or silently unbounded.
+    try:
+        budget = parse_run_budget(os.environ.get(ENV_MAX_RUN_TOKENS), os.environ.get(ENV_MAX_RUN_COST))
+    except ValueError as e:
+        logging.error(f"Invalid per-run budget configuration ({ENV_MAX_RUN_TOKENS}/{ENV_MAX_RUN_COST}): {e}")
+        sys.exit(1)
+    global run_health
+    run_health = RunHealth()
+
+    # Delete any stale output files before we run. The Lean build step executes
+    # PR-branch lakefile code in this same workspace BEFORE review.py, and lean_tools
+    # run model-directed Lean IO — either could plant a crafted review_annotations.json
+    # / review_comments.json (posted verbatim by Post Review) or a review_health.json
+    # (read by the shell step). Start from a clean slate so only THIS run's files count.
+    for _stale in ("review_annotations.json", "review_comments.json", REVIEW_HEALTH_FILE):
+        try:
+            os.remove(_stale)
+        except FileNotFoundError:
+            pass
+        except OSError as _e:
+            logging.warning(f"Could not remove stale {_stale}: {describe_exc(_e)}")
+
+    provider = create_provider(api_key, enable_web_search=enable_web_search, budget=budget)
     logging.info(f"Using LLM provider: {provider.name}"
                  + (" (web search enabled)" if enable_web_search else ""))
+    if budget is not None:
+        logging.info(f"Per-run budget active: max_tokens={budget.max_tokens} max_cost={budget.max_cost}")
 
     # Lean toolchain access for the reviewer + verifier: enabled by default, but
     # only when requested and `lake` is actually available in the runner.
@@ -2110,6 +2251,13 @@ def main():
     if lean_tools_requested and not LEAN_TOOLS_ENABLED:
         logging.warning("Lean tools requested but `lake` was not found; agents will run without them.")
     logging.info(f"Lean toolchain tools: {'enabled' if LEAN_TOOLS_ENABLED else 'disabled'}")
+
+    # Partial-result accumulators, initialized BEFORE the orchestration try so the
+    # top-level containment handler can render whatever completed if a fatal (budget
+    # trip / hard LLM failure) aborts the run before these are reached inside the try.
+    per_file_reviews, per_file_structured, review_errors = {}, {}, []
+    cross_file_text, cross_file_structured = "", None
+    refuted_findings, clusters = [], []
 
     try:
         review_context = {
@@ -2205,7 +2353,7 @@ def main():
         cluster_info = {}          # file_path -> cluster name
 
         with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-            futures = []
+            future_to_file = {}
             for cluster in clusters:
                 # Build cluster context for multi-file clusters
                 cluster_context = ""
@@ -2232,17 +2380,27 @@ def main():
                 for file_path in cluster.files:
                     if file_path in diff_by_file:
                         cluster_info[file_path] = cluster.name
-                        futures.append(executor.submit(
+                        future_to_file[executor.submit(
                             process_file, file_path, diff_by_file[file_path],
                             review_context, cluster_context
-                        ))
+                        )] = file_path
 
-            for future in futures:
+            for future, submitted_path in future_to_file.items():
                 try:
                     file_path, structured, formatted = future.result()
+                except BudgetExceededError:
+                    # Idempotent (STEP 5b): once the budget trips, the already-queued
+                    # workers each raise at fresh entry — that burst is ONE budget event,
+                    # not N failures. Record the skipped file and keep going; the marker
+                    # plus forced review_incomplete carry the signal. Do NOT re-raise.
+                    run_health.record_budget_trip(submitted_path)
+                    continue
                 except Exception as e:
-                    logging.error(f"File review thread failed: {e}")
-                    review_errors.append(f"Agent B thread failed: {e}")
+                    if is_hard_llm_failure(e):
+                        raise  # hard failure → top-level containment records + contains it
+                    # R6: keep the exception body out of the PR-visible error line.
+                    logging.error(f"File review thread failed for {submitted_path}: {describe_exc(e)}")
+                    review_errors.append(f"Agent B failed for `{_safe_md_path(submitted_path)}`.")
                     continue
                 if file_path:
                     per_file_reviews[file_path] = formatted
@@ -2254,12 +2412,20 @@ def main():
         cross_file_text = ""
         cross_file_structured = None
         if len(lean_files) > 1:
-            cross_file_structured, cross_file_text = analyze_cross_file(
-                provider, diff_by_file, spec_checklist, pre_check_findings,
-                repo_context, args.additional_comments, external_parts,
-                args.cross_file_model
-            )
-            logging.info("Cross-file analysis complete.")
+            try:
+                cross_file_structured, cross_file_text = analyze_cross_file(
+                    provider, diff_by_file, spec_checklist, pre_check_findings,
+                    repo_context, args.additional_comments, external_parts,
+                    args.cross_file_model
+                )
+                logging.info("Cross-file analysis complete.")
+            except BudgetExceededError:
+                # Budget trip degrades in place: keep the completed per-file reviews,
+                # drop cross-file analysis, force review_incomplete. A HARD failure is
+                # NOT caught here — it propagates to the top-level containment catch.
+                run_health.record_budget_trip()
+                cross_file_structured, cross_file_text = None, ""
+                logging.warning("Cross-file analysis skipped: per-run budget exhausted.")
         else:
             logging.info("Single file PR — skipping cross-file analysis.")
             # Deterministic downstream impact note from lake graph
@@ -2280,7 +2446,7 @@ def main():
                             f"Changes to public API may affect these downstream consumers."
                         )
                 except Exception as e:
-                    logging.warning(f"Could not generate downstream impact note: {e}")
+                    logging.warning(f"Could not generate downstream impact note: {describe_exc(e)}")
 
         # --- Second-order: dependent-impact pass over unchanged consumers ---
         # Re-review the unchanged depth-1 importers of the changed files for
@@ -2295,10 +2461,15 @@ def main():
         )
         if dependents:
             logging.info(f"Dependent-impact: reviewing {len(dependents)} unchanged consumer(s).")
-            dep_result = analyze_dependent_impact(
-                provider, dependents, all_diffs, spec_checklist, external_parts,
-                args.cross_file_model, max_workers=args.max_workers,
-            )
+            try:
+                dep_result = analyze_dependent_impact(
+                    provider, dependents, all_diffs, spec_checklist, external_parts,
+                    args.cross_file_model, max_workers=args.max_workers,
+                )
+            except BudgetExceededError:
+                run_health.record_budget_trip()
+                dep_result = None
+                logging.warning("Dependent-impact pass skipped: per-run budget exhausted.")
             if dep_result is not None:
                 cross_file_structured = _merge_cross_file(cross_file_structured, dep_result)
                 cross_file_text = _format_cross_file(cross_file_structured)
@@ -2315,8 +2486,16 @@ def main():
                     diff_by_file, spec_checklist, args.verify_model,
                     max_workers=args.max_workers,
                 )
+            except BudgetExceededError:
+                # Verification runs BEFORE the verdict, so recording the trip here flips
+                # review_incomplete (via run_health.degraded) before the verdict computes —
+                # findings go out UNFILTERED but the run can no longer render Approved.
+                run_health.record_budget_trip()
+                logging.warning("Verification pass skipped: per-run budget exhausted; reporting unfiltered findings.")
             except Exception as e:
-                logging.warning(f"Verification pass failed; reporting unfiltered findings: {e}")
+                if is_hard_llm_failure(e):
+                    raise  # hard failure → top-level containment records + contains it
+                logging.warning(f"Verification pass failed; reporting unfiltered findings: {describe_exc(e)}")
             if refuted_findings:
                 # Re-render the affected outputs from the filtered structured data.
                 for fp, r in per_file_structured.items():
@@ -2333,6 +2512,8 @@ def main():
             bool(review_errors)
             or any(fp not in reviewed_ok for fp in lean_files)
             or any(r.coverage_incomplete for r in per_file_structured.values() if r)
+            or run_health.degraded  # R9: any hard LLM failure / budget trip forces incomplete —
+                                    # compute_deterministic_verdict then cannot Approve an outage run.
         )
         det_verdict, det_reasons = compute_deterministic_verdict(
             precheck_scan, per_file_structured, cross_file_structured, review_incomplete
@@ -2351,20 +2532,49 @@ def main():
             if cross_file_text:
                 summary_text += f"\n{cross_file_text}\n"
         else:
-            summary_structured, summary_text = synthesize_overall_summary(
-                provider, per_file_reviews, per_file_structured, spec_checklist,
-                pre_check_findings, cross_file_text, verdict_rules, args.synthesis_model
+            # Synthesis runs AFTER the authoritative verdict, so a trip here must keep
+            # the verdict standing (it is already computed): degrade the narrative in
+            # place, record the failure (→ banner + review_incomplete), and never
+            # contradict the verdict. Budget and hard failures both degrade here rather
+            # than aborting a fully-reviewed run to a bare degraded comment.
+            try:
+                summary_structured, summary_text = synthesize_overall_summary(
+                    provider, per_file_reviews, per_file_structured, spec_checklist,
+                    pre_check_findings, cross_file_text, verdict_rules, args.synthesis_model
+                )
+                # The LLM writes the narrative, but the verdict is authoritative and
+                # computed deterministically — override whatever the model chose.
+                if summary_structured is not None:
+                    summary_structured.overall_verdict = det_verdict
+                    summary_text = _format_synthesis(summary_structured)
+            except Exception as e:
+                if isinstance(e, BudgetExceededError):
+                    run_health.record_budget_trip()
+                elif is_hard_llm_failure(e):
+                    run_health.record_hard_failure()
+                else:
+                    raise
+                logging.warning(f"Synthesis degraded: {describe_exc(e)}")
+                summary_text = "*Overall summary unavailable — the run degraded before synthesis completed; the per-file reviews above stand.*"
+
+        # Synthesis (and its degradation) happens AFTER the verdict is computed, so a
+        # failure there flips run_health.degraded without having flipped review_incomplete.
+        # Re-derive the verdict when that occurs, so an outage can never leave an
+        # "Approved" standing directly under the CAUTION banner (R9 for the post-verdict
+        # path). Idempotent when degraded was already reflected before the verdict.
+        if run_health.degraded and not review_incomplete:
+            review_incomplete = True
+            det_verdict, det_reasons = compute_deterministic_verdict(
+                precheck_scan, per_file_structured, cross_file_structured, review_incomplete
             )
-            # The LLM writes the narrative, but the verdict is authoritative and
-            # computed deterministically — override whatever the model chose.
-            if summary_structured is not None:
-                summary_structured.overall_verdict = det_verdict
-                summary_text = _format_synthesis(summary_structured)
+            logging.info(f"Verdict re-derived after post-verdict degradation: {det_verdict}")
 
         # Format the final comment for printing to stdout. The authoritative
         # verdict + its basis lead so the reader sees it first.
         final_comment = (
-            f"### 🤖 AI Review\n\n{_format_verdict_basis(det_verdict, det_reasons)}\n\n"
+            "### 🤖 AI Review\n\n"
+            + ((_LOUD_BANNER + "\n" + _skipped_marker() + "\n") if run_health.degraded else "")
+            + f"{_format_verdict_basis(det_verdict, det_reasons)}\n\n"
             f"**Overall Summary:**\n{summary_text}\n\n---\n"
         )
 
@@ -2432,7 +2642,7 @@ def main():
                     f"({len(comments) - 1} follow-up comment(s))."
                 )
             except Exception as e:
-                logging.warning(f"Failed to write overflow comments: {e}")
+                logging.warning(f"Failed to write overflow comments: {describe_exc(e)}")
 
         # Generate line-level annotations for GitHub Review API
         annotations = _build_line_annotations(per_file_structured, diff_by_file)
@@ -2442,9 +2652,40 @@ def main():
                     json.dump(annotations, f, indent=2)
                 logging.info(f"Wrote {len(annotations)} line annotations to review_annotations.json")
             except Exception as e:
-                logging.warning(f"Failed to write annotations: {e}")
+                logging.warning(f"Failed to write annotations: {describe_exc(e)}")
+    except BudgetExceededError:
+        # Top-level containment (STEP 5a): a budget trip re-raised from an early
+        # sequential phase (triage/spec/cross-file) that could not degrade in place.
+        # Do NOT crash with no comment — render a degraded comment from whatever
+        # completed, then exit 0 (or the loud-exit code, applied at the entrypoint).
+        run_health.record_budget_trip()
+        logging.error("Review aborted early: per-run budget exhausted; reporting as incomplete.")
+        _emit_degraded_review(per_file_reviews)
+    except Exception as e:
+        # A hard spend/auth/quota failure re-raised to here. Anything NOT hard keeps
+        # today's behaviour: propagate (a genuine bug must not be reported as a clean
+        # review). This is the single recording site for a hard failure that aborts the
+        # run — the leaf R3 sites only re-raise, so it is counted exactly once here.
+        if not is_hard_llm_failure(e):
+            raise
+        run_health.record_hard_failure()
+        logging.error(f"Review aborted: hard LLM failure; reporting as incomplete: {describe_exc(e)}")
+        _emit_degraded_review(per_file_reviews)
     finally:
         logging.info(token_tracker.summary())
 
+    # Health flag for the action's shell step (which emits the ::error:: annotation —
+    # review.py's stdout is the PR-comment channel and must not print it itself).
+    _write_review_health()
+
+    # Loud-exit (R1): a non-zero process exit ONLY when explicitly opted in AND the
+    # run degraded — computed here, outside any finally, so it cannot mask a traceback
+    # and runs only after the comment above has been printed. Default OFF.
+    loud_exit = os.environ.get(ENV_LOUD_EXIT, "").strip().lower() in ("1", "true", "yes")
+    if loud_exit and run_health.degraded:
+        logging.warning("LLM_LOUD_EXIT enabled and the run degraded — exiting non-zero.")
+        return LOUD_EXIT_CODE
+    return 0
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

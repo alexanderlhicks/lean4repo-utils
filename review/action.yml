@@ -71,6 +71,18 @@ inputs:
     description: 'Run the adversarial verification pass that filters likely-false-positive findings. "false" to disable.'
     required: false
     default: 'true'
+  llm_max_run_tokens:
+    description: 'Per-run token ceiling (C3). Once exceeded, no further LLM calls are made and the run degrades gracefully (partial results + a loud banner) instead of consuming unbounded spend on a shared key. Empty = disabled. The token ceiling is authoritative; source from workflow/secrets config, NEVER from PR content.'
+    required: false
+    default: ''
+  llm_max_run_cost:
+    description: 'Per-run cost ceiling in OpenRouter credits (C3). Requires llm_max_run_tokens (a cost-only budget is rejected — cost can be BYOK-fee-only or absent). Empty = disabled.'
+    required: false
+    default: ''
+  llm_loud_exit:
+    description: 'When "true", the action exits non-zero if the run degraded (spend/quota/auth failure or budget exhausted), AFTER posting the comment. Default "false" keeps the job green with a banner + error annotation. Do NOT mark this action as a required check with loud-exit enabled — a provider outage would then block all merges.'
+    required: false
+    default: 'false'
 outputs:
   review_text:
     description: "The generated review text"
@@ -82,6 +94,20 @@ runs:
       uses: actions/checkout@v7
       with:
         fetch-depth: 0
+        # Do not leave the GITHUB_TOKEN in .git/config: the Lean build step below runs
+        # PR-branch lakefile code in this same workspace, and the reviewer's lean_tools
+        # execute model-directed Lean IO. Nothing here pushes, so drop the credential.
+        # (Full lean_tools sandboxing is tracked as a separate roadmap item.)
+        persist-credentials: false
+
+    - name: Mask secrets
+      shell: bash
+      env:
+        API_KEY: ${{ inputs.api_key }}
+        GH_TOKEN_TO_MASK: ${{ inputs.github_token }}
+      run: |
+        echo "::add-mask::$API_KEY"
+        echo "::add-mask::$GH_TOKEN_TO_MASK"
 
     - name: Install uv
       uses: astral-sh/setup-uv@v8.2.0
@@ -147,6 +173,12 @@ runs:
         SYNTHESIS_MODEL: ${{ inputs.synthesis_model }}
         VERIFY_MODEL: ${{ inputs.verify_model }}
         VERIFY_FINDINGS: ${{ inputs.verify_findings }}
+        # Per-run spend control (C3). Threaded ONLY through env (never interpolated into
+        # the run: body — that would be a GHA expression-injection sink). Empty == unset
+        # == disabled. Names must match review.py's ENV_MAX_RUN_* constants exactly.
+        LLM_MAX_RUN_TOKENS: ${{ inputs.llm_max_run_tokens }}
+        LLM_MAX_RUN_COST: ${{ inputs.llm_max_run_cost }}
+        LLM_LOUD_EXIT: ${{ inputs.llm_loud_exit }}
       run: |
         # Repo context = files discovered from the dependency graph; paths
         # mentioned in additional_comments are merged in by review.py itself.
@@ -156,6 +188,11 @@ runs:
         # We use a special "end of file" marker to handle multiline output
         EOF_MARKER=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
         echo "review_text<<$EOF_MARKER" >> $GITHUB_OUTPUT
+        # Capture review.py's exit code WITHOUT letting `set -e -o pipefail` abort the
+        # step before the heredoc terminator is written: a non-zero exit (loud-exit)
+        # would otherwise leave review_text unterminated/empty and Post Review would
+        # post nothing even with if: !cancelled().
+        rc=0
         uv run --project "${{ github.action_path }}" --no-dev --frozen python "${{ github.action_path }}/review.py" \
           --pr-number "$PR_NUMBER" \
           --repo-context-refs "$REPO_CONTEXT_REFS" \
@@ -166,10 +203,19 @@ runs:
           ${TRIAGE_MODEL:+--triage-model "$TRIAGE_MODEL"} \
           ${REVIEW_MODEL:+--review-model "$REVIEW_MODEL"} \
           ${CROSS_FILE_MODEL:+--cross-file-model "$CROSS_FILE_MODEL"} \
-          ${SYNTHESIS_MODEL:+--synthesis-model "$SYNTHESIS_MODEL"} >> $GITHUB_OUTPUT
+          ${SYNTHESIS_MODEL:+--synthesis-model "$SYNTHESIS_MODEL"} >> $GITHUB_OUTPUT || rc=$?
         echo "$EOF_MARKER" >> $GITHUB_OUTPUT
+        # review.py's stdout is the PR-comment channel, so it cannot print workflow
+        # commands itself — it writes review_health.json and we emit the annotation here.
+        if [ -f review_health.json ] && grep -qE '"degraded": *true' review_health.json; then
+          echo "::error::AI review degraded: an LLM spend/quota/auth failure or per-run budget exhaustion left the review incomplete — results are partial (see the run log)."
+        fi
+        exit $rc
 
     - name: Post Review
+      # Post even on a non-green run (loud-exit) so the banner/partial results are still
+      # delivered — but NOT when the run was cancelled or the review step never ran.
+      if: ${{ !cancelled() && steps.run_review.outcome != 'skipped' }}
       uses: actions/github-script@v9
       env:
         REVIEW_TEXT: ${{ steps.run_review.outputs.review_text }}
@@ -179,12 +225,18 @@ runs:
         retries: 3
         script: |
           const fs = require('fs');
+          const reviewText = process.env.REVIEW_TEXT || '';
+          // Guard: a pre-provider crash (e.g. missing pr.diff) can leave review_text
+          // empty. Do not post an empty/header-only comment — bail out quietly.
+          if (!reviewText.trim()) {
+            console.log('review_text is empty — skipping comment post.');
+            return;
+          }
           let headerText = '### 🤖 Initial AI review';
           if (process.env.ADDITIONAL_COMMENTS) {
             headerText = '### 🤖 AI Review (with review instructions)';
           }
           const header = headerText + '\n\n';
-          const reviewText = process.env.REVIEW_TEXT || '';
           const body = reviewText.startsWith('### 🤖 ') ? reviewText : header + reviewText;
           const { owner, repo } = context.repo;
           const pr_number = parseInt(process.env.PR_NUMBER);
@@ -290,4 +342,4 @@ runs:
       if: always()
       shell: bash
       run: |
-        rm -f ./review_annotations.json ./review_comments.json
+        rm -f ./review_annotations.json ./review_comments.json ./review_health.json
