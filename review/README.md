@@ -222,6 +222,26 @@ Tune to your project's characteristics:
 | `cross_file_model` | No | `model` | Model override for the Cross-File Analysis agent |
 | `synthesis_model` | No | `model` | Model override for the Synthesis agent |
 | `verify_model` | No | `z-ai/glm-5.2` | Model for the verification pass. Defaults to a **different open-weight family** than `model` for an independent check (avoids self-agreement bias). Override with any slug; keep it a different family than `model`. |
+| `llm_max_run_tokens` | No | `""` | Per-run token ceiling. Once exceeded, no further LLM calls are made and the run degrades gracefully (partial results + a loud banner + a non-Approved verdict) instead of draining a shared key. Empty = disabled. The token ceiling is authoritative. |
+| `llm_max_run_cost` | No | `""` | Per-run cost ceiling in OpenRouter credits. **Requires** `llm_max_run_tokens` (a cost-only budget is rejected — cost can be BYOK-fee-only or absent). Empty = disabled. |
+| `llm_loud_exit` | No | `false` | When `true`, the action exits **non-zero** if the run degraded (spend/quota/auth failure or budget exhausted), *after* posting the comment. Default `false` keeps the job green with a banner + `::error::` annotation. See the warning below. |
+
+> **Per-run spend control (C3).** `llm_max_run_tokens` / `llm_max_run_cost` bound a
+> single run so one huge or hostile PR can't drain the shared key; they layer on top
+> of OpenRouter's own per-key credit limit (the bug-proof hard cap — they do **not**
+> bound aggregate spend across runs). A spend/quota/auth failure or budget trip is now
+> **loud**: a `> [!CAUTION]` banner leads the comment, the verdict can no longer be
+> *Approved*, and a `::error::` annotation is emitted — the run no longer fails open to
+> a green check. **Do not mark this action as a required check with `llm_loud_exit`
+> enabled** — a provider outage would then block every merge. These inputs are
+> operator config; source them from the workflow/secrets, never from PR content.
+>
+> **Actions logs are public** on public repos: exception detail (class + status +
+> truncated message) goes to the log, never into the PR comment. **Security:** the
+> reviewer's `lean_tools` execute model-directed Lean IO in the workspace, and the
+> Lean build step runs the PR branch's `lakefile` code. Until full `lean_tools`
+> sandboxing lands (tracked separately), do **not** wire this action under
+> `pull_request_target` with a privileged token on an untrusted-fork PR.
 
 ### Advanced tuning (environment variables)
 
@@ -235,6 +255,9 @@ Tune to your project's characteristics:
 | `MAX_PROMPT_CHARS` | `2500000` | Per-call assembled-prompt budget; bulk context is trimmed to fit. |
 | `LLM_MAX_CONCURRENCY` | `5` | Cap on concurrent in-flight API calls (keep aligned with `--max-workers`). |
 | `ESCAPE_HATCH_ALLOWLIST` | `""` | Same as the `escape_hatch_allowlist` input. |
+| `LLM_MAX_RUN_TOKENS` | `""` | Same as the `llm_max_run_tokens` input (empty = disabled). |
+| `LLM_MAX_RUN_COST` | `""` | Same as the `llm_max_run_cost` input (requires `LLM_MAX_RUN_TOKENS`). |
+| `LLM_LOUD_EXIT` | `false` | Same as the `llm_loud_exit` input. Non-zero exit on a degraded run, after the comment posts. |
 | `ENABLE_WEB_SEARCH` | `false` | Same as the `enable_web_search` input. |
 | `SPEC_REFS` | `""` | Same as the `spec_refs` input. |
 

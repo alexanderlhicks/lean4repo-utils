@@ -62,6 +62,20 @@ jobs:
 | `upstream_path` | Path prefix for upstream-bound files. If changed files match, a reminder is shown. | No | |
 | `max_file_diff_chars` | Max characters of a single file's diff sent to the summarizer before it is truncated at a hunk boundary. Rough guide: Lean averages ~50 chars/line (~4 chars/token), so `60000` ≈ ~1,200 lines ≈ ~15k tokens. Lower for a smaller-context model. | No | `60000` |
 | `max_instructions_diff_chars` | Max characters of the whole-PR diff sent to the additional-instructions agent in one call; above this the analysis is skipped. Must fit the model's context alongside the instructions file and response. Rough guide: `400000` ≈ ~8,000 changed lines ≈ ~100k tokens (fits a ~128k-token model). Lower for a smaller-context model. | No | `400000` |
+| `llm_max_run_tokens` | Per-run token ceiling. Once exceeded, no further LLM calls are made and the summary degrades gracefully (partial results + a loud banner) instead of draining a shared key. Empty = disabled. The token ceiling is authoritative. | No | `` |
+| `llm_max_run_cost` | Per-run cost ceiling in OpenRouter credits. **Requires** `llm_max_run_tokens` (a cost-only budget is rejected — cost can be BYOK-fee-only or absent). Empty = disabled. | No | `` |
+| `llm_loud_exit` | When `true`, the action exits **non-zero** if the run degraded (spend/quota/auth failure or budget exhausted), *after* posting the comment. Default `false` keeps the job green with a banner + `::error::` annotation. | No | `false` |
+
+> **Per-run spend control (C3).** `llm_max_run_tokens` / `llm_max_run_cost` bound a
+> single run so one large PR can't drain the shared key; they layer on top of
+> OpenRouter's per-key credit limit (the hard cap — they do **not** bound aggregate
+> spend across runs). A spend/quota/auth failure or budget trip is now **loud**: a
+> `> [!CAUTION]` banner leads the posted comment and a `::error::` annotation is
+> emitted, instead of failing open to a green check. **Do not mark this action as a
+> required check with `llm_loud_exit` enabled** — a provider outage would then block
+> every merge. These inputs are operator config (source from workflow/secrets, never
+> PR content). Actions logs are public: exception detail goes to the log, never the
+> PR comment.
 
 ## How it Works
 

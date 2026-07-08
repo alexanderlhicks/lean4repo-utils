@@ -18,7 +18,11 @@ from github.Repository import Repository
 from pydantic import BaseModel, Field
 
 from leanrepo_common.lean_utils import is_in_comment
-from leanrepo_common.llm_provider import ContentPart, LLMProvider, TokenUsage, create_provider
+from leanrepo_common.llm_provider import (
+    ContentPart, LLMProvider, TokenUsage, create_provider,
+    RunHealth, BudgetExceededError, is_hard_llm_failure,
+    parse_run_budget, describe_exc,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -75,6 +79,61 @@ MAX_LISTED_DECLS = 150  # Cap on individually-listed declarations (grouped by fi
 
 # --- Global Provider and Token Tracker ---
 _provider: LLMProvider = None  # Initialized in main()
+
+# --- Per-run spend control + loud-on-failure (C3) ---
+# Env-var NAMES the entrypoint reads (module constants so a test can assert
+# action.yml wires the exact same names). Operator-config only — sourced from the
+# workflow/secrets env, NEVER from the untrusted PR checkout.
+ENV_MAX_RUN_TOKENS = "LLM_MAX_RUN_TOKENS"
+ENV_MAX_RUN_COST = "LLM_MAX_RUN_COST"
+ENV_LOUD_EXIT = "LLM_LOUD_EXIT"
+# Process exit code when loud-exit is enabled AND the run degraded — applied only at
+# the entrypoint via sys.exit(main()), after the comment is posted. Do NOT mark this
+# action as a required check with loud-exit on.
+LOUD_EXIT_CODE = 2
+# Per-run health tracker; a fresh one is installed at the top of main(). Module-global
+# so the ThreadPool worker paths can record into it (thread-safe).
+run_health = RunHealth()
+
+# FIXED loud-failure banner (no interpolation — it renders in the PR comment; dynamic
+# content there would be an injection channel). summary.py posts a single comment and
+# has no gating verdict, so — unlike review.py's re-raise-into-containment — each LLM
+# site degrades IN PLACE and records into run_health; the banner below is prepended to
+# the posted comment whenever run_health.degraded, so a spend/quota/auth failure stays
+# loud (banner + ::error:: to stdout + optional loud-exit) instead of a silent green.
+_LOUD_BANNER = (
+    "> [!CAUTION]\n"
+    "> **This summary did not complete normally.** One or more AI calls failed for a "
+    "spend, quota, or authentication reason, or the per-run budget was exhausted. The "
+    "summary below is PARTIAL — see the Actions log for details."
+)
+_LOUD_ANNOTATION = (
+    "AI summary degraded: an LLM spend/quota/auth failure or per-run budget exhaustion "
+    "left the summary incomplete — results are partial (see the run log)."
+)
+
+
+def _note_failure(exc: BaseException) -> None:
+    """Record a hard/budget LLM failure into run_health WITHOUT re-raising. summary.py
+    degrades in place and stays loud via run_health.degraded (banner + loud-exit); it
+    does not crash the run, so nothing needs a top-level containment catch."""
+    if isinstance(exc, BudgetExceededError):
+        run_health.record_budget_trip()
+    elif is_hard_llm_failure(exc):
+        run_health.record_hard_failure()
+
+
+def _safe_md_path(s: str) -> str:
+    """Neutralise markdown-breaking chars in a PR-author-controlled path before it is
+    rendered inside a code span in the bot's comment."""
+    return s.replace("`", "").replace("\n", " ").replace("\r", " ")
+
+
+def _summary_skipped_marker() -> str:
+    if not run_health.skipped_files:
+        return ""
+    files = ", ".join(f"`{_safe_md_path(fp)}`" for fp in run_health.skipped_files)
+    return f"\n> **Skipped (per-run budget):** {files}\n"
 
 
 class TokenTracker:
@@ -328,7 +387,8 @@ def triage_files(file_paths, diff_by_file, model_name):
     try:
         parsed = _call_llm(prompt, model_name, schema)
     except Exception as exc:
-        print(f"Warning: Triage agent failed ({exc}). Proceeding with all candidate files.")
+        _note_failure(exc)  # loud via run_health.degraded; degrade in place (no re-raise)
+        print(f"Warning: Triage agent failed ({describe_exc(exc)}). Proceeding with all candidate files.")
         return candidates, []
 
     if use_tiered:
@@ -396,7 +456,8 @@ def synthesize_summary_staged(per_file_summaries, model_name, pr_title, pr_body,
             try:
                 result = _call_prose(prompt, model_name)
             except Exception as exc:
-                print(f"Warning: Sub-synthesis for {group_key}/ failed ({exc}). Falling back to raw summaries.")
+                _note_failure(exc)
+                print(f"Warning: Sub-synthesis for {group_key}/ failed ({describe_exc(exc)}). Falling back to raw summaries.")
                 result = ""
             if result:
                 group_summaries.append(f"**{group_key}/**: {result.strip()}")
@@ -1069,7 +1130,7 @@ def find_sorry_issues(repo: Repository):
     try:
         return list(repo.get_issues(state="open", labels=["proof wanted"]))
     except Exception as e:
-        print(f"Warning: Could not fetch issues. {e}")
+        print(f"Warning: Could not fetch issues. {describe_exc(e)}")
         return []
 
 # --- PR Title Validation ---
@@ -1129,8 +1190,20 @@ def main():
     if reasoning_effort.strip() and not provider_kwargs:
         print(f"Warning: ignoring unrecognized reasoning_effort '{reasoning_effort.strip()}' (expected low/medium/high).")
 
-    _provider = create_provider(api_key, **provider_kwargs)
+    # Per-run spend ceiling (C3). Operator-config from the workflow/secrets env only.
+    # Empty/whitespace == unset == disabled; a non-empty invalid or cost-only value
+    # fails fast here, before any LLM call.
+    try:
+        budget = parse_run_budget(os.environ.get(ENV_MAX_RUN_TOKENS), os.environ.get(ENV_MAX_RUN_COST))
+    except ValueError as e:
+        sys.exit(f"Error: invalid per-run budget configuration ({ENV_MAX_RUN_TOKENS}/{ENV_MAX_RUN_COST}): {e}")
+    global run_health
+    run_health = RunHealth()
+
+    _provider = create_provider(api_key, budget=budget, **provider_kwargs)
     logging.info(f"Using LLM provider: {_provider.name}")
+    if budget is not None:
+        logging.info(f"Per-run budget active: max_tokens={budget.max_tokens} max_cost={budget.max_cost}")
     if provider_kwargs:
         logging.info(f"Reasoning effort: {reasoning_effort.strip().lower()}")
 
@@ -1241,18 +1314,30 @@ def main():
                     if cache:
                         cache.update(fp, file_diff_hash, summary)
                     summary_by_file[fp] = summary
+                    run_health.record_fresh_success()  # a genuinely fresh (non-cache) generation succeeded (R5)
                 else:
                     print(f"Warning: Summarization for {fp} returned no result.")
                     summary_by_file[fp] = "*Summary unavailable — AI generation failed after retries.*"
+            except BudgetExceededError:
+                # Idempotent skip: once the budget trips, already-queued workers each
+                # raise at fresh entry — one budget event, recorded per file, not N
+                # failures. The marker + prepended banner carry the signal.
+                run_health.record_budget_trip(fp)
+                summary_by_file[fp] = "*Summary unavailable — per-run budget exhausted.*"
             except Exception as exc:
-                print(f"Warning: Summarization for {fp} generated an exception: {exc}")
-                summary_by_file[fp] = f"*Summary unavailable — error: {exc}*"
+                if is_hard_llm_failure(exc):
+                    run_health.record_hard_failure()
+                # R6: this string is rendered into the comment AND fed back into the
+                # synthesis prompt — keep the exception body out of both; log the detail.
+                print(f"Warning: Summarization for {fp} generated an exception: {describe_exc(exc)}")
+                summary_by_file[fp] = "*Summary unavailable — AI generation failed.*"
 
         if instructions_future:
             try:
                 instructions_report = instructions_future.result()
             except Exception as exc:
-                print(f"Warning: Additional-instructions analysis generated an exception: {exc}")
+                _note_failure(exc)
+                print(f"Warning: Additional-instructions analysis generated an exception: {describe_exc(exc)}")
 
     # Assemble per-file summaries in original file order for deterministic output
     for fp in files_to_summarize:
@@ -1289,7 +1374,8 @@ def main():
         else:
             ai_summary = synthesize_summary(synthesis_inputs, model_name, pr_title, pr_body, pr_type_hint)
     except Exception as e:
-        print(f"Error synthesizing final summary: {e}")
+        _note_failure(e)
+        print(f"Error synthesizing final summary: {describe_exc(e)}")
         # Fallback if synthesis fails
         ai_summary = "Failed to generate AI summary. Please check the per-file summaries and statistics below."
 
@@ -1316,6 +1402,14 @@ def main():
         instructions_skipped,
     )
 
+    # Loud-on-failure: prepend the fixed banner + budget skip-marker when the run
+    # degraded, and emit a GitHub ::error:: annotation. summary.py's stdout is NOT the
+    # comment channel (it posts via the API), so printing the workflow command here is
+    # safe and lands in the checks UI.
+    if run_health.degraded:
+        final_summary = _LOUD_BANNER + "\n" + _summary_skipped_marker() + "\n\n" + final_summary
+        print(f"::error::{_LOUD_ANNOTATION}")
+
     if pr:
         post_github_comment(pr, final_summary)
     elif "GITHUB_TOKEN" in os.environ:
@@ -1325,5 +1419,14 @@ def main():
 
     logging.info(token_tracker.summary())
 
+    # Loud-exit (R1): non-zero process exit ONLY when explicitly opted in AND the run
+    # degraded. Computed after the comment is posted; applied at the entrypoint, never
+    # in a finally. Default OFF.
+    loud_exit = os.environ.get(ENV_LOUD_EXIT, "").strip().lower() in ("1", "true", "yes")
+    if loud_exit and run_health.degraded:
+        logging.warning("LLM_LOUD_EXIT enabled and the run degraded — exiting non-zero.")
+        return LOUD_EXIT_CODE
+    return 0
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

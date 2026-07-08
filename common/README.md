@@ -40,7 +40,8 @@ cost figure (an explicit `0.0` from a `:free` model is treated as known), so spe
 control can fail closed instead of silently counting $0. The public surface
 (`ContentPart`, `TokenUsage`, `OpenRouterProvider`, `create_provider`, plus the
 per-run spend-control primitives `RunBudget`, `BudgetExceededError`,
-`is_hard_llm_failure`) is kept stable for callers.
+`is_hard_llm_failure`, `RunHealth`, `parse_run_budget`, `describe_exc`) is kept
+stable for callers.
 
 `create_provider` also accepts three operator-trusted tuning knobs (**never source
 them from an untrusted PR checkout**):
@@ -92,6 +93,61 @@ provider = create_provider(api_key, budget=RunBudget(max_tokens=200_000, max_cos
 failure (`401`/`402`, or an auth-shaped `403`) that must be surfaced loudly, versus
 a transient one (`408`/`429`/`5xx`/timeout) or a moderation `403` (which is driven
 by attacker-controllable PR input and so is *not* treated as a hard failure).
+
+### Loud-on-failure (`RunHealth`, `_reraise_if_fatal`, `describe_exc`)
+
+Before C3 the tools *failed open*: a `402`/auth/quota error was caught, swallowed,
+and the job still exited `0` — a spend or outage looked like a clean pass. C3
+inverts that default:
+
+- `_reraise_if_fatal(exc)` is the first thing every LLM-touching `except` does:
+  a `BudgetExceededError` or `is_hard_llm_failure(exc)` is re-raised into a
+  top-level containment handler rather than degraded away. Everything else keeps
+  its existing fail-soft behaviour.
+- `RunHealth` is a thread-safe per-run tracker (hard-failure count, budget-trip
+  flag, deterministic skipped-files list). Its `degraded` property is the single
+  source of truth for the loud banner **and** for forcing a review's
+  `review_incomplete` — so a total outage can never render an *Approved* verdict.
+  It counts *fresh* (non-cache, non-fallback) successes separately, so a warm
+  cache or an all-fallback run can neither suppress the banner (a real failure
+  still shows) nor raise a false one.
+- `describe_exc(exc)` renders an exception as `Class(status=NNN): truncated msg`
+  for the (world-readable) Actions log. PR-visible comments never interpolate an
+  exception body at all — model output and provider payloads stay out of the
+  comment channel; only a fixed banner string (plus, at most, a status integer)
+  is rendered.
+
+The consuming tools (`review.py`, `summary.py`) read the ceiling from
+`LLM_MAX_RUN_TOKENS` / `LLM_MAX_RUN_COST` (parsed by `parse_run_budget`, empty ==
+disabled) and opt into a non-zero exit with `LLM_LOUD_EXIT`. The exit code is
+applied only at the process entrypoint, after the comment is written — never in a
+`finally`.
+
+**Provider contract change (all consumers).** When a budget trip or hard failure
+occurs *inside* the tool-gathering phase, the provider now re-raises it instead of
+silently making a second, doomed tool-less call. Any caller of `create_provider`
+(including `sorry-tracker`, which passes no budget and so is bounded only by the
+OpenRouter key cap) sees this: a fatal spend/auth error propagates rather than
+being retried into more spend.
+
+**Caveats (verified against the OpenRouter docs on 2026-07-08 —
+<https://openrouter.ai/docs/api/reference/overview> and its usage-accounting, errors,
+and BYOK sub-pages; all statements paraphrased, none copied):**
+
+- Per-run ceilings do **not** bound aggregate spend across repeated (attacker-
+  triggered) runs — the per-key credit limit + concurrency settings are that layer.
+- **BYOK**: `usage.cost` is fee-only and can be `0.0` while real upstream spend
+  occurs; the true figure is `cost_details.upstream_inference_cost` (populated only
+  for BYOK). The response `is_byok` flag deterministically flips `cost_reliable`, so
+  the token ceiling stays authoritative. Shape-pinned to a live capture, not
+  live-verified against a BYOK key (none available).
+- **403 classification** is shape-pinned (auth-shaped vs moderation-shaped) via
+  real-SDK-class tests + the documented error table; a live moderation `403` body
+  was not captured (it requires deliberately flagged input).
+- **Streaming (future)**: a mid-stream error arrives as an SSE
+  `finish_reason == "error"` over HTTP `200`, invisible to status-code
+  classification. The provider is currently non-streaming, so this is a doc caveat
+  only.
 
 ## Development
 

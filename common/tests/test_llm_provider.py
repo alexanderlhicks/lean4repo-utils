@@ -681,6 +681,73 @@ class LiveCostTests(unittest.TestCase):
         print(f"\n[live] observed cost for {model}: ${usage.cost:.6f}")
 
 
+@unittest.skipUnless(
+    os.environ.get("OPENROUTER_API_KEY"),
+    "live C3 checks: set OPENROUTER_API_KEY (real round-trips prove the per-run budget "
+    "and hard-failure classification against the live API — no mock can)",
+)
+class LiveC3Tests(unittest.TestCase):
+    """C3 STEP 9 GO-condition: real-wire verification. Close-out BLOCKS if these skip."""
+
+    def _key(self):
+        return os.environ["OPENROUTER_API_KEY"]
+
+    def _model(self):
+        return os.environ.get("OPENROUTER_TEST_MODEL", "openai/gpt-4o-mini")
+
+    def test_real_call_records_tokens_and_cost_in_budget(self):
+        budget = RunBudget(max_tokens=100_000)
+        provider = create_provider(self._key(), budget=budget)
+        text, usage = provider.generate_text(
+            self._model(), [ContentPart("text", "Reply with the single word: ok")])
+        self.assertTrue(text)
+        snap = budget.snapshot()
+        # The one authoritative sink recorded exactly this call's usage.
+        self.assertEqual(snap.input_tokens + snap.output_tokens,
+                         usage.input_tokens + usage.output_tokens)
+        self.assertGreater(snap.input_tokens + snap.output_tokens, 0)
+        # is_byok is read from the REAL response shape — on a normal (non-BYOK) key it
+        # is a bool and False; this pins the field location the R8 cost branch rests on.
+        self.assertIsInstance(usage.byok, bool)
+        print(f"\n[live] budget recorded tokens={snap.input_tokens + snap.output_tokens} "
+              f"cost=${snap.cost:.6f} byok={usage.byok} cost_missing={usage.cost_missing}")
+
+    def test_ceiling_trips_second_fresh_entry(self):
+        # max_tokens=1: the first real call blows past it, so the SECOND fresh entry
+        # deterministically raises before making any call.
+        budget = RunBudget(max_tokens=1)
+        provider = create_provider(self._key(), budget=budget)
+        provider.generate_text(self._model(), [ContentPart("text", "Reply: ok")])
+        self.assertTrue(budget.exceeded)
+        with self.assertRaises(BudgetExceededError):
+            provider.generate_text(self._model(), [ContentPart("text", "Reply: ok again")])
+
+    def test_invalid_key_401_is_hard(self):
+        provider = create_provider("sk-or-deadbeef-invalid-key-000")
+        try:
+            provider.generate_text(self._model(), [ContentPart("text", "hi")])
+            self.fail("expected an auth error from a bogus key")
+        except Exception as e:  # noqa: BLE001 — we classify, then assert
+            self.assertTrue(is_hard_llm_failure(e),
+                            f"a real invalid-key error must classify as hard: {describe_exc(e)}")
+            print(f"\n[live] invalid-key classified hard: {describe_exc(e)}")
+
+    def test_reasoning_tokens_are_subset_of_output(self):
+        # RunBudget._count treats reasoning as a SUBSET of output tokens; if that were
+        # false the ceiling would undercount exactly the expensive calls. Assert the
+        # relation on a real thinking-enabled response.
+        model = os.environ.get("OPENROUTER_TEST_REASONING_MODEL", "openai/o3-mini")
+        provider = create_provider(self._key())
+        try:
+            _, usage = provider.generate_text(
+                model, [ContentPart("text", "Think, then reply with the word: ok")],
+                thinking_budget=1024)
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"reasoning model {model} unavailable on this key: {describe_exc(e)}")
+        self.assertGreaterEqual(usage.output_tokens, usage.thinking_tokens)
+        print(f"\n[live] output_tokens={usage.output_tokens} >= reasoning_tokens={usage.thinking_tokens}")
+
+
 # ================= C2 — timeout + configurable concurrency ===================
 class TimeoutTests(unittest.TestCase):
     def test_default_timeout_wired_to_client(self):
@@ -867,8 +934,11 @@ import httpx  # noqa: E402  (openai's own transport dep; used to build real SDK 
 from leanrepo_common.llm_provider import (  # noqa: E402
     BudgetExceededError,
     RunBudget,
+    RunHealth,
     _reraise_if_fatal,
+    describe_exc,
     is_hard_llm_failure,
+    parse_run_budget,
 )
 
 
@@ -1054,6 +1124,118 @@ class RunBudgetTests(unittest.TestCase):
         # threads actually finished, not just the crossing count.
         self.assertFalse(any(t.is_alive() for t in threads), "worker thread hung — lock regression")
         self.assertEqual(sum(crossings), 1)  # exactly one call observes the crossing
+
+
+class DescribeExcTests(unittest.TestCase):
+    def test_includes_class_and_status(self):
+        s = describe_exc(_status_error(402, message="insufficient credits"))
+        self.assertIn("status=402", s)
+        self.assertIn("insufficient credits", s)
+
+    def test_collapses_and_truncates(self):
+        s = describe_exc(ValueError("a\nb   c" + "x" * 500), max_len=20)
+        self.assertNotIn("\n", s)
+        self.assertTrue(s.endswith("…"))
+        self.assertLessEqual(len(s), len("ValueError: ") + 21)
+
+    def test_no_status_when_absent(self):
+        s = describe_exc(ValueError("plain"))
+        self.assertNotIn("status=", s)
+        self.assertIn("ValueError", s)
+
+
+class ParseRunBudgetTests(unittest.TestCase):
+    def test_both_unset_is_none(self):
+        self.assertIsNone(parse_run_budget(None, None))
+        self.assertIsNone(parse_run_budget("", ""))
+
+    def test_whitespace_only_is_unset(self):
+        # The value every default action run sends once the inputs exist.
+        self.assertIsNone(parse_run_budget("  ", "\t"))
+
+    def test_token_only_builds_budget(self):
+        b = parse_run_budget("5000", "")
+        self.assertEqual(b.max_tokens, 5000)
+        self.assertIsNone(b.max_cost)
+
+    def test_both_builds_budget(self):
+        b = parse_run_budget("5000", "0.50")
+        self.assertEqual(b.max_tokens, 5000)
+        self.assertAlmostEqual(b.max_cost, 0.50)
+
+    def test_cost_only_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_run_budget("", "0.50")          # R8: token ceiling authoritative
+
+    def test_non_numeric_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_run_budget("lots", "")
+        with self.assertRaises(ValueError):
+            parse_run_budget("5000", "cheap")
+
+    def test_zero_and_negative_rejected(self):
+        for bad in ("0", "-5"):
+            with self.assertRaises(ValueError):
+                parse_run_budget(bad, "")
+
+    def test_float_tokens_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_run_budget("10.5", "")
+
+
+class RunHealthTests(unittest.TestCase):
+    def test_clean_run_is_not_degraded(self):
+        h = RunHealth()
+        h.record_fresh_success()
+        h.record_fresh_success()
+        self.assertFalse(h.degraded)          # no false alarm
+
+    def test_hard_failure_degrades(self):
+        h = RunHealth()
+        h.record_fresh_success()
+        h.record_hard_failure()
+        self.assertTrue(h.degraded)
+
+    def test_budget_trip_degrades_and_is_idempotent(self):
+        h = RunHealth()
+        h.record_budget_trip("b.lean", "a.lean")
+        h.record_budget_trip("a.lean", "c.lean")  # burst; dedup, keep order
+        self.assertTrue(h.degraded)
+        self.assertTrue(h.budget_exceeded)
+        self.assertEqual(h.skipped_files, ["b.lean", "a.lean", "c.lean"])
+
+    def test_fresh_successes_do_not_suppress_banner_R5(self):
+        # A warm-cache/all-fallback run has fresh successes yet a hard failure must
+        # still fire the banner — degraded is independent of fresh_successes.
+        h = RunHealth()
+        for _ in range(5):
+            h.record_fresh_success()
+        h.record_hard_failure()
+        self.assertTrue(h.degraded)
+
+    def test_thread_safe_counts(self):
+        import threading
+        h = RunHealth()
+        barrier = threading.Barrier(30)
+
+        def worker(i):
+            barrier.wait()
+            if i % 2 == 0:
+                h.record_fresh_success()
+            else:
+                h.record_hard_failure()
+            h.record_budget_trip(f"f{i}.lean")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(30)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        self.assertFalse(any(t.is_alive() for t in threads), "worker hung — lock regression")
+        self.assertEqual(h.fresh_successes, 15)
+        self.assertEqual(h.hard_failures, 15)
+        self.assertEqual(len(h.skipped_files), 30)   # all distinct, none lost
+        self.assertTrue(h.degraded)
 
 
 class BudgetIntegrationTests(unittest.TestCase):

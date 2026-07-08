@@ -16,6 +16,7 @@ Public surface (kept stable for callers):
 
     ContentPart, TokenUsage, LLMProvider, create_provider
     RunBudget, BudgetExceededError, is_hard_llm_failure   # per-run spend control (C3)
+    RunHealth, _reraise_if_fatal                          # loud-on-failure (C3)
 
     provider = create_provider(api_key)
     parsed, usage = provider.generate_structured(model, contents, schema,
@@ -375,6 +376,115 @@ class RunBudget:
             thinking_tokens=u.thinking_tokens, cached_tokens=u.cached_tokens,
             cost=u.cost, cost_missing=u.cost_missing, byok=u.byok,
         )
+
+
+class RunHealth:
+    """Per-run health tracker (C3, R5/R9): did this run degrade, and how?
+
+    The orchestration layer records into it from worker threads, so it is
+    thread-safe (one Lock). It counts three things:
+
+    - ``hard_failures``: how many LLM calls failed for a spend/auth/quota reason
+      (classified by :func:`is_hard_llm_failure` at each fail-soft ``except`` site
+      BEFORE re-raising, and at the top-level containment catch).
+    - ``budget_exceeded`` + ``skipped_files``: whether the per-run :class:`RunBudget`
+      tripped, and which files were skipped because of it (deterministic order,
+      de-duped — pure orchestration state, so a model cannot forge it in its output).
+    - ``fresh_successes``: genuinely fresh (non-cache, non-fallback) successful
+      generations. This is bookkeeping for R5 tests; the loud-failure decision does
+      NOT depend on it — :attr:`degraded` is driven only by hard failures / budget,
+      so a warm cache or an all-fallback run can never SUPPRESS the banner (R5), and
+      a clean run with zero hard failures never RAISES it (no false alarm).
+
+    :attr:`degraded` is both the loud-banner trigger and what the orchestration ORs
+    into ``review_incomplete`` (R9), so an all-402 run can never render Approved.
+    Deliberately stores NO exception text — Actions logs are public on public repos,
+    and nothing here is allowed to carry a PR-influenced message into a comment.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.fresh_successes = 0
+        self.hard_failures = 0
+        self.budget_exceeded = False
+        self.skipped_files: List[str] = []
+
+    def record_fresh_success(self) -> None:
+        with self._lock:
+            self.fresh_successes += 1
+
+    def record_hard_failure(self) -> None:
+        with self._lock:
+            self.hard_failures += 1
+
+    def record_budget_trip(self, *files: str) -> None:
+        """Idempotent: flag the budget trip and append any skipped files (dedup,
+        insertion order). A burst of N fresh-entry BudgetExceededError raises from
+        already-queued workers is ONE budget event, not N failures."""
+        with self._lock:
+            self.budget_exceeded = True
+            for f in files:
+                if f and f not in self.skipped_files:
+                    self.skipped_files.append(f)
+
+    @property
+    def degraded(self) -> bool:
+        """True iff the run did not complete normally: a hard LLM failure occurred
+        or the per-run budget tripped. The single source of truth for the loud
+        banner and for forcing ``review_incomplete``."""
+        with self._lock:
+            return self.hard_failures > 0 or self.budget_exceeded
+
+
+def parse_run_budget(max_tokens_raw: Optional[str], max_cost_raw: Optional[str]) -> Optional[RunBudget]:
+    """Build a :class:`RunBudget` from raw env-string values (C3, STEP 3).
+
+    Empty or whitespace-only == UNSET — this is the value EVERY default GitHub
+    Action run sends once the ``LLM_MAX_RUN_*`` inputs exist (action inputs default
+    to ``''``), so it must map to "no budget", not to an error. If BOTH are unset,
+    returns ``None`` (disabled; ``create_provider`` then uses a no-op budget and
+    existing callers are behaviourally unchanged).
+
+    A NON-empty but invalid value ('0', negative, non-numeric) or a cost-only budget
+    raises :class:`ValueError`, so the entrypoint can fail fast at startup — before
+    any LLM call — rather than shipping the feature dark or silently unbounded.
+    """
+    t_raw = (max_tokens_raw or "").strip()
+    c_raw = (max_cost_raw or "").strip()
+    if not t_raw and not c_raw:
+        return None
+    max_tokens: Optional[int] = None
+    if t_raw:
+        try:
+            max_tokens = int(t_raw)
+        except ValueError:
+            raise ValueError(f"max-run-tokens must be a positive integer, got {t_raw!r}")
+    max_cost: Optional[float] = None
+    if c_raw:
+        try:
+            max_cost = float(c_raw)
+        except ValueError:
+            raise ValueError(f"max-run-cost must be a positive number, got {c_raw!r}")
+    # RunBudget enforces the rest: >0, finite, and cost-only rejection (R8).
+    return RunBudget(max_tokens=max_tokens, max_cost=max_cost)
+
+
+def describe_exc(exc: BaseException, max_len: int = 200) -> str:
+    """A safe, single-line description of an exception for a PUBLIC log (C3, R6).
+
+    GitHub Actions logs are world-readable on public repos, and exception messages
+    can embed model output or provider payloads (potentially PR-influenced). This
+    returns the exception CLASS, its HTTP status (if any), and a whitespace-collapsed,
+    truncated message — enough to debug a spend/quota failure without dumping a full
+    body. For PR-VISIBLE text (comments/annotations) do not use this at all: render a
+    fixed generic label instead, so nothing dynamic reaches the comment channel.
+    """
+    status = _status_code_of(exc)
+    msg = " ".join(str(exc).split())
+    if len(msg) > max_len:
+        msg = msg[: max_len] + "…"
+    prefix = type(exc).__name__ + (f"(status={status})" if status is not None else "")
+    return f"{prefix}: {msg}" if msg else prefix
 
 
 def _data_url(data: Union[str, bytes], mime_type: str) -> str:
