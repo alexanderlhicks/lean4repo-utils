@@ -1049,6 +1049,10 @@ class RunBudgetTests(unittest.TestCase):
             t.start()
         for t in threads:
             t.join(timeout=5)
+        # A deadlock in record_and_check would hang a join while sum(crossings) could
+        # still be 1 (the crossing is recorded before any later hang) — so assert the
+        # threads actually finished, not just the crossing count.
+        self.assertFalse(any(t.is_alive() for t in threads), "worker thread hung — lock regression")
         self.assertEqual(sum(crossings), 1)  # exactly one call observes the crossing
 
 
@@ -1138,6 +1142,121 @@ class BudgetIntegrationTests(unittest.TestCase):
         snap = p.budget.snapshot()
         self.assertEqual(snap.input_tokens, 11)              # round 1 usage retained
         self.assertAlmostEqual(snap.cost, 0.004)
+
+    def test_soft_gather_error_retains_round_usage_in_returned_total(self):
+        # A SOFT error in a later tool round → fall through to phase-2, and the
+        # completed round's usage must survive in the RETURNED total (not just the
+        # budget). Distinct from the fatal case above, where the total is discarded.
+        p = _bare_provider()
+        p.budget = RunBudget(max_tokens=10**9)
+        tc = types.SimpleNamespace(id="c1", function=types.SimpleNamespace(name="t", arguments="{}"))
+        r1 = _FakeCompletion(types.SimpleNamespace(content=None, tool_calls=[tc]),
+                             usage=_FakeUsage({"prompt_tokens": 9, "completion_tokens": 4, "cost": 0.001}))
+        create = mock.Mock(side_effect=[r1, RuntimeError("transient blip")])  # round 2 soft-fails
+        parse = mock.Mock(return_value=_FakeCompletion(
+            _FakeMessage(parsed=_Schema(x=3)),
+            usage=_FakeUsage({"prompt_tokens": 20, "completion_tokens": 6, "cost": 0.003})))
+        p.client = self._client(create, parse)
+        parsed, usage = p.generate_structured(
+            "m", [ContentPart("text", "hi")], _Schema,
+            tools=[{"type": "function", "function": {"name": "t", "parameters": {}}}],
+            tool_runner=lambda n, a: "r")
+        self.assertEqual(parsed.x, 3)                 # fell back to a structured answer
+        self.assertEqual(parse.call_count, 1)
+        self.assertEqual(usage.input_tokens, 9 + 20)  # round-1 usage retained in the RETURN
+        self.assertEqual(usage.output_tokens, 4 + 6)
+        self.assertAlmostEqual(usage.cost, 0.001 + 0.003)
+
+    def test_multiround_success_returned_usage_equals_budget_delta(self):
+        # The double-count surface: rounds_usage folded in `finally` PLUS the phase-2
+        # _record_usage. On a clean multi-round run the returned usage must equal the
+        # budget delta exactly (nothing recorded twice, nothing dropped).
+        p = _bare_provider()
+        p.budget = RunBudget(max_tokens=10**9)
+        tc = types.SimpleNamespace(id="c1", function=types.SimpleNamespace(name="t", arguments="{}"))
+        r1 = _FakeCompletion(types.SimpleNamespace(content=None, tool_calls=[tc]),
+                             usage=_FakeUsage({"prompt_tokens": 7, "completion_tokens": 2, "cost": 0.001}))
+        r2 = _FakeCompletion(types.SimpleNamespace(content="stop", tool_calls=None),
+                             usage=_FakeUsage({"prompt_tokens": 5, "completion_tokens": 1, "cost": 0.001}))
+        create = mock.Mock(side_effect=[r1, r2])
+        parse = mock.Mock(return_value=_FakeCompletion(
+            _FakeMessage(parsed=_Schema(x=8)),
+            usage=_FakeUsage({"prompt_tokens": 30, "completion_tokens": 9, "cost": 0.005})))
+        p.client = self._client(create, parse)
+        _, usage = p.generate_structured(
+            "m", [ContentPart("text", "hi")], _Schema,
+            tools=[{"type": "function", "function": {"name": "t", "parameters": {}}}],
+            tool_runner=lambda n, a: "r")
+        snap = p.budget.snapshot()
+        self.assertEqual(usage.input_tokens, snap.input_tokens)
+        self.assertEqual(usage.output_tokens, snap.output_tokens)
+        self.assertAlmostEqual(usage.cost, snap.cost)
+        self.assertEqual(usage.input_tokens, 7 + 5 + 30)   # and no round dropped/doubled
+        self.assertAlmostEqual(usage.cost, 0.001 + 0.001 + 0.005)
+
+
+class LengthRetryBudgetTests(unittest.TestCase):
+    """The length-retry (truncated structured output) path under the budget."""
+
+    def _length_error(self, completion):
+        from openai import LengthFinishReasonError
+        try:
+            return LengthFinishReasonError(completion=completion)
+        except Exception:  # pragma: no cover - signature guard across SDK versions
+            e = LengthFinishReasonError.__new__(LengthFinishReasonError)
+            Exception.__init__(e, "length")
+            e.completion = completion
+            return e
+
+    def _client(self, parse):
+        return types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(parse=parse)))
+
+    def test_truncated_usage_recorded_once_then_escalates_and_succeeds(self):
+        p = _bare_provider()
+        p.budget = RunBudget(max_tokens=10**9)
+        trunc = _FakeCompletion(_FakeMessage(content=None),
+                                usage=_FakeUsage({"prompt_tokens": 100, "completion_tokens": 50, "cost": 0.01}))
+        good = _FakeCompletion(_FakeMessage(parsed=_Schema(x=5)),
+                               usage=_FakeUsage({"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.002}))
+        parse = mock.Mock(side_effect=[self._length_error(trunc), good])
+        p.client = self._client(parse)
+        _, usage = p.generate_structured("m", [ContentPart("text", "hi")], _Schema)
+        self.assertEqual(parse.call_count, 2)                     # escalated once
+        # truncated attempt counted exactly once, alongside the successful retry
+        self.assertEqual(usage.input_tokens, 100 + 10)
+        self.assertEqual(usage.output_tokens, 50 + 5)
+        snap = p.budget.snapshot()
+        self.assertEqual(snap.input_tokens, 100 + 10)            # budget delta == returned
+        self.assertAlmostEqual(snap.cost, 0.012)
+
+    def test_over_budget_stops_escalation(self):
+        # Decision 3: once the truncated attempt pushes the run over budget, do NOT
+        # escalate (each escalation is another billed generation) — fail out instead.
+        p = _bare_provider()
+        p.budget = RunBudget(max_tokens=120)
+        trunc = _FakeCompletion(_FakeMessage(content=None),
+                                usage=_FakeUsage({"prompt_tokens": 100, "completion_tokens": 50}))  # 150 > 120
+        parse = mock.Mock(side_effect=[self._length_error(trunc), _FakeCompletion(_FakeMessage(parsed=_Schema(x=1)))])
+        p.client = self._client(parse)
+        with self.assertRaises(ValueError):
+            p.generate_structured("m", [ContentPart("text", "hi")], _Schema)
+        self.assertEqual(parse.call_count, 1)                    # did NOT escalate
+        self.assertEqual(p.budget.snapshot().input_tokens, 100)  # truncated usage still counted
+
+    def test_length_error_without_completion_marks_cost_unreliable(self):
+        # Fail closed: no completion → can't count the billed tokens, so at least
+        # flip cost reliability rather than silently trust the running total.
+        p = _bare_provider()
+        p.budget = RunBudget(max_tokens=10**9, max_cost=1.0)
+        err = self._length_error(None)
+        good = _FakeCompletion(_FakeMessage(parsed=_Schema(x=2)),
+                               usage=_FakeUsage({"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.001}))
+        parse = mock.Mock(side_effect=[err, good])
+        p.client = self._client(parse)
+        with self.assertLogs(level="WARNING"):
+            p.generate_structured("m", [ContentPart("text", "hi")], _Schema)
+        self.assertFalse(p.budget.cost_reliable)
 
 
 if __name__ == "__main__":

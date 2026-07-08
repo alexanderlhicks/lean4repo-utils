@@ -641,6 +641,12 @@ class OpenRouterProvider:
                     truncated = getattr(e, "completion", None)
                     if truncated is not None:
                         usage_total = _sum_usage(usage_total, self._record_usage(truncated))
+                    else:
+                        # Fail closed (symmetry with _usage_from's absent-usage path):
+                        # the attempt still burned a full max_tokens of billed output,
+                        # but with no completion we can't count it — record an unknown
+                        # marker so the cost cap stops trusting its running total.
+                        self.budget.record_and_check(TokenUsage(cost_missing=True))
                     # Truncated before complete structured output. Normally retry with
                     # a larger cap so the review's findings aren't lost wholesale — but
                     # if the run is now over budget, do NOT escalate (each escalation is

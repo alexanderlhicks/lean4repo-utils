@@ -78,10 +78,15 @@ provider = create_provider(api_key, budget=RunBudget(max_tokens=200_000, max_cos
   raises `BudgetExceededError` before spending anything. A trip that happens
   mid-run degrades instead: the tool-gathering loop breaks and the model still
   produces one final answer from the evidence gathered.
-- **Honest soft bound.** The ceiling caps *extra* calls; it does not cap the
-  up-to-`max_concurrency` maximal calls already in flight, so a run can overshoot
-  by roughly one in-flight batch. It bounds one run, not aggregate spend across
-  repeated runs — the key credit limit is that layer.
+- **Honest soft bound.** The budget check is poll-then-act, not a reservation, and
+  one budget is shared across a tool's worker pool. So when the ceiling is reached,
+  every one of the up-to-`max_workers` calls already in flight can each still run a
+  full generation (each up to `length_retry_max_tokens`) before the next check sees
+  the trip — worst-case overshoot is ≈ `max_workers` maximal generations, not one.
+  It also bounds one run, not aggregate spend across repeated runs — the OpenRouter
+  key credit limit is that (bug-proof) layer. Tightening this to a hard reservation
+  (using `RunBudget.record_and_check`'s atomic crossing signal to gate calls before
+  they start) is possible future work; C3 deliberately ships the soft bound.
 
 `is_hard_llm_failure(exc)` classifies whether an exception is a spend/auth/quota
 failure (`401`/`402`, or an auth-shaped `403`) that must be surfaced loudly, versus
