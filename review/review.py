@@ -231,13 +231,81 @@ def _write_review_health() -> None:
         logging.warning(f"Failed to write review health flag: {describe_exc(e)}")
 
 
-def _emit_degraded_review(per_file_reviews: dict) -> None:
+def _review_comment_header(additional_comments: str) -> str:
+    """Header for a posted review. Distinguishes a GUIDED review — the reviewer supplied
+    ``/review`` instructions, laid out so the review can be read against them — from an
+    UNGUIDED one (plain ``/review``: the "naive" baseline, grounded only on auto-pulled
+    context). Also stamps the reviewed commit (from the S1-resolved ``PR_HEAD_SHA``) for
+    auditability and multi-review continuity. Replaces the old "Initial vs. not-initial"
+    label, which was a trigger proxy, not what a reader needs.
+
+    The instructions are rendered as a blockquote (each line prefixed) so multi-line text
+    stays contained; in the pilot they come from a commenter-gated (trusted) ``/review``.
+    """
+    instr = (additional_comments or "").strip()
+    head = (os.environ.get("PR_HEAD_SHA") or "").strip()
+    stamp = f"*Reviewed at commit `{head[:12]}`.*\n\n" if head else ""
+    if instr:
+        title = "### 🤖 AI Review (with additional instructions)\n\n"
+        quoted = "\n".join(f"> {ln}" for ln in instr.splitlines())
+        body = f"> **Review instructions:**\n{quoted}\n\n"
+    else:
+        title = "### 🤖 AI Review\n\n"
+        body = ("*Unguided review — no extra instructions; grounded only on the diff, the "
+                "repository dependency graph, and any cited references.*\n\n")
+    return title + stamp + body
+
+
+_MANIFEST_REPO_CAP = 25  # cap the repo-context list so a large dep-graph doesn't bloat the comment
+
+
+def _render_reference_manifest(records: "Optional[List[ContextRecord]]") -> str:
+    """Deterministic 'References & context used' section (no LLM call).
+
+    Lists the context the reviewers were GIVEN — external references fetched, KB/spec
+    files loaded, and repository/dependency files — as an inert code-span list, so a
+    reader can see exactly what grounded the review (and, for the pilot, whether the KB
+    was pulled). Load FAILURES are NOT repeated here — they remain in the separate
+    'Context Warnings' block, so each item appears once (single source). KB/external
+    references are handed to the model intact (they are not in `_TRIMMABLE_KEYS`), so
+    listing them here is faithful. Repository/dependency context, by contrast, IS in
+    `_TRIMMABLE_KEYS` — under budget pressure some listed files may be trimmed from the
+    prompt, so that section is labelled "provided" (not "guaranteed used"). Rendered on
+    both the happy and the degraded paths."""
+    loaded = [r for r in (records or []) if r.ok]
+    if not loaded:
+        return ""
+    ext = [r.ref for r in loaded if r.category == "external"]
+    spec = [r.ref for r in loaded if r.category == "spec"]
+    repo = [r.ref for r in loaded if r.category == "repo"]
+    out = ["\n<details><summary>📚 <b>References &amp; context used</b></summary>\n"]
+    if ext:
+        out.append("\n**External references fetched:**")
+        out.extend(f"- `{_safe_md_path(u)}`" for u in ext)
+    if spec:
+        out.append(f"\n**Knowledge base / specification ({len(spec)}):**")
+        out.extend(f"- `{_safe_md_path(p)}`" for p in spec)
+    if repo:
+        out.append(f"\n**Repository context provided ({len(repo)} file(s) from the dependency "
+                   "graph; large sets may be trimmed to fit the model's budget):**")
+        out.extend(f"- `{_safe_md_path(p)}`" for p in repo[:_MANIFEST_REPO_CAP])
+        if len(repo) > _MANIFEST_REPO_CAP:
+            out.append(f"- …and {len(repo) - _MANIFEST_REPO_CAP} more")
+    out.append("\n</details>\n")
+    return "\n".join(out)
+
+
+def _emit_degraded_review(per_file_reviews: dict, records: "Optional[List[ContextRecord]]" = None) -> None:
     """Render + print a degraded review comment after a fatal aborted the run
     mid-flight (C3, STEP 5a). Leads with the CAUTION banner and a NOT-approved basis,
     then whatever per-file reviews completed before the abort, plus the budget
     skipped-files marker. The comment is STILL written, so the failure is loud and
     visible rather than a silent red job with no explanation (acceptance #3)."""
-    comment = "### 🤖 AI Review\n\n" + _LOUD_BANNER + "\n"
+    comment = "### 🤖 AI Review\n\n"
+    _head = (os.environ.get("PR_HEAD_SHA") or "").strip()
+    if _head:
+        comment += f"*Reviewed at commit `{_head[:12]}`.*\n\n"
+    comment += _LOUD_BANNER + "\n"
     comment += _skipped_marker()
     comment += "\n" + _format_verdict_basis(
         "Changes Requested",
@@ -248,6 +316,9 @@ def _emit_degraded_review(per_file_reviews: dict) -> None:
         comment += "\n**Partial results — reviews that completed before the run stopped:**\n"
         for fp, text in completed.items():
             comment += f"\n<details><summary>📄 **Review for `{fp}`**</summary>\n\n{text}\n</details>\n"
+    # The manifest belongs on the degraded path too — it is most diagnostic exactly when
+    # the run aborted (what context HAD been loaded before it stopped).
+    comment += _render_reference_manifest(records)
     comments = split_into_comments(comment, MAX_GITHUB_COMMENT_SIZE)
     print(comments[0])
     if len(comments) > 1:
@@ -557,8 +628,23 @@ def _fetch_url_content(url: str, timeout: int = HTTP_TIMEOUT, max_redirects: int
     raise requests.TooManyRedirects(f"Too many redirects while fetching '{url}'")
 
 
-def get_document_content(urls_str: str) -> Tuple[List[ContentPart], List[str]]:
-    """Fetches content from URLs and returns provider-agnostic ContentParts."""
+@dataclasses.dataclass
+class ContextRecord:
+    """One reference the reviewers were given, for the 'References & context used'
+    manifest. Populated as an ADDITIVE side-channel by the loaders (see the optional
+    `records` param) so the loaders' ``(parts, errors)`` return contract — relied on by
+    callers and tests — is untouched. ``ref`` is the source URL/path; ``category`` is
+    external | spec | repo; ``ok`` is whether it loaded."""
+    ref: str
+    category: str
+    ok: bool
+
+
+def get_document_content(urls_str: str, records: "Optional[List[ContextRecord]]" = None) -> Tuple[List[ContentPart], List[str]]:
+    """Fetches content from URLs and returns provider-agnostic ContentParts.
+
+    If `records` is given, appends a :class:`ContextRecord` per URL (loaded/failed) for
+    the reference manifest — additive; the ``(parts, errors)`` return is unchanged."""
     if not urls_str:
         logging.info("No external references provided.")
         return [], []
@@ -590,21 +676,26 @@ def get_document_content(urls_str: str) -> Tuple[List[ContentPart], List[str]]:
                 content = response.text
                 parts.append(ContentPart(type="text", data=f"--- Content from {url} ---\n{content}\n"))
                 logging.info(f"Added plain text part from: {url}")
+            if records is not None:
+                records.append(ContextRecord(url, "external", True))
         except Exception as e:
             # R6: the errors list renders into the PR comment's Context Warnings —
             # keep the exception body out of it; log the detail (class/status/truncated).
             logging.error(f"Error processing document '{url}': {describe_exc(e)}")
             errors.append(f"Error processing document '{url}'.")
+            if records is not None:
+                records.append(ContextRecord(url, "external", False))
     return parts, errors
 
-def get_local_reference_parts(paths_str: str) -> Tuple[List[ContentPart], List[str]]:
+def get_local_reference_parts(paths_str: str, records: "Optional[List[ContextRecord]]" = None) -> Tuple[List[ContentPart], List[str]]:
     """Read local reference/specification files (a repository knowledge base) as
     provider-agnostic ContentParts so they can drive Agent A's checklist and
     ground every reviewer — just like external PDF/URL references, but from disk.
 
     PDFs are sent as native PDF parts; other files (`.md`, `.txt`, `.tex`,
     `.lean`) as text — `.tex` so LaTeX blueprints work as a spec source.
-    Directories are expanded. Returns (parts, errors)."""
+    Directories are expanded. Returns (parts, errors). If `records` is given, appends a
+    :class:`ContextRecord` per file (loaded/failed) for the manifest — additive."""
     if not paths_str:
         return [], []
     parts: List[ContentPart] = []
@@ -620,6 +711,8 @@ def get_local_reference_parts(paths_str: str) -> Tuple[List[ContentPart], List[s
             files.append(path)
         else:
             errors.append(f"Could not find spec reference: {path}")
+            if records is not None:
+                records.append(ContextRecord(path, "spec", False))
     for fp in sorted(set(files)):
         try:
             if fp.lower().endswith('.pdf'):
@@ -629,12 +722,18 @@ def get_local_reference_parts(paths_str: str) -> Tuple[List[ContentPart], List[s
                 content = file_cache.read(fp)
                 if content is None:
                     errors.append(f"Error reading spec reference {fp}")
+                    if records is not None:
+                        records.append(ContextRecord(fp, "spec", False))
                     continue
                 parts.append(ContentPart(type="text", data=f"--- Specification reference: {fp} ---\n{content}\n"))
             logging.info(f"Added local spec reference: {fp}")
+            if records is not None:
+                records.append(ContextRecord(fp, "spec", True))
         except Exception as e:
             logging.warning(f"Error reading spec reference {fp}: {describe_exc(e)}")
             errors.append(f"Error reading spec reference {fp}.")
+            if records is not None:
+                records.append(ContextRecord(fp, "spec", False))
     return parts, errors
 
 
@@ -1097,14 +1196,24 @@ def analyze_specification(provider: LLMProvider, external_parts: List[ContentPar
         return ""
 
 def get_pr_diff(pr_number: str) -> Tuple[str, List[str]]:
-    """Fetches the diff of the specified pull request."""
+    """Fetches the diff of the specified pull request.
+
+    S1: when the action pins the base/head SHAs (``PR_BASE_SHA``/``PR_HEAD_SHA``, set
+    from the same resolve step that drove the checkout), diff against those exact
+    commits (``git diff base...head`` on the already-checked-out worktree) so the diff
+    can never skew from the reviewed tree if the PR is force-pushed mid-run. Without the
+    pins (local runs / older callers), fall back to ``gh pr diff`` — same three-dot
+    semantics, but re-resolves the current head."""
     logging.info(f"Fetching PR diff for PR #{pr_number}...")
     errors = []
+    base_sha = (os.environ.get("PR_BASE_SHA") or "").strip()
+    head_sha = (os.environ.get("PR_HEAD_SHA") or "").strip()
+    if base_sha and head_sha:
+        cmd = ["git", "diff", f"{base_sha}...{head_sha}"]
+    else:
+        cmd = ["gh", "pr", "diff", pr_number]
     try:
-        result = subprocess.run(
-            ["gh", "pr", "diff", pr_number],
-            capture_output=True, text=True, check=True,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         diff = result.stdout.strip()
         if not diff:
             logging.warning("PR diff is empty.")
@@ -1119,9 +1228,10 @@ def get_pr_diff(pr_number: str) -> Tuple[str, List[str]]:
         return "", errors
 
 
-def get_repo_files_by_path(paths_str: str) -> Tuple[Dict[str, str], List[str]]:
+def get_repo_files_by_path(paths_str: str, records: "Optional[List[ContextRecord]]" = None) -> Tuple[Dict[str, str], List[str]]:
     """Read content from a comma-separated string of file/directory paths,
-    keyed by path. Returns (path_to_content, errors)."""
+    keyed by path. Returns (path_to_content, errors). If `records` is given, appends a
+    :class:`ContextRecord` per file (loaded/failed) for the manifest — additive."""
     if not paths_str:
         return {}, []
     errors: List[str] = []
@@ -1136,13 +1246,19 @@ def get_repo_files_by_path(paths_str: str) -> Tuple[Dict[str, str], List[str]]:
             expanded_files.append(path)
         else:
             errors.append(f"Could not find file or directory: {path}")
+            if records is not None:
+                records.append(ContextRecord(path, "repo", False))
     result: Dict[str, str] = {}
     for file_path in sorted(set(expanded_files)):
         content = file_cache.read(file_path)
         if content is None:
             errors.append(f"Error reading file {file_path}")
+            if records is not None:
+                records.append(ContextRecord(file_path, "repo", False))
             continue
         result[file_path] = content
+        if records is not None:
+            records.append(ContextRecord(file_path, "repo", True))
     return result, errors
 
 
@@ -2165,12 +2281,17 @@ def main():
     args.spec_refs = _merge_csv(args.spec_refs, instr_spec)
     args.repo_context_refs = _merge_csv(args.repo_context_refs, instr_repo)
 
-    external_parts, external_errors = get_document_content(args.external_refs)
-    spec_parts, spec_errors = get_local_reference_parts(args.spec_refs)
+    # Per-item context records for the "References & context used" manifest. Collected
+    # HERE — before the orchestration try — so a later abort still has whatever loaded
+    # (the degraded comment renders the manifest too). Categorised at the loader so the
+    # external+spec merge below can't blur which items were KB/spec vs external.
+    context_records: List[ContextRecord] = []
+    external_parts, external_errors = get_document_content(args.external_refs, records=context_records)
+    spec_parts, spec_errors = get_local_reference_parts(args.spec_refs, records=context_records)
     # Local KB/spec docs join the shared reference prefix: they drive Agent A's
     # checklist and ground every downstream reviewer, just like external refs.
     external_parts = external_parts + spec_parts
-    repo_files_by_path, repo_errors = get_repo_files_by_path(args.repo_context_refs)
+    repo_files_by_path, repo_errors = get_repo_files_by_path(args.repo_context_refs, records=context_records)
     summary_context = get_summary_context(os.environ.get("SUMMARY_FILES", ""))
 
     # Appendix: non-file content (summary signatures, Lean toolchain info).
@@ -2572,7 +2693,7 @@ def main():
         # Format the final comment for printing to stdout. The authoritative
         # verdict + its basis lead so the reader sees it first.
         final_comment = (
-            "### 🤖 AI Review\n\n"
+            _review_comment_header(args.additional_comments)
             + ((_LOUD_BANNER + "\n" + _skipped_marker() + "\n") if run_health.degraded else "")
             + f"{_format_verdict_basis(det_verdict, det_reasons)}\n\n"
             f"**Overall Summary:**\n{summary_text}\n\n---\n"
@@ -2591,6 +2712,11 @@ def main():
             for w in all_warnings:
                 final_comment += f"- {w}\n"
             final_comment += "\n</details>\n"
+
+        # What context the reviewers were actually given (external refs, KB/spec, repo
+        # files). Failures already appear once above in Context Warnings; this lists what
+        # loaded — the pilot's "did it pull the KB?" signal.
+        final_comment += _render_reference_manifest(context_records)
 
         if has_findings:
             final_comment += f"\n<details><summary>🔍 **Mechanical Pre-Check Results**</summary>\n\n{pre_check_findings}\n</details>\n"
@@ -2660,7 +2786,7 @@ def main():
         # completed, then exit 0 (or the loud-exit code, applied at the entrypoint).
         run_health.record_budget_trip()
         logging.error("Review aborted early: per-run budget exhausted; reporting as incomplete.")
-        _emit_degraded_review(per_file_reviews)
+        _emit_degraded_review(per_file_reviews, context_records)
     except Exception as e:
         # A hard spend/auth/quota failure re-raised to here. Anything NOT hard keeps
         # today's behaviour: propagate (a genuine bug must not be reported as a clean
@@ -2670,7 +2796,7 @@ def main():
             raise
         run_health.record_hard_failure()
         logging.error(f"Review aborted: hard LLM failure; reporting as incomplete: {describe_exc(e)}")
-        _emit_degraded_review(per_file_reviews)
+        _emit_degraded_review(per_file_reviews, context_records)
     finally:
         logging.info(token_tracker.summary())
 

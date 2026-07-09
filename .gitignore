@@ -19,3 +19,8 @@ build/
 # Local agent config
 .codex
 .claude/settings.local.json
+
+# Local planning / development-support docs (kept on the dev machine, not repo content
+# while this is a solo effort — untracked via `git rm --cached`).
+ROADMAP.md
+SESSIONS.md
