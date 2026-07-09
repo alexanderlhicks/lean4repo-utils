@@ -22,6 +22,7 @@ leanrepo-common = { workspace = true }
 dev = [
     "pytest",
     "ruff",
+    "pyyaml",
 ]
 
 [tool.pytest.ini_options]
