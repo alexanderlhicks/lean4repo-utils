@@ -7,12 +7,22 @@ from leanrepo_common.lean_utils import file_path_to_module_name
 
 
 def get_changed_lean_files(pr_number):
+    # S1: pin to the base/head SHAs the worktree was checked out at (PR_BASE_SHA/
+    # PR_HEAD_SHA) so the changed-file set matches the reviewed tree even under a
+    # mid-run force-push; fall back to the (re-resolving) `gh pr diff` when unset.
+    base_sha = (os.environ.get("PR_BASE_SHA") or "").strip()
+    head_sha = (os.environ.get("PR_HEAD_SHA") or "").strip()
+    if base_sha and head_sha:
+        cmd = ["git", "diff", "--name-only", f"{base_sha}...{head_sha}"]
+    else:
+        cmd = ["gh", "pr", "diff", str(pr_number), "--name-only"]
     try:
-        result = subprocess.run(["gh", "pr", "diff", str(pr_number), "--name-only"], check=True, capture_output=True, text=True)
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip().endswith('.lean')]
         return changed_files
-    except subprocess.CalledProcessError as e:
-        print(f"::error::Failed to get changed files: {e.stderr}")
+    except subprocess.CalledProcessError:
+        # Do not echo raw stderr (may carry token-adjacent detail on a public log).
+        print(f"::error::Failed to get changed files for PR #{pr_number}.")
         return []
 
 

@@ -1599,6 +1599,30 @@ class TestC3Containment:
         assert health["hard_failures"] == 1
         assert rc == 0                                      # loud-exit OFF by default
 
+    def test_reference_manifest_lists_loaded_context_end_to_end(self, monkeypatch, tmp_path, capsys):
+        # Integration: a real spec/KB file flows through the loader's records channel
+        # into the rendered manifest (proves loader→render wiring, not just the renderer).
+        spec = tmp_path / "kb_page.md"
+        spec.write_text("# BCIKS20\nProximity gaps for Reed-Solomon codes.\n")
+        fr = review.FileReview(verdict="Approved", analysis="fine")
+        monkeypatch.setattr(review, "analyze_file_changes_with_context", lambda *a, **k: (fr, "FORMATTED::ok"))
+        monkeypatch.setattr(review, "analyze_cross_file", lambda *a, **k: (None, ""))
+        monkeypatch.setattr(review, "synthesize_overall_summary",
+                            lambda *a, **k: (review.SynthesisSummary(tldr="t", precheck_summary="p", overall_verdict="Approved"), "S"))
+        monkeypatch.setattr(review, "verify_findings", lambda *a, **k: [])
+        # One real KB file (loads → manifest) + one missing (fails → Context Warnings).
+        out, rc, health = self._run(
+            monkeypatch, tmp_path, capsys,
+            env={"SPEC_REFS": f"{spec},{tmp_path / 'missing_kb.md'}"})
+        assert "References &amp; context used" in out
+        assert "kb_page.md" in out                         # loaded → listed in the manifest
+        assert "Knowledge base / specification" in out
+        # Single source, no double-listing: the failed ref appears exactly once, in the
+        # Context Warnings block — never also in the manifest.
+        assert "Context Warnings" in out
+        assert out.count("missing_kb.md") == 1
+        assert rc == 0
+
     def test_synthesis_only_failure_cannot_render_approved(self, monkeypatch, tmp_path, capsys):
         # A hard failure confined to synthesis (which runs AFTER the verdict) must not
         # leave an "Approved" verdict standing under the CAUTION banner — the verdict is
@@ -1745,6 +1769,44 @@ class TestC3ActionWiring:
         assert checkout["with"]["persist-credentials"] is False
         assert any("add-mask" in s.get("run", "") for s in doc["runs"]["steps"])
 
+    def test_s1_resolve_before_checkout_and_ref_threaded(self):
+        # S1: the resolve step must run BEFORE checkout and the checkout must pin the
+        # resolved head SHA (else issue_comment lands on base — the wrong-code bug).
+        doc, _ = self._action()
+        steps = doc["runs"]["steps"]
+        names = [s.get("name") for s in steps]
+        assert names.index("Resolve PR head SHA") < names.index("Checkout repository")
+        resolve = next(s for s in steps if s.get("name") == "Resolve PR head SHA")
+        assert resolve.get("id") == "resolve_head"
+        checkout = next(s for s in steps if s.get("name") == "Checkout repository")
+        assert checkout["with"]["ref"] == "${{ steps.resolve_head.outputs.head_sha }}"
+        # S1 hardening from C3 must still hold on the same step.
+        assert checkout["with"]["persist-credentials"] is False
+        assert checkout["with"]["fetch-depth"] == 0
+
+    def test_s1_diff_and_discovery_pinned_to_resolved_shas(self):
+        doc, _ = self._action()
+        run_env = self._run_step(doc)["env"]
+        assert run_env.get("PR_HEAD_SHA") == "${{ steps.resolve_head.outputs.head_sha }}"
+        assert run_env.get("PR_BASE_SHA") == "${{ steps.resolve_head.outputs.base_sha }}"
+        discover = next(s for s in doc["runs"]["steps"] if s.get("id") == "discover_files")
+        assert discover["env"].get("PR_HEAD_SHA") == "${{ steps.resolve_head.outputs.head_sha }}"
+
+    def test_s1_resolve_step_routes_pr_number_via_env_not_run_body(self):
+        # Expression-injection guard: pr_number must reach the resolve script via an env
+        # var, never interpolated into the run: body (the file's own standard).
+        doc, _ = self._action()
+        resolve = next(s for s in doc["runs"]["steps"] if s.get("id") == "resolve_head")
+        assert resolve["env"].get("PR_NUMBER") == "${{ inputs.pr_number }}"
+        assert "${{ inputs.pr_number }}" not in resolve["run"]
+        assert "inputs.pr_number" not in resolve["run"]
+
+    def test_s1_post_review_anchor_threaded_not_reresolved(self):
+        doc, _ = self._action()
+        post = next(s for s in doc["runs"]["steps"] if s.get("name") == "Post Review")
+        assert post["env"].get("REVIEW_HEAD_SHA") == "${{ steps.resolve_head.outputs.head_sha }}"
+        assert "process.env.REVIEW_HEAD_SHA" in post["with"]["script"]
+
     def test_entrypoint_is_sys_exit_main(self):
         src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "review.py")).read()
         assert "sys.exit(main())" in src
@@ -1766,6 +1828,190 @@ class TestC3ActionWiring:
                                     and sub.func.attr == "exit"
                                     and isinstance(sub.func.value, ast.Name) and sub.func.value.id == "sys"):
                                 raise AssertionError(f"sys.exit inside a finally in {fn}")
+
+
+class TestS1ResolveScript:
+    """resolve_pr_head.sh (S1) — behavioral: stub `gh` on PATH and drive the script,
+    not a YAML string match. Covers the happy path and the fail-closed exits."""
+
+    def _script(self):
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "resolve_pr_head.sh")
+
+    def _run(self, tmp_path, gh_line, repo="o/r", pr="42", gh_exit=0):
+        import subprocess
+        binp = tmp_path / "bin"
+        binp.mkdir(exist_ok=True)
+        # Stub `gh` on PATH: echo the canned line, then exit with gh_exit so we can drive
+        # the API-failure branch (the most security-critical fail-closed guarantee).
+        (binp / "gh").write_text(f"#!/usr/bin/env bash\necho '{gh_line}'\nexit {gh_exit}\n")
+        (binp / "gh").chmod(0o755)
+        out = tmp_path / "gh_output.txt"
+        env = dict(os.environ, PATH=f"{binp}:{os.environ['PATH']}", GITHUB_OUTPUT=str(out), GH_TOKEN="x")
+        proc = subprocess.run(["bash", self._script(), repo, pr], env=env,
+                              capture_output=True, text=True)
+        return proc.returncode, (out.read_text() if out.exists() else "")
+
+    def test_happy_path_writes_both_shas(self, tmp_path):
+        rc, output = self._run(tmp_path, "abc123head def456base")
+        assert rc == 0
+        assert "head_sha=abc123head" in output
+        assert "base_sha=def456base" in output
+
+    def test_fail_closed_empty_pr(self, tmp_path):
+        rc, output = self._run(tmp_path, "h b", pr="   ")
+        assert rc != 0
+        assert "head_sha=" not in output          # never a partial/base fallback
+
+    def test_fail_closed_null_sha(self, tmp_path):
+        rc, output = self._run(tmp_path, "null null")
+        assert rc != 0
+        assert "head_sha=" not in output
+
+    def test_fail_closed_on_gh_api_error(self, tmp_path):
+        # The single most important S1 guarantee: a failing `gh api` (404/auth/network)
+        # aborts under `set -euo pipefail` and NEVER falls through to a base checkout.
+        rc, output = self._run(tmp_path, "anything at all", gh_exit=1)
+        assert rc != 0
+        assert "head_sha=" not in output and "base_sha=" not in output
+
+    def test_fail_closed_on_partial_null_base(self, tmp_path):
+        # A resolved head but a null base must still fail closed (both are validated
+        # before anything is written).
+        rc, output = self._run(tmp_path, "abc123head null")
+        assert rc != 0
+        assert "head_sha=" not in output
+
+    def test_fail_closed_non_numeric_pr(self, tmp_path):
+        # Defence-in-depth numeric guard: a path-separator-bearing pr never reaches gh.
+        rc, output = self._run(tmp_path, "h b", pr="42/../../issues/1")
+        assert rc != 0
+        assert "head_sha=" not in output
+
+
+class TestReviewLabelling:
+    """Guided/unguided header + reviewed-at stamp (drops the old Initial/subsequent axis)."""
+
+    def test_unguided_header(self, monkeypatch):
+        monkeypatch.delenv("PR_HEAD_SHA", raising=False)
+        h = review._review_comment_header("")
+        assert h.startswith("### 🤖 AI Review\n")
+        assert "with additional instructions" not in h
+        assert "Unguided review" in h
+
+    def test_guided_header_lays_out_instructions(self, monkeypatch):
+        monkeypatch.delenv("PR_HEAD_SHA", raising=False)
+        h = review._review_comment_header("Check commutativity.\nAlso the base case.")
+        assert "### 🤖 AI Review (with additional instructions)" in h
+        assert "> Check commutativity." in h
+        assert "> Also the base case." in h         # multi-line instructions blockquoted
+        assert "Unguided review" not in h
+
+    def test_reviewed_at_stamp_from_head_sha(self, monkeypatch):
+        monkeypatch.setenv("PR_HEAD_SHA", "abcdef1234567890fedcba")
+        h = review._review_comment_header("")
+        assert "Reviewed at commit `abcdef123456`" in h   # short, 12 chars
+
+
+class TestReferenceManifest:
+    """The 'References & context used' manifest (deterministic render + load-status channel)."""
+
+    def _rec(self, ref, cat, ok):
+        return review.ContextRecord(ref, cat, ok)
+
+    def test_render_groups_loaded_by_category(self):
+        recs = [self._rec("https://eprint.iacr.org/2020/654", "external", True),
+                self._rec("docs/kb/papers/BCIKS20.md", "spec", True),
+                self._rec("ArkLib/Foo.lean", "repo", True),
+                self._rec("missing.md", "spec", False)]
+        out = review._render_reference_manifest(recs)
+        assert "References &amp; context used" in out
+        assert "eprint.iacr.org/2020/654" in out
+        assert "docs/kb/papers/BCIKS20.md" in out
+        assert "ArkLib/Foo.lean" in out
+        # failures are NOT duplicated here — they live once in Context Warnings.
+        assert "missing.md" not in out
+
+    def test_empty_or_all_failed_renders_nothing(self):
+        assert review._render_reference_manifest([]) == ""
+        assert review._render_reference_manifest(None) == ""
+        assert review._render_reference_manifest([self._rec("x", "spec", False)]) == ""
+
+    def test_repo_list_is_capped(self):
+        recs = [self._rec(f"f{i}.lean", "repo", True) for i in range(40)]
+        out = review._render_reference_manifest(recs)
+        assert f"and {40 - review._MANIFEST_REPO_CAP} more" in out
+
+    def test_attacker_path_backticks_neutralised(self):
+        out = review._render_reference_manifest([self._rec("evil`.lean", "repo", True)])
+        assert "evil.lean" in out and "evil`.lean" not in out  # backtick stripped
+
+    def test_safe_md_path_strips_backticks_and_newlines(self):
+        # Both named injection vectors (backtick to escape the code span, newline to
+        # start a new markdown line) must be neutralised.
+        s = review._safe_md_path("a`b\nc\rd")
+        assert "`" not in s and "\n" not in s and "\r" not in s
+        assert s == "ab c d"
+
+    def test_loader_records_additive_contract_preserved(self):
+        # The records channel must not change the (parts, errors) return.
+        recs = []
+        assert review.get_local_reference_parts("", records=recs) == ([], [])
+        assert recs == []
+        assert review.get_document_content("", records=recs) == ([], [])
+
+
+class TestPinnedDiff:
+    """get_pr_diff / discovery pin to the resolved SHAs (S1) when present, else fall back."""
+
+    def test_get_pr_diff_uses_git_when_pinned(self, monkeypatch):
+        seen = {}
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return SimpleNamespace(stdout="diff --git a/A.lean b/A.lean\n@@ -1 +1 @@\n+x\n")
+        monkeypatch.setattr(review.subprocess, "run", fake_run)
+        monkeypatch.setenv("PR_BASE_SHA", "base1")
+        monkeypatch.setenv("PR_HEAD_SHA", "head1")
+        review.get_pr_diff("42")
+        assert seen["cmd"][:2] == ["git", "diff"]
+        assert "base1...head1" in seen["cmd"][2]
+
+    def test_get_pr_diff_falls_back_to_gh_when_unpinned(self, monkeypatch):
+        seen = {}
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return SimpleNamespace(stdout="diff --git a/A.lean b/A.lean\n@@ -1 +1 @@\n+x\n")
+        monkeypatch.setattr(review.subprocess, "run", fake_run)
+        monkeypatch.delenv("PR_BASE_SHA", raising=False)
+        monkeypatch.delenv("PR_HEAD_SHA", raising=False)
+        review.get_pr_diff("42")
+        assert seen["cmd"][:3] == ["gh", "pr", "diff"]
+
+    def test_discover_changed_files_pinned_to_shas(self, monkeypatch):
+        # The discovery half of the "diff + discovery pinned to ONE SHA" S1 claim.
+        import discover_files
+        seen = {}
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return SimpleNamespace(stdout="ArkLib/A.lean\nREADME.md\n", returncode=0)
+        monkeypatch.setattr(discover_files.subprocess, "run", fake_run)
+        monkeypatch.setenv("PR_BASE_SHA", "b1")
+        monkeypatch.setenv("PR_HEAD_SHA", "h1")
+        files = discover_files.get_changed_lean_files("42")
+        assert seen["cmd"][:3] == ["git", "diff", "--name-only"]
+        assert "b1...h1" in seen["cmd"][3]
+        assert files == ["ArkLib/A.lean"]          # only .lean kept
+
+    def test_discover_changed_files_falls_back_when_unpinned(self, monkeypatch):
+        import discover_files
+        seen = {}
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return SimpleNamespace(stdout="ArkLib/A.lean\n", returncode=0)
+        monkeypatch.setattr(discover_files.subprocess, "run", fake_run)
+        monkeypatch.delenv("PR_BASE_SHA", raising=False)
+        monkeypatch.delenv("PR_HEAD_SHA", raising=False)
+        discover_files.get_changed_lean_files("42")
+        assert seen["cmd"][:3] == ["gh", "pr", "diff"]
 
 
 # --- extract_refs_from_instructions (freeform /review parsing) ---

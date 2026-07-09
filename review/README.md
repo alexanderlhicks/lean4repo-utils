@@ -243,6 +243,27 @@ Tune to your project's characteristics:
 > sandboxing lands (tracked separately), do **not** wire this action under
 > `pull_request_target` with a privileged token on an untrusted-fork PR.
 
+### Reviews the PR head, and shows what it used
+
+- **Correct code (PR head).** The action resolves the pull request's head commit from
+  `pr_number` and checks that exact SHA out, so a `/review` invoked from a comment
+  reviews the PR's code — not the base branch. The same commit anchors the diff, file
+  discovery, and the line annotations, and is stamped in the posted comment
+  (*"Reviewed at commit `…`"*). Note this means the action reviews the **head** commit
+  for every trigger.
+- **"References & context used."** Each review comment ends with a collapsible manifest
+  listing what actually grounded it — external references fetched, knowledge-base /
+  specification files loaded, and repository dependency-graph files (context that
+  failed to load is reported once, in *Context Warnings*). This makes it visible
+  whether the review drew on the intended sources.
+- **Guided vs. unguided.** A plain `/review` is an *unguided* review (grounded only on
+  the diff, the dependency graph, and any cited references); a `/review` with
+  instructions is titled *"AI Review (with additional instructions)"* and lays those
+  instructions out, so a reader can judge the review against what was asked.
+- **Findings cite their basis.** Each finding carries an `evidence` line — the paper
+  section / checklist item it rests on, the repository symbol misused, or the
+  compiler/toolchain output — while original, non-citeable findings remain first-class.
+
 ### Advanced tuning (environment variables)
 
 | Env var | Default | Effect |

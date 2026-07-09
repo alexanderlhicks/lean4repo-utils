@@ -90,14 +90,41 @@ outputs:
 runs:
   using: "composite"
   steps:
+    # S1: resolve the PR HEAD (and BASE) SHA from pr_number BEFORE checkout. On the
+    # issue_comment /review path there is no github.event.pull_request, so without this
+    # the checkout below lands on the base branch and the whole review reads the wrong
+    # code. Fail-closed (never a base fallback). NOTE: this pins HEAD for EVERY trigger —
+    # a future auto (pull_request) trigger will review HEAD, not the refs/pull/N/merge
+    # commit that the default checkout would use. That is a deliberate semantic choice
+    # (the action only sees pr_number); the auto-trigger fast-follow must expect HEAD.
+    - name: Resolve PR head SHA
+      id: resolve_head
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        # Route pr_number through env and reference it as a shell variable — never
+        # interpolate ${{ inputs.pr_number }} into the run: body (that is a GHA
+        # expression-injection sink, per the standard used everywhere else in this file).
+        # $GITHUB_REPOSITORY is a built-in, trusted default env var.
+        PR_NUMBER: ${{ inputs.pr_number }}
+      run: bash "${{ github.action_path }}/resolve_pr_head.sh" "$GITHUB_REPOSITORY" "$PR_NUMBER"
+
     - name: Checkout repository
       uses: actions/checkout@v7
       with:
+        # Immutable HEAD sha (not refs/pull/N/head or a branch), so the worktree, the
+        # diff, discovery, and the review annotations all anchor to ONE commit. For a
+        # fork PR the SHA is fetchable via the base repo's PR refs; if a future runner
+        # cannot fetch a raw SHA, the fallback is to fetch refs/pull/<n>/head and hard-
+        # reset to head_sha (fail closed on mismatch) — see the dogfood notes.
+        ref: ${{ steps.resolve_head.outputs.head_sha }}
         fetch-depth: 0
         # Do not leave the GITHUB_TOKEN in .git/config: the Lean build step below runs
         # PR-branch lakefile code in this same workspace, and the reviewer's lean_tools
         # execute model-directed Lean IO. Nothing here pushes, so drop the credential.
-        # (Full lean_tools sandboxing is tracked as a separate roadmap item.)
+        # (Full lean_tools sandboxing is tracked as a separate roadmap item; until it
+        # lands, do not wire this action under pull_request_target with a privileged
+        # token — the HEAD checkout means untrusted PR code now builds/elaborates here.)
         persist-credentials: false
 
     - name: Mask secrets
@@ -133,6 +160,10 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number }}
         DEPENDENCY_DEPTH: ${{ inputs.dependency_depth }}
+        # Pin discovery to the SAME base...head SHAs the worktree was checked out at
+        # (S1), so a mid-run force-push can't skew changed-files vs. the reviewed tree.
+        PR_HEAD_SHA: ${{ steps.resolve_head.outputs.head_sha }}
+        PR_BASE_SHA: ${{ steps.resolve_head.outputs.base_sha }}
       run: uv run --project "${{ github.action_path }}" --no-dev --frozen python "${{ github.action_path }}/discover_files.py"
 
 
@@ -155,6 +186,9 @@ runs:
         API_KEY: ${{ inputs.api_key }}
         MODEL: ${{ inputs.model }}
         PR_NUMBER: ${{ inputs.pr_number }}
+        # Pin the diff + the reviewed-at stamp to the checked-out SHAs (S1).
+        PR_HEAD_SHA: ${{ steps.resolve_head.outputs.head_sha }}
+        PR_BASE_SHA: ${{ steps.resolve_head.outputs.base_sha }}
         SPEC_REFS: ${{ inputs.spec_refs }}
         DISCOVERED_FILES: ${{ steps.discover_files.outputs.discovered_files }}
         SUMMARY_FILES: ${{ steps.discover_files.outputs.summary_files }}
@@ -221,6 +255,9 @@ runs:
         REVIEW_TEXT: ${{ steps.run_review.outputs.review_text }}
         ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
         PR_NUMBER: ${{ inputs.pr_number }}
+        # Anchor the review's line annotations to the EXACT commit that was reviewed
+        # (S1), not a fresh re-resolve that a mid-run force-push could have moved.
+        REVIEW_HEAD_SHA: ${{ steps.resolve_head.outputs.head_sha }}
       with:
         retries: 3
         script: |
@@ -232,10 +269,12 @@ runs:
             console.log('review_text is empty — skipping comment post.');
             return;
           }
-          let headerText = '### 🤖 Initial AI review';
-          if (process.env.ADDITIONAL_COMMENTS) {
-            headerText = '### 🤖 AI Review (with review instructions)';
-          }
+          // Fallback header only (review.py's output already starts with '### 🤖 ',
+          // so this branch is rarely taken). Mirror review.py's two states — guided vs
+          // unguided — with no "Initial/subsequent" distinction (that is R2's concern).
+          const headerText = process.env.ADDITIONAL_COMMENTS
+            ? '### 🤖 AI Review (with additional instructions)'
+            : '### 🤖 AI Review';
           const header = headerText + '\n\n';
           const body = reviewText.startsWith('### 🤖 ') ? reviewText : header + reviewText;
           const { owner, repo } = context.repo;
@@ -286,9 +325,14 @@ runs:
 
           if (annotations.length > 0) {
             try {
-              // Get the PR's head SHA for the review
-              const pr = await github.rest.pulls.get({ owner, repo, pull_number: pr_number });
-              const commit_id = pr.data.head.sha;
+              // Anchor to the SHA the review was actually performed against (threaded
+              // from the resolve_head step). Fall back to a live re-resolve only if it
+              // is somehow absent, so a stale/edited env can't silently mis-anchor.
+              let commit_id = process.env.REVIEW_HEAD_SHA;
+              if (!commit_id) {
+                const pr = await github.rest.pulls.get({ owner, repo, pull_number: pr_number });
+                commit_id = pr.data.head.sha;
+              }
 
               // GitHub limits to 50 comments per review
               const comments = annotations.slice(0, 50).map(a => ({
