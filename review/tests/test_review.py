@@ -1091,6 +1091,21 @@ class TestLeanToolWiring:
         assert captured["tools"] is None
         assert captured["runner"] is None
 
+    def test_call_provider_tracks_advisory_budget_without_raising(self):
+        budget = review.parse_run_budget("1", None)
+
+        def gen(model, contents, schema, thinking_budget=None, **kw):
+            return review.FindingVerdict(verdict="confirmed", reasoning="r"), review.TokenUsage(input_tokens=10)
+
+        provider = SimpleNamespace(
+            generate_structured=gen,
+            budget=SimpleNamespace(max_tokens=None),
+            prompt_budget=budget,
+            name="fake",
+        )
+        review._call_provider(provider, "m", [review.ContentPart("text", "x")], review.FindingVerdict)
+        assert budget.exceeded is True
+
     def test_per_file_reviewer_uses_tools_when_enabled(self, monkeypatch):
         monkeypatch.setattr(review, "LEAN_TOOLS_ENABLED", True)
         captured = {}
@@ -1134,8 +1149,10 @@ class TestTriageRobustness:
         monkeypatch.delenv("LAKE_GRAPH", raising=False)
         captured = {}
 
-        def fake_fit(template_name, replacements, context_label="", trimmable=None):
+        def fake_fit(template_name, replacements, max_chars=review.MAX_PROMPT_CHARS,
+                     context_label="", trimmable=None):
             captured["template"] = template_name
+            captured["max_chars"] = max_chars
             captured["trimmable"] = trimmable
             return replacements
         monkeypatch.setattr(review, "_fit_prompt_to_budget", fake_fit)
@@ -1150,6 +1167,69 @@ class TestTriageRobustness:
         assert clusters[0].name == "c"
         assert captured["template"] == "triage.md"
         assert captured["trimmable"] == ("ALL_DIFFS",)
+
+
+class TestSpecPromptBudget:
+    def test_call_prompt_char_budget_uses_run_token_ceiling(self):
+        budget = review.parse_run_budget("100000", None)
+        provider = SimpleNamespace(budget=budget, max_tokens=16_000)
+        cap = review._call_prompt_char_budget(
+            provider,
+            thinking_budget=4_000,
+            external_parts=[review.ContentPart("text", "R" * 1_000)],
+            fallback=review.MAX_PROMPT_CHARS,
+        )
+        assert cap < review.MAX_PROMPT_CHARS
+        assert cap <= (100_000 - 16_000 - 4_000) * 2
+
+    def test_call_prompt_char_budget_slices_parallel_calls(self):
+        budget = review.parse_run_budget("200000", None)
+        provider = SimpleNamespace(budget=budget, max_tokens=10_000)
+        sequential = review._call_prompt_char_budget(
+            provider, thinking_budget=2_000, parallelism=1, fallback=review.MAX_PROMPT_CHARS)
+        parallel = review._call_prompt_char_budget(
+            provider, thinking_budget=2_000, parallelism=5, fallback=review.MAX_PROMPT_CHARS)
+        assert parallel < sequential
+        assert parallel <= ((200_000 // 5) - 10_000 - 2_000) * 2
+
+    def test_binary_reference_size_counts_base64_payload(self):
+        part = review.ContentPart("pdf", b"123456", mime_type="application/pdf")
+        assert review._part_char_size(part) >= 8 + len("application/pdf")
+
+    def test_analyze_specification_marks_bulk_context_trimmable(self, monkeypatch):
+        captured = {}
+
+        def fake_fit(template_name, replacements, max_chars=review.MAX_PROMPT_CHARS,
+                     context_label="", trimmable=None):
+            captured["template"] = template_name
+            captured["max_chars"] = max_chars
+            captured["trimmable"] = trimmable
+            return dict(replacements, FILE_DIFFS="trimmed")
+        monkeypatch.setattr(review, "_fit_prompt_to_budget", fake_fit)
+
+        def gen(model, contents, schema, thinking_budget=None):
+            text_parts = [p.data for p in contents if p.type == "text"]
+            captured["prompt_text"] = text_parts[-1]
+            return review.SpecChecklist(items=[]), review.TokenUsage(input_tokens=1, output_tokens=1)
+
+        provider = SimpleNamespace(
+            budget=review.parse_run_budget("100000", None),
+            max_tokens=16_000,
+            generate_structured=gen,
+            name="fake",
+        )
+        review.analyze_specification(
+            provider,
+            [review.ContentPart("text", "reference")],
+            "m",
+            "D" * 1_000_000,
+            summary_context="S" * 1_000_000,
+            lake_graph="G" * 1_000_000,
+        )
+        assert captured["template"] == "analyze_spec.md"
+        assert captured["trimmable"] == ("FILE_DIFFS", "REPO_STRUCTURE", "DEPENDENCY_GRAPH")
+        assert captured["max_chars"] < review.MAX_PROMPT_CHARS
+        assert "trimmed" in captured["prompt_text"]
 
 
 # --- dependent-impact pass (second-order) ---
@@ -1565,7 +1645,8 @@ class TestC3Containment:
         monkeypatch.setattr(sys, "argv", argv)
         monkeypatch.setenv("API_KEY", "sk-test")
         for var in ("SUMMARY_FILES", "LEAN_INFO", "DISCOVERED_FILES", "BUILD_OUTPUT",
-                    "LAKE_GRAPH", "LLM_MAX_RUN_TOKENS", "LLM_MAX_RUN_COST", "LLM_LOUD_EXIT"):
+                    "LAKE_GRAPH", "LLM_MAX_RUN_TOKENS", "LLM_MAX_RUN_COST",
+                    "LLM_BUDGET_MODE", "LLM_LOUD_EXIT"):
             monkeypatch.delenv(var, raising=False)
         for k, v in (env or {}).items():
             monkeypatch.setenv(k, v)
@@ -1724,7 +1805,7 @@ class TestC3ActionWiring:
 
     def test_new_inputs_declared(self):
         doc, _ = self._action()
-        for name in ("llm_max_run_tokens", "llm_max_run_cost", "llm_loud_exit"):
+        for name in ("llm_max_run_tokens", "llm_max_run_cost", "llm_budget_mode", "llm_loud_exit"):
             assert name in doc["inputs"]
 
     def test_env_names_match_python_constants(self):
@@ -1734,8 +1815,10 @@ class TestC3ActionWiring:
         env = self._run_step(doc)["env"]
         assert review.ENV_MAX_RUN_TOKENS in env
         assert review.ENV_MAX_RUN_COST in env
+        assert review.ENV_BUDGET_MODE in env
         assert review.ENV_LOUD_EXIT in env
         assert env[review.ENV_MAX_RUN_TOKENS] == "${{ inputs.llm_max_run_tokens }}"
+        assert env[review.ENV_BUDGET_MODE] == "${{ inputs.llm_budget_mode }}"
 
     def test_budget_inputs_never_interpolated_into_run_body(self):
         # Expression-injection guard: the budget inputs must reach Python via env only,
@@ -1744,6 +1827,7 @@ class TestC3ActionWiring:
         for s in doc["runs"]["steps"]:
             run = s.get("run", "")
             assert "inputs.llm_max_run" not in run
+            assert "inputs.llm_budget_mode" not in run
             assert "inputs.llm_loud_exit" not in run
 
     def test_run_step_captures_rc_and_closes_heredoc(self):
@@ -1754,6 +1838,13 @@ class TestC3ActionWiring:
         assert "exit $rc" in run
         # rc-capture must come before the EOF echo, or review_text is unterminated.
         assert run.index("|| rc=$?") < run.index('echo "$EOF_MARKER"')
+
+    def test_heredoc_marker_not_pipefail_fragile(self):
+        doc, _ = self._action()
+        run = self._run_step(doc)["run"]
+        assert "openssl rand -hex" in run
+        assert "head /dev/urandom" not in run
+        assert "tr -dc" not in run
 
     def test_shell_emits_error_from_health_file(self):
         doc, _ = self._action()
@@ -1791,6 +1882,13 @@ class TestC3ActionWiring:
         assert run_env.get("PR_BASE_SHA") == "${{ steps.resolve_head.outputs.base_sha }}"
         discover = next(s for s in doc["runs"]["steps"] if s.get("id") == "discover_files")
         assert discover["env"].get("PR_HEAD_SHA") == "${{ steps.resolve_head.outputs.head_sha }}"
+
+    def test_lean_info_receives_changed_files_not_context_files(self):
+        doc, _ = self._action()
+        lean_info = next(s for s in doc["runs"]["steps"] if s.get("id") == "lean_info")
+        assert lean_info["env"]["CHANGED_FILES"] == "${{ steps.discover_files.outputs.changed_files }}"
+        run_env = self._run_step(doc)["env"]
+        assert run_env["DISCOVERED_FILES"] == "${{ steps.discover_files.outputs.discovered_files }}"
 
     def test_s1_resolve_step_routes_pr_number_via_env_not_run_body(self):
         # Expression-injection guard: pr_number must reach the resolve script via an env

@@ -180,6 +180,7 @@ def main():
 
     output_string = ','.join(full_context_files)
     summary_string = ','.join(summary_context_files)
+    changed_string = ','.join(changed_files)
 
     print(f"::notice::Discovered files for review: {output_string}")
     if summary_string:
@@ -193,6 +194,7 @@ def main():
         pass
 
     with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+        f.write(f"changed_files={changed_string}\n")
         f.write(f"discovered_files={output_string}\n")
         f.write(f"summary_files={summary_string}\n")
         f.write(f"lake_graph={lake_graph_serialized}\n")

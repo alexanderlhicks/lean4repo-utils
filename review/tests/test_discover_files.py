@@ -2,9 +2,11 @@
 
 import sys
 import os
+import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import discover_files
 from discover_files import (
     get_lean_module_name,
     get_dependent_lean_files,
@@ -227,3 +229,23 @@ class TestPartitionContextTiers:
         assert len(summary) == 3
         # All 8 still accounted for, order preserved.
         assert full + summary == final
+
+
+class TestMainOutputs:
+    def test_writes_changed_files_separately_from_context(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "Changed.lean").write_text("def changed := 1\n")
+        github_output = tmp_path / "out.txt"
+        monkeypatch.setenv("PR_NUMBER", "1")
+        monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+        monkeypatch.setattr(discover_files, "get_changed_lean_files", lambda pr: ["Changed.lean"])
+
+        def fail_graph(*args, **kwargs):
+            raise subprocess.CalledProcessError(1, args[0])
+        monkeypatch.setattr(discover_files.subprocess, "run", fail_graph)
+
+        discover_files.main()
+
+        out = github_output.read_text()
+        assert "changed_files=Changed.lean\n" in out
+        assert "discovered_files=Changed.lean\n" in out

@@ -222,19 +222,22 @@ Tune to your project's characteristics:
 | `cross_file_model` | No | `model` | Model override for the Cross-File Analysis agent |
 | `synthesis_model` | No | `model` | Model override for the Synthesis agent |
 | `verify_model` | No | `z-ai/glm-5.2` | Model for the verification pass. Defaults to a **different open-weight family** than `model` for an independent check (avoids self-agreement bias). Override with any slug; keep it a different family than `model`. |
-| `llm_max_run_tokens` | No | `""` | Per-run token ceiling. Once exceeded, no further LLM calls are made and the run degrades gracefully (partial results + a loud banner + a non-Approved verdict) instead of draining a shared key. Empty = disabled. The token ceiling is authoritative. |
-| `llm_max_run_cost` | No | `""` | Per-run cost ceiling in OpenRouter credits. **Requires** `llm_max_run_tokens` (a cost-only budget is rejected — cost can be BYOK-fee-only or absent). Empty = disabled. |
-| `llm_loud_exit` | No | `false` | When `true`, the action exits **non-zero** if the run degraded (spend/quota/auth failure or budget exhausted), *after* posting the comment. Default `false` keeps the job green with a banner + `::error::` annotation. See the warning below. |
+| `llm_max_run_tokens` | No | `""` | Per-run token budget. In the default `llm_budget_mode=advisory`, this sizes/trims prompts but does **not** stop review coverage. In `hard` mode, once exceeded, no further LLM calls are made and the run degrades gracefully. Empty = disabled. |
+| `llm_max_run_cost` | No | `""` | Per-run cost budget in OpenRouter credits. **Requires** `llm_max_run_tokens` (a cost-only budget is rejected — cost can be BYOK-fee-only or absent). Empty = disabled. |
+| `llm_budget_mode` | No | `advisory` | `advisory` prioritizes reviewing all PRs: budgets are prompt-sizing hints and are tracked but not enforced. `hard` prioritizes spend containment: crossing the budget stops further LLM calls and posts an incomplete/degraded review. |
+| `llm_loud_exit` | No | `false` | When `true`, the action exits **non-zero** if the run degraded (spend/quota/auth failure, or budget exhaustion in `hard` mode), *after* posting the comment. Default `false` keeps the job green with a banner + `::error::` annotation. See the warning below. |
 
-> **Per-run spend control (C3).** `llm_max_run_tokens` / `llm_max_run_cost` bound a
-> single run so one huge or hostile PR can't drain the shared key; they layer on top
-> of OpenRouter's own per-key credit limit (the bug-proof hard cap — they do **not**
-> bound aggregate spend across runs). A spend/quota/auth failure or budget trip is now
-> **loud**: a `> [!CAUTION]` banner leads the comment, the verdict can no longer be
-> *Approved*, and a `::error::` annotation is emitted — the run no longer fails open to
-> a green check. **Do not mark this action as a required check with `llm_loud_exit`
-> enabled** — a provider outage would then block every merge. These inputs are
-> operator config; source them from the workflow/secrets, never from PR content.
+> **Coverage-first budget control.** The default `llm_budget_mode=advisory`
+> prioritizes complete reviews: `llm_max_run_tokens` / `llm_max_run_cost` are tracked
+> and used to shrink bulky prompts, but crossing them does not abort later files. Use
+> `llm_budget_mode=hard` only when spend containment is more important than reviewing
+> every PR; in hard mode, budget exhaustion is loud (`> [!CAUTION]`, non-Approved
+> verdict, and `::error::`). Spend/quota/auth provider failures are always loud.
+> These action-level budgets layer on top of OpenRouter's own per-key credit limit
+> and do **not** bound aggregate spend across runs. **Do not mark this action as a
+> required check with `llm_loud_exit` enabled** — a provider outage would then block
+> every merge. These inputs are operator config; source them from workflow/secrets,
+> never from PR content.
 >
 > **Actions logs are public** on public repos: exception detail (class + status +
 > truncated message) goes to the log, never into the PR comment. **Security:** the
@@ -278,6 +281,7 @@ Tune to your project's characteristics:
 | `ESCAPE_HATCH_ALLOWLIST` | `""` | Same as the `escape_hatch_allowlist` input. |
 | `LLM_MAX_RUN_TOKENS` | `""` | Same as the `llm_max_run_tokens` input (empty = disabled). |
 | `LLM_MAX_RUN_COST` | `""` | Same as the `llm_max_run_cost` input (requires `LLM_MAX_RUN_TOKENS`). |
+| `LLM_BUDGET_MODE` | `advisory` | Same as the `llm_budget_mode` input (`advisory` or `hard`). |
 | `LLM_LOUD_EXIT` | `false` | Same as the `llm_loud_exit` input. Non-zero exit on a degraded run, after the comment posts. |
 | `ENABLE_WEB_SEARCH` | `false` | Same as the `enable_web_search` input. |
 | `SPEC_REFS` | `""` | Same as the `spec_refs` input. |

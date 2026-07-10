@@ -169,6 +169,7 @@ LEAN_TOOLS_ENABLED = False
 # the workflow/secrets env, NEVER from the untrusted PR checkout.
 ENV_MAX_RUN_TOKENS = "LLM_MAX_RUN_TOKENS"
 ENV_MAX_RUN_COST = "LLM_MAX_RUN_COST"
+ENV_BUDGET_MODE = "LLM_BUDGET_MODE"
 ENV_LOUD_EXIT = "LLM_LOUD_EXIT"
 # Process exit code when loud-exit is enabled AND the run degraded. Applied ONLY at
 # the entrypoint via sys.exit(main()) — never inside a finally, and only after the
@@ -375,6 +376,13 @@ except ValueError:
 # in order of preference (bulkiest / least-essential first).
 _TRIMMABLE_KEYS = ("REPO_CONTEXT", "DEPENDENCY_CONTEXT")
 
+# Rough spend-budget guard for prompt assembly. Tokenization is model-specific
+# and unavailable here, so use a conservative chars/token estimate when a
+# per-run token budget is configured. In advisory mode this is a sizing hint; in
+# hard mode the provider also enforces the exact budget after each returned call.
+_PROMPT_CHARS_PER_BUDGET_TOKEN = 2
+_MIN_DYNAMIC_PROMPT_CHARS = 20_000
+
 # --- Helper Functions ---
 def _load_prompt(template_name: str, replacements: Dict[str, str]) -> str:
     """Loads a prompt template and applies replacements with validation."""
@@ -472,6 +480,72 @@ def _fit_prompt_to_budget(
     with open(path, "r") as f:
         template = f.read()
     return _fit_replacements_to_budget(template, replacements, max_chars, context_label, trimmable)
+
+
+def _part_char_size(part: ContentPart) -> int:
+    """Approximate how many prompt characters a content part contributes.
+
+    This is only used for conservative preflight trimming against a token spend
+    ceiling. Exact token accounting stays in the provider after a response
+    returns.
+    """
+    data = part.data
+    if isinstance(data, str):
+        return len(data)
+    if isinstance(data, (bytes, bytearray)):
+        # Binary parts are sent as data: URLs with base64 payloads.
+        return ((len(data) + 2) // 3) * 4 + len(part.mime_type or "")
+    return len(str(data))
+
+
+def _call_prompt_char_budget(
+    provider: LLMProvider,
+    *,
+    thinking_budget: Optional[int] = None,
+    external_parts: Optional[List[ContentPart]] = None,
+    cached_body: str = "",
+    parallelism: int = 1,
+    fallback: int = MAX_PROMPT_CHARS,
+) -> int:
+    """Return a prompt-template char budget for one LLM call.
+
+    Without a configured per-run token ceiling this preserves the existing
+    context-window cap. With one, it estimates how much input room remains after
+    already-spent tokens, output/thinking reserve, the operating contract,
+    external references, any cached prefix, and the number of calls that can
+    enter concurrently before usage is recorded.
+    """
+    budget = getattr(provider, "prompt_budget", None) or getattr(provider, "budget", None)
+    max_tokens = getattr(budget, "max_tokens", None)
+    if not max_tokens:
+        return fallback
+
+    try:
+        snap = budget.snapshot()
+        spent = (snap.input_tokens or 0) + (snap.output_tokens or 0)
+    except Exception:
+        spent = 0
+
+    output_reserve = getattr(provider, "max_tokens", 16_384)
+    if thinking_budget and thinking_budget > 0:
+        output_reserve += int(thinking_budget)
+
+    try:
+        n_parallel = max(1, int(parallelism))
+    except (TypeError, ValueError):
+        n_parallel = 1
+
+    # For parallel stages, several calls can enter before any one records usage.
+    # Split the remaining run budget across that many in-flight calls so they
+    # cannot each claim the full remaining budget during preflight sizing.
+    prompt_tokens = ((max_tokens - spent) // n_parallel) - output_reserve
+    if prompt_tokens <= 0:
+        return _MIN_DYNAMIC_PROMPT_CHARS
+
+    total_chars = min(fallback, prompt_tokens * _PROMPT_CHARS_PER_BUDGET_TOKEN)
+    stable_chars = len(OPERATING_CONTRACT or "") + len(cached_body or "")
+    stable_chars += sum(_part_char_size(p) for p in (external_parts or []))
+    return max(_MIN_DYNAMIC_PROMPT_CHARS, total_chars - stable_chars)
 
 
 def _check_ip_safe(ip_str: str) -> Tuple[bool, str]:
@@ -1052,6 +1126,10 @@ def _call_provider(provider: LLMProvider, model: str, contents: List[ContentPart
         parsed, usage = provider.generate_structured(
             model=model, contents=contents, schema=schema, thinking_budget=thinking_budget,
         )
+    advisory_budget = getattr(provider, "prompt_budget", None)
+    hard_budget = getattr(provider, "budget", None)
+    if advisory_budget is not None and advisory_budget is not hard_budget:
+        advisory_budget.record_and_check(usage)
     token_tracker.record(usage)
     return parsed
 
@@ -1123,7 +1201,11 @@ def run_triage(provider: LLMProvider, diff_by_file: Dict[str, str], spec_checkli
         # signatures and dependency graph instead of failing to a per-file
         # fallback that loses all clustering.
         replacements = _fit_prompt_to_budget(
-            "triage.md", replacements, context_label="triage", trimmable=("ALL_DIFFS",),
+            "triage.md",
+            replacements,
+            max_chars=_call_prompt_char_budget(provider, thinking_budget=THINKING_BUDGET_LOW),
+            context_label="triage",
+            trimmable=("ALL_DIFFS",),
         )
         prompt_text = _load_prompt("triage.md", replacements)
     except FileNotFoundError:
@@ -1152,12 +1234,24 @@ def analyze_specification(provider: LLMProvider, external_parts: List[ContentPar
         return ""
 
     try:
-        prompt_text = _load_prompt("analyze_spec.md", {
+        replacements = {
             "EXTERNAL_CONTEXT": "Refer to the external reference documents provided above (attached as content parts before this prompt).",
             "FILE_DIFFS": all_diffs,
             "REPO_STRUCTURE": summary_context or "No repository structure available.",
             "DEPENDENCY_GRAPH": lake_graph or "Dependency graph not available.",
-        })
+        }
+        replacements = _fit_prompt_to_budget(
+            "analyze_spec.md",
+            replacements,
+            max_chars=_call_prompt_char_budget(
+                provider,
+                thinking_budget=THINKING_BUDGET_HIGH,
+                external_parts=external_parts,
+            ),
+            context_label="spec",
+            trimmable=("FILE_DIFFS", "REPO_STRUCTURE", "DEPENDENCY_GRAPH"),
+        )
+        prompt_text = _load_prompt("analyze_spec.md", replacements)
     except FileNotFoundError:
         logging.error("Error: Prompt template 'analyze_spec.md' not found")
         return ""
@@ -1482,6 +1576,7 @@ def _merge_file_reviews(reviews: List[FileReview]) -> Optional[FileReview]:
 def _run_file_review(provider: LLMProvider, prompt_file: str, base_replacements: Dict[str, str],
                      full_content: str, file_diff: str, external_parts: list,
                      review_model: str, context_label: str,
+                     budget_parallelism: int = 1,
                      toolbox: Optional[LeanToolbox] = None) -> Tuple[Optional[FileReview], Optional[str]]:
     """Single Agent-B call for one (chunk of a) file. Returns (review, None) on
     success or (None, error_message) on failure."""
@@ -1489,7 +1584,17 @@ def _run_file_review(provider: LLMProvider, prompt_file: str, base_replacements:
     replacements["FULL_CONTENT"] = full_content
     replacements["FILE_DIFF"] = file_diff
     try:
-        replacements = _fit_prompt_to_budget(prompt_file, replacements, context_label=context_label)
+        replacements = _fit_prompt_to_budget(
+            prompt_file,
+            replacements,
+            max_chars=_call_prompt_char_budget(
+                provider,
+                thinking_budget=THINKING_BUDGET_HIGH,
+                external_parts=external_parts,
+                parallelism=budget_parallelism,
+            ),
+            context_label=context_label,
+        )
         prompt_text = _load_prompt(prompt_file, replacements)
     except FileNotFoundError:
         return None, f"Error: Prompt template not found: {prompt_file}"
@@ -1562,13 +1667,18 @@ def analyze_file_changes_with_context(provider: LLMProvider, review_context: dic
         "VERDICT_RULES": verdict_rules,
     }
     review_model = review_context.get("review_model")
+    try:
+        budget_parallelism = int(review_context.get("max_workers", 1))
+    except (TypeError, ValueError):
+        budget_parallelism = 1
     toolbox = _make_toolbox(file_path_to_module_name(file_path))
 
     # Small file: single call (the common case).
     if len(full_content) <= MAX_FILE_REVIEW_CHARS:
         review, err = _run_file_review(
             provider, prompt_file, base_replacements, full_content, file_diff,
-            external_parts, review_model, file_path, toolbox=toolbox,
+            external_parts, review_model, file_path,
+            budget_parallelism=budget_parallelism, toolbox=toolbox,
         )
         if review is None:
             return None, err
@@ -1597,7 +1707,8 @@ def analyze_file_changes_with_context(provider: LLMProvider, review_context: dic
         )
         review, err = _run_file_review(
             provider, prompt_file, base_replacements, chunk_full, chunk_diff,
-            external_parts, review_model, f"{file_path}:{start}-{end}", toolbox=toolbox,
+            external_parts, review_model, f"{file_path}:{start}-{end}",
+            budget_parallelism=budget_parallelism, toolbox=toolbox,
         )
         if review is not None:
             reviews.append(review)
@@ -1671,6 +1782,11 @@ def analyze_cross_file(provider: LLMProvider, diff_by_file: Dict[str, str], spec
     try:
         replacements = _fit_prompt_to_budget(
             "cross_file_analysis.md", replacements, context_label="cross-file",
+            max_chars=_call_prompt_char_budget(
+                provider,
+                thinking_budget=THINKING_BUDGET_HIGH,
+                external_parts=external_parts,
+            ),
             trimmable=("DEPENDENCY_CONTEXT", "ALL_CHANGED_CONTENTS"),
         )
         prompt_text = _load_prompt("cross_file_analysis.md", replacements)
@@ -1747,6 +1863,12 @@ def analyze_dependent_impact(provider: LLMProvider, dependents: Dict[str, str], 
                 "ALL_DIFFS": all_diffs,
                 "SPEC_CHECKLIST": spec_checklist or "No specification checklist provided.",
             },
+            max_chars=_call_prompt_char_budget(
+                provider,
+                thinking_budget=THINKING_BUDGET_LOW,
+                external_parts=external_parts,
+                parallelism=max_workers,
+            ),
             context_label=f"dependent-impact:{path}",
             trimmable=("DEPENDENT_CONTENT", "ALL_DIFFS"),
         )
@@ -1854,6 +1976,7 @@ def synthesize_overall_summary(provider: LLMProvider, per_file_reviews: Dict[str
         # the prose is trimmed on a very large PR.
         replacements = _fit_prompt_to_budget(
             "synthesize_summary.md", replacements, context_label="synthesis",
+            max_chars=_call_prompt_char_budget(provider, thinking_budget=THINKING_BUDGET_LOW),
             trimmable=("PER_FILE_REVIEWS",),
         )
         prompt = _load_prompt("synthesize_summary.md", replacements)
@@ -1873,6 +1996,7 @@ def synthesize_overall_summary(provider: LLMProvider, per_file_reviews: Dict[str
 
 
 def _verify_one_finding(provider: LLMProvider, finding: Finding, context: str, model: str,
+                        budget_parallelism: int = 1,
                         toolbox: Optional[LeanToolbox] = None) -> FindingVerdict:
     """Run the adversarial verifier on a single finding. Raises on API failure.
     With a toolbox, the verifier can check the claim against the Lean toolchain
@@ -1885,6 +2009,11 @@ def _verify_one_finding(provider: LLMProvider, finding: Finding, context: str, m
             "FINDING_EVIDENCE": finding.evidence or "(none provided)",
             "CONTEXT": context,
         },
+        max_chars=_call_prompt_char_budget(
+            provider,
+            thinking_budget=THINKING_BUDGET_LOW,
+            parallelism=budget_parallelism,
+        ),
         context_label="verify",
         trimmable=("CONTEXT",),
     )
@@ -1957,7 +2086,10 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
     verdicts: Dict[int, Optional[FindingVerdict]] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_finding = {
-            executor.submit(_verify_one_finding, provider, f, ctx, model, _make_toolbox(module)): f
+            executor.submit(
+                _verify_one_finding,
+                provider, f, ctx, model, max_workers, _make_toolbox(module),
+            ): f
             for (f, ctx, module) in jobs
         }
         for future in future_to_finding:
@@ -2339,6 +2471,10 @@ def main():
     except ValueError as e:
         logging.error(f"Invalid per-run budget configuration ({ENV_MAX_RUN_TOKENS}/{ENV_MAX_RUN_COST}): {e}")
         sys.exit(1)
+    budget_mode = os.environ.get(ENV_BUDGET_MODE, "advisory").strip().lower() or "advisory"
+    if budget_mode not in ("advisory", "hard"):
+        logging.error(f"Invalid {ENV_BUDGET_MODE}: expected 'advisory' or 'hard', got {budget_mode!r}")
+        sys.exit(1)
     global run_health
     run_health = RunHealth()
 
@@ -2355,11 +2491,19 @@ def main():
         except OSError as _e:
             logging.warning(f"Could not remove stale {_stale}: {describe_exc(_e)}")
 
-    provider = create_provider(api_key, enable_web_search=enable_web_search, budget=budget)
+    hard_budget = budget if budget_mode == "hard" else None
+    provider = create_provider(api_key, enable_web_search=enable_web_search, budget=hard_budget)
+    # In advisory mode, the configured budget is still tracked and used by
+    # _call_prompt_char_budget to right-size later prompts, but it never aborts
+    # coverage. Hard mode preserves the old ceiling semantics.
+    provider.prompt_budget = budget
     logging.info(f"Using LLM provider: {provider.name}"
                  + (" (web search enabled)" if enable_web_search else ""))
     if budget is not None:
-        logging.info(f"Per-run budget active: max_tokens={budget.max_tokens} max_cost={budget.max_cost}")
+        logging.info(
+            f"Per-run budget active ({budget_mode}): max_tokens={budget.max_tokens} "
+            f"max_cost={budget.max_cost}"
+        )
 
     # Lean toolchain access for the reviewer + verifier: enabled by default, but
     # only when requested and `lake` is actually available in the runner.
@@ -2389,6 +2533,7 @@ def main():
             "changed_files": set(diff_by_file.keys()),
             "additional_comments": args.additional_comments,
             "review_model": args.review_model,
+            "max_workers": args.max_workers,
         }
         
         lean4_checklist_path = os.path.join(ACTION_PATH, "prompts", "lean4_checklist.md")

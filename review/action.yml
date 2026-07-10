@@ -79,8 +79,12 @@ inputs:
     description: 'Per-run cost ceiling in OpenRouter credits (C3). Requires llm_max_run_tokens (a cost-only budget is rejected — cost can be BYOK-fee-only or absent). Empty = disabled.'
     required: false
     default: ''
+  llm_budget_mode:
+    description: 'How to use llm_max_run_tokens / llm_max_run_cost. "advisory" (default) uses the budget to size prompts but keeps reviewing even after it is crossed. "hard" stops further LLM calls once crossed and posts an incomplete/degraded review.'
+    required: false
+    default: 'advisory'
   llm_loud_exit:
-    description: 'When "true", the action exits non-zero if the run degraded (spend/quota/auth failure or budget exhausted), AFTER posting the comment. Default "false" keeps the job green with a banner + error annotation. Do NOT mark this action as a required check with loud-exit enabled — a provider outage would then block all merges.'
+    description: 'When "true", the action exits non-zero if the run degraded (spend/quota/auth failure, or budget exhaustion in hard mode), AFTER posting the comment. Default "false" keeps the job green with a banner + error annotation. Do NOT mark this action as a required check with loud-exit enabled — a provider outage would then block all merges.'
     required: false
     default: 'false'
 outputs:
@@ -174,7 +178,7 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number }}
-        CHANGED_FILES: ${{ steps.discover_files.outputs.discovered_files }}
+        CHANGED_FILES: ${{ steps.discover_files.outputs.changed_files }}
         SUMMARY_FILES: ${{ steps.discover_files.outputs.summary_files }}
       run: uv run --project "${{ github.action_path }}" --no-dev --frozen python "${{ github.action_path }}/lean_info_extractor.py"
 
@@ -212,6 +216,7 @@ runs:
         # == disabled. Names must match review.py's ENV_MAX_RUN_* constants exactly.
         LLM_MAX_RUN_TOKENS: ${{ inputs.llm_max_run_tokens }}
         LLM_MAX_RUN_COST: ${{ inputs.llm_max_run_cost }}
+        LLM_BUDGET_MODE: ${{ inputs.llm_budget_mode }}
         LLM_LOUD_EXIT: ${{ inputs.llm_loud_exit }}
       run: |
         # Repo context = files discovered from the dependency graph; paths
@@ -220,7 +225,7 @@ runs:
 
         # Run the script and capture its output to post as a comment later
         # We use a special "end of file" marker to handle multiline output
-        EOF_MARKER=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
+        EOF_MARKER=$(openssl rand -hex 16)
         echo "review_text<<$EOF_MARKER" >> $GITHUB_OUTPUT
         # Capture review.py's exit code WITHOUT letting `set -e -o pipefail` abort the
         # step before the heredoc terminator is written: a non-zero exit (loud-exit)
