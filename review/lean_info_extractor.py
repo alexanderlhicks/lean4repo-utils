@@ -20,27 +20,79 @@ from typing import Dict, List, Optional
 from leanrepo_common.lean_utils import file_path_to_module_name, scrub_line
 
 
+_DECL_RE = re.compile(
+    r'^\s*(?P<mods>(?:private\s+|protected\s+|noncomputable\s+|partial\s+|unsafe\s+)*)'
+    r'(?:def|theorem|lemma|abbrev|instance|structure|class|inductive|opaque|axiom)\s+'
+    # Declaration name: must not start with a binder/type delimiter (rejects
+    # anonymous `instance : Foo`, whose next token is `:`).
+    r'(?P<name>(?![:({\[⦃|])[^\s:({\[⦃]+)'
+)
+_NAMESPACE_RE = re.compile(r'^\s*namespace\s+(\S+)\s*$')
+_SECTION_RE = re.compile(r'^\s*(?:noncomputable\s+)?section(?:\s+(\S+))?\s*$')
+_MUTUAL_RE = re.compile(r'^\s*mutual\s*$')
+_END_RE = re.compile(r'^\s*end(?:\s+(\S+))?\s*$')
+
+
 def get_lean_declarations(file_path: str) -> List[str]:
-    """Extracts declaration names from a Lean file by parsing the source."""
+    """Extracts namespace-qualified declaration names from a Lean file.
+
+    Tracks `namespace`/`section`/`mutual` … `end` blocks (over comment- and
+    string-scrubbed lines) so a `def bar` under `namespace Foo` is reported as
+    `Foo.bar` — the name `#print axioms` can actually resolve. `_root_.`-anchored
+    names are returned absolute. `private` declarations and anonymous instances
+    are skipped: they have no name resolvable from an importing module.
+    """
     if not os.path.exists(file_path):
         return []
 
-    decl_pattern = re.compile(
-        r'^\s*(?:private |protected |noncomputable |partial |unsafe )*'
-        r'(?:def |theorem |lemma |abbrev |instance |structure |class |inductive |opaque |axiom )'
-        r'(\S+)'
-    )
-
     declarations = []
+    # Scope stack frames: ('ns', component) — one frame per namespace component,
+    # so `end A.B` pops two — ('section', name-or-None), or ('mutual', None).
+    scopes: List[tuple] = []
     try:
         comment_depth = 0
         in_string = False
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 code, comment_depth, in_string = scrub_line(line, comment_depth, in_string)
-                m = decl_pattern.match(code)
+
+                m = _NAMESPACE_RE.match(code)
                 if m:
-                    declarations.append(m.group(1))
+                    for component in m.group(1).split('.'):
+                        if component:
+                            scopes.append(('ns', component))
+                    continue
+                m = _SECTION_RE.match(code)
+                if m:
+                    scopes.append(('section', m.group(1)))
+                    continue
+                if _MUTUAL_RE.match(code):
+                    scopes.append(('mutual', None))
+                    continue
+                m = _END_RE.match(code)
+                if m:
+                    # `end` with a k-component name closes k namespace frames
+                    # (or one named section); a bare `end` closes one frame.
+                    pops = len([c for c in m.group(1).split('.') if c]) if m.group(1) else 1
+                    for _ in range(min(pops, len(scopes))):
+                        scopes.pop()
+                    continue
+
+                m = _DECL_RE.match(code)
+                if m:
+                    if 'private' in m.group('mods'):
+                        continue
+                    # Trim a trailing dot the greedy name class can pick up before
+                    # an explicit-universe binder (`def foo.{u}` → `foo.`), so the
+                    # #print axioms query uses the real name, not `foo.`.
+                    name = m.group('name').rstrip('.')
+                    if not name:
+                        continue
+                    if name.startswith('_root_.'):
+                        declarations.append(name[len('_root_.'):])
+                        continue
+                    prefix = '.'.join(c for kind, c in scopes if kind == 'ns')
+                    declarations.append(f"{prefix}.{name}" if prefix else name)
     except (OSError, UnicodeError):
         pass
     return declarations
@@ -71,13 +123,40 @@ def run_lean_command(module_name: str, command: str, timeout: int = 30) -> Optio
         return None
 
 
-def extract_axioms(module_name: str, declarations: List[str]) -> Dict[str, List[str]]:
-    """Extracts axiom dependencies for each declaration using #print axioms."""
-    axiom_map = {}
-    for decl in declarations:
-        full_name = f"{module_name}.{decl}"
-        output = run_lean_command(module_name, f"#print axioms {full_name}")
+def extract_axioms(
+    module_name: str,
+    declarations: List[str],
+    deadline: Optional[float] = None,
+) -> tuple[Dict[str, List[str]], List[str]]:
+    """Extracts axiom dependencies for each declaration using #print axioms.
+
+    ``declarations`` are the namespace-qualified names from
+    :func:`get_lean_declarations`; they are queried as-is (the module path is
+    only used for the ``import``, never as a name prefix — module paths are not
+    namespaces). ``deadline`` is a ``time.monotonic()`` timestamp: once passed,
+    remaining declarations are skipped with a recorded truncation error, so a
+    file full of slow declarations cannot blow the caller's overall budget.
+
+    Returns ``(axiom_map, errors)`` — failures are reported, never silently
+    dropped, so an empty axiom section is distinguishable from a broken one.
+    """
+    axiom_map: Dict[str, List[str]] = {}
+    errors: List[str] = []
+    for i, decl in enumerate(declarations):
+        timeout = 30
+        if deadline is not None:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                errors.append(
+                    f"Axiom-extraction time budget exhausted in {module_name}: "
+                    f"skipped {len(declarations) - i} remaining declaration(s)."
+                )
+                break
+            timeout = max(1, min(30, int(remaining)))
+
+        output = run_lean_command(module_name, f"#print axioms {decl}", timeout=timeout)
         if output is None:
+            errors.append(f"`#print axioms {decl}` failed (lean invocation error or timeout).")
             continue
 
         # Lean 4 `#print axioms Foo.bar` emits one of:
@@ -91,15 +170,16 @@ def extract_axioms(module_name: str, declarations: List[str]) -> Dict[str, List[
 
         match = re.search(r'depends on axioms:\s*\[(.*?)\]', output, re.DOTALL)
         if not match:
-            # No recognizable axiom list (e.g. the declaration was not found,
-            # so the output is an error message) — skip rather than treating the
-            # message text as an axiom name.
+            # No recognizable axiom list (e.g. unknown constant) — record it
+            # rather than treating the message text as an axiom name.
+            first_line = output.splitlines()[0][:200] if output else "(empty output)"
+            errors.append(f"`#print axioms {decl}` gave no axiom list: {first_line}")
             continue
         axioms = [a.strip() for a in match.group(1).split(',') if a.strip()]
         if axioms:
             axiom_map[decl] = axioms
 
-    return axiom_map
+    return axiom_map, errors
 
 
 def extract_sorry_warnings(file_path: str) -> List[str]:
@@ -183,14 +263,26 @@ def extract_info_for_files(changed_files: List[str], time_budget: int = 300) -> 
             # Extract axiom dependencies with per-file time awareness
             remaining_budget = time_budget - (_time.monotonic() - start)
             if len(declarations) <= 50 and remaining_budget > 30:
-                axiom_map = extract_axioms(module_name, declarations)
+                axiom_map, axiom_errors = extract_axioms(
+                    module_name, declarations, deadline=start + time_budget
+                )
                 file_info["axiom_dependencies"] = axiom_map
+                if axiom_errors:
+                    # Bound per-file error spam: these end up in an LLM prompt.
+                    shown = axiom_errors[:5]
+                    if len(axiom_errors) > len(shown):
+                        shown.append(
+                            f"… and {len(axiom_errors) - len(shown)} more axiom-extraction "
+                            f"error(s) in {file_path}."
+                        )
+                    results["errors"].extend(shown)
 
                 STANDARD_AXIOMS = {'propext', 'Quot.sound', 'Classical.choice'}
                 for decl, axioms in axiom_map.items():
+                    # decl is already the namespace-qualified name.
                     non_standard = [a for a in axioms if a not in STANDARD_AXIOMS]
                     if non_standard:
-                        results["axiom_summary"][f"{module_name}.{decl}"] = non_standard
+                        results["axiom_summary"][decl] = non_standard
             elif len(declarations) > 50:
                 results["errors"].append(f"Skipped axiom extraction for {file_path}: too many declarations ({len(declarations)})")
             else:

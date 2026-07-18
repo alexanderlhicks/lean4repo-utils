@@ -58,6 +58,84 @@ noncomputable def myNonComp := Classical.choice ⟨0⟩
         assert "fake" not in decls
         assert "real" in decls
 
+    def test_namespace_block_qualifies_names(self, tmp_path):
+        lean_file = tmp_path / "Ns.lean"
+        lean_file.write_text(
+            "namespace Foo\n"
+            "def bar := 1\n"
+            "namespace Baz\n"
+            "theorem qux : True := trivial\n"
+            "end Baz\n"
+            "def after := 2\n"
+            "end Foo\n"
+            "def top := 3\n"
+        )
+        assert get_lean_declarations(str(lean_file)) == [
+            "Foo.bar", "Foo.Baz.qux", "Foo.after", "top",
+        ]
+
+    def test_dotted_namespace_closed_by_dotted_end(self, tmp_path):
+        lean_file = tmp_path / "Dotted.lean"
+        lean_file.write_text(
+            "namespace A.B\n"
+            "def x := 1\n"
+            "end A.B\n"
+            "def y := 2\n"
+        )
+        assert get_lean_declarations(str(lean_file)) == ["A.B.x", "y"]
+
+    def test_sections_and_mutual_do_not_qualify_but_consume_end(self, tmp_path):
+        lean_file = tmp_path / "Sec.lean"
+        lean_file.write_text(
+            "namespace Ns\n"
+            "noncomputable section\n"
+            "def a := 1\n"
+            "end\n"
+            "section Named\n"
+            "def b := 2\n"
+            "end Named\n"
+            "mutual\n"
+            "def c := 3\n"
+            "end\n"
+            "def d := 4\n"
+            "end Ns\n"
+        )
+        assert get_lean_declarations(str(lean_file)) == [
+            "Ns.a", "Ns.b", "Ns.c", "Ns.d",
+        ]
+
+    def test_inline_dotted_name_and_root_anchor(self, tmp_path):
+        lean_file = tmp_path / "Inline.lean"
+        lean_file.write_text(
+            "namespace Ns\n"
+            "def Sub.item := 1\n"
+            "theorem _root_.Nat.mine : True := trivial\n"
+            "end Ns\n"
+        )
+        assert get_lean_declarations(str(lean_file)) == ["Ns.Sub.item", "Nat.mine"]
+
+    def test_private_and_anonymous_instance_skipped(self, tmp_path):
+        lean_file = tmp_path / "Priv.lean"
+        lean_file.write_text(
+            "namespace Ns\n"
+            "private def hidden := 1\n"
+            "instance : Inhabited Nat := ⟨0⟩\n"
+            "instance named : Inhabited Int := ⟨0⟩\n"
+            "protected def visible := 2\n"
+            "end Ns\n"
+        )
+        assert get_lean_declarations(str(lean_file)) == ["Ns.named", "Ns.visible"]
+
+    def test_namespace_keyword_in_comment_or_string_ignored(self, tmp_path):
+        lean_file = tmp_path / "Fake.lean"
+        lean_file.write_text(
+            "-- namespace Fake\n"
+            '/- namespace AlsoFake -/\n'
+            'def s := "namespace StringFake"\n'
+            "def x := 1\n"
+        )
+        assert get_lean_declarations(str(lean_file)) == ["s", "x"]
+
 
 class TestGetModuleName:
     def test_with_src_prefix(self, tmp_path, monkeypatch):
@@ -110,49 +188,97 @@ class TestExtractSorryWarnings:
 
 
 class TestExtractAxioms:
-    """Parser tests for #print axioms output (run_lean_command is mocked)."""
+    """Parser tests for #print axioms output (run_lean_command is mocked).
+
+    Declarations are namespace-qualified names (FQNs); the module name is used
+    only for the import. Queries must use the FQN verbatim — never the
+    module-path-prefixed form, which #print axioms cannot resolve.
+    """
 
     def _patch_output(self, monkeypatch, output):
-        monkeypatch.setattr(lean_info_extractor, "run_lean_command", lambda mod, cmd: output)
+        calls = []
+
+        def fake(mod, cmd, timeout=30):
+            calls.append((mod, cmd, timeout))
+            return output
+
+        monkeypatch.setattr(lean_info_extractor, "run_lean_command", fake)
+        return calls
+
+    def test_query_uses_fqn_verbatim(self, monkeypatch):
+        calls = self._patch_output(
+            monkeypatch, "'Ns.bar' does not depend on any axioms"
+        )
+        # Module path (Crypto.Hash) differs from the namespace (Ns): the query
+        # must NOT be prefixed with the module path.
+        extract_axioms("Crypto.Hash", ["Ns.bar"])
+        assert calls == [("Crypto.Hash", "#print axioms Ns.bar", 30)]
 
     def test_standard_axioms_only(self, monkeypatch):
         self._patch_output(
             monkeypatch,
             "'Foo.bar' depends on axioms: [propext, Classical.choice, Quot.sound]",
         )
-        result = extract_axioms("Foo", ["bar"])
+        result, errors = extract_axioms("Foo", ["Foo.bar"])
         # The three standard axioms must be parsed as separate names so the
         # downstream non-standard filter sees nothing flagworthy.
-        assert result == {"bar": ["propext", "Classical.choice", "Quot.sound"]}
+        assert result == {"Foo.bar": ["propext", "Classical.choice", "Quot.sound"]}
+        assert errors == []
 
     def test_non_standard_axiom_detected(self, monkeypatch):
         self._patch_output(
             monkeypatch,
             "'Foo.bar' depends on axioms: [propext, sorryAx, Lean.ofReduceBool]",
         )
-        result = extract_axioms("Foo", ["bar"])
-        assert result == {"bar": ["propext", "sorryAx", "Lean.ofReduceBool"]}
+        result, errors = extract_axioms("Foo", ["Foo.bar"])
+        assert result == {"Foo.bar": ["propext", "sorryAx", "Lean.ofReduceBool"]}
+        assert errors == []
 
     def test_no_axioms(self, monkeypatch):
         self._patch_output(monkeypatch, "'Foo.bar' does not depend on any axioms")
-        assert extract_axioms("Foo", ["bar"]) == {"bar": []}
+        assert extract_axioms("Foo", ["Foo.bar"]) == ({"Foo.bar": []}, [])
 
     def test_wrapped_list_across_lines(self, monkeypatch):
         self._patch_output(
             monkeypatch,
             "'Foo.bar' depends on axioms: [propext,\n  Classical.choice,\n  Quot.sound]",
         )
-        result = extract_axioms("Foo", ["bar"])
-        assert result == {"bar": ["propext", "Classical.choice", "Quot.sound"]}
+        result, _ = extract_axioms("Foo", ["Foo.bar"])
+        assert result == {"Foo.bar": ["propext", "Classical.choice", "Quot.sound"]}
 
-    def test_unrecognized_output_skipped(self, monkeypatch):
-        # e.g. declaration not found — the error text must not become an axiom.
+    def test_unrecognized_output_recorded_as_error(self, monkeypatch):
+        # e.g. declaration not found — the error text must not become an axiom,
+        # and the failure must be visible, not silently dropped.
         self._patch_output(monkeypatch, "unknown identifier 'Foo.bar'")
-        assert extract_axioms("Foo", ["bar"]) == {}
+        result, errors = extract_axioms("Foo", ["Foo.bar"])
+        assert result == {}
+        assert len(errors) == 1
+        assert "Foo.bar" in errors[0] and "unknown identifier" in errors[0]
 
-    def test_none_output_skipped(self, monkeypatch):
+    def test_none_output_recorded_as_error(self, monkeypatch):
         self._patch_output(monkeypatch, None)
-        assert extract_axioms("Foo", ["bar"]) == {}
+        result, errors = extract_axioms("Foo", ["Foo.bar"])
+        assert result == {}
+        assert len(errors) == 1
+        assert "failed" in errors[0]
+
+    def test_deadline_exhaustion_truncates_with_error(self, monkeypatch):
+        self._patch_output(monkeypatch, "'X' does not depend on any axioms")
+        # Deadline already passed: nothing may run, truncation must be recorded.
+        result, errors = extract_axioms(
+            "Foo", ["Foo.a", "Foo.b"], deadline=lean_info_extractor._time.monotonic() - 1
+        )
+        assert result == {}
+        assert len(errors) == 1
+        assert "budget exhausted" in errors[0] and "2 remaining" in errors[0]
+
+    def test_deadline_caps_per_call_timeout(self, monkeypatch):
+        calls = self._patch_output(monkeypatch, "'Foo.a' does not depend on any axioms")
+        extract_axioms(
+            "Foo", ["Foo.a"], deadline=lean_info_extractor._time.monotonic() + 5
+        )
+        assert len(calls) == 1
+        assert calls[0][2] <= 5  # per-subprocess timeout sized to remaining budget
 
 
 class TestFormatForReview:
@@ -237,6 +363,50 @@ class TestExtractInfoForFiles:
         result = extract_info_for_files([str(lean_file)], time_budget=0)
         assert len(result["errors"]) > 0
         assert "Time budget" in result["errors"][0]
+
+    def test_axiom_summary_keyed_by_fqn(self, tmp_path, monkeypatch):
+        """End-to-end: namespace decl → FQN query → FQN-keyed axiom summary."""
+        lean_file = tmp_path / "Foo.lean"
+        lean_file.write_text(
+            "namespace Ns\ntheorem thm : True := trivial\nend Ns\n"
+        )
+        queries = []
+
+        def fake(mod, cmd, timeout=30):
+            queries.append(cmd)
+            return "'Ns.thm' depends on axioms: [myCustomAxiom]"
+
+        monkeypatch.setattr(lean_info_extractor, "run_lean_command", fake)
+        monkeypatch.setattr(
+            lean_info_extractor, "get_module_name", lambda fp: "Some.Module"
+        )
+        monkeypatch.setattr(
+            lean_info_extractor, "extract_diagnostics", lambda fp, timeout=60: []
+        )
+        result = extract_info_for_files([str(lean_file)], time_budget=300)
+        assert queries == ["#print axioms Ns.thm"]
+        assert result["axiom_summary"] == {"Ns.thm": ["myCustomAxiom"]}
+
+    def test_axiom_errors_surfaced_and_bounded(self, tmp_path, monkeypatch):
+        """Per-declaration extraction failures reach results['errors'], capped."""
+        decls = "\n".join(f"def d{i} := 1" for i in range(10))
+        lean_file = tmp_path / "Foo.lean"
+        lean_file.write_text(decls + "\n")
+        monkeypatch.setattr(
+            lean_info_extractor,
+            "run_lean_command",
+            lambda mod, cmd, timeout=30: "unknown constant",
+        )
+        monkeypatch.setattr(
+            lean_info_extractor, "get_module_name", lambda fp: "Some.Module"
+        )
+        monkeypatch.setattr(
+            lean_info_extractor, "extract_diagnostics", lambda fp, timeout=60: []
+        )
+        result = extract_info_for_files([str(lean_file)], time_budget=300)
+        # 10 failures → 5 shown + 1 "and N more" marker, not silence, not spam.
+        assert len(result["errors"]) == 6
+        assert "and 5 more" in result["errors"][-1]
 
 
 class TestExtractLightInfo:
