@@ -151,7 +151,14 @@ def _safe_md_path(s: str) -> str:
 def _summary_skipped_marker() -> str:
     if not run_health.skipped_files:
         return ""
-    files = ", ".join(f"`{_safe_md_path(fp)}`" for fp in run_health.skipped_files)
+    # Bounded: this marker is prepended to the posted comment, so an unbounded
+    # file list could by itself blow the size limit exactly when the loud signal
+    # matters most (U5). List a preview and count the rest.
+    skipped = list(run_health.skipped_files)
+    preview = skipped[:12]
+    files = ", ".join(f"`{_safe_md_path(fp)}`" for fp in preview)
+    if len(skipped) > len(preview):
+        files += f", …(+{len(skipped) - len(preview)} more)"
     return f"\n> **Skipped (per-run budget):** {files}\n"
 
 
@@ -162,6 +169,8 @@ class TokenTracker:
         self.total_input = 0
         self.total_output = 0
         self.total_thinking = 0
+        self.total_cost = 0.0
+        self.cost_reliable = True  # cleared once any call reports cost_missing/byok
         self.call_count = 0
 
     def record(self, usage: TokenUsage):
@@ -170,6 +179,9 @@ class TokenTracker:
             self.total_input += usage.input_tokens
             self.total_output += usage.output_tokens
             self.total_thinking += usage.thinking_tokens
+            self.total_cost += usage.cost
+            if usage.cost_missing or usage.byok:
+                self.cost_reliable = False
 
     def summary(self) -> str:
         with self._lock:
@@ -178,6 +190,12 @@ class TokenTracker:
             if self.total_thinking > 0:
                 parts.append(f" + {self.total_thinking:,} thinking")
             parts.append(f" = {total:,} total across {self.call_count} API calls")
+            # Accumulated cost (C7); flagged as a lower bound when any call had
+            # no/BYOK cost so the number isn't mistaken for exact.
+            if self.cost_reliable:
+                parts.append(f"; cost ${self.total_cost:.6f}")
+            else:
+                parts.append(f"; cost ${self.total_cost:.6f}+ (partial — some calls reported no/BYOK cost)")
             return "".join(parts)
 
 token_tracker = TokenTracker()
@@ -350,9 +368,15 @@ def _file_cache_key(sent_diff, decl_context):
 
 def summarize_file_diff(file_path, file_diff, model_name, prompt_template, decl_context=""):
     """Generates a summary for a single file's diff (Map step)."""
+    # The diff is fork-controlled and sits inside a ```diff fence in the template;
+    # a context line containing a 3+ backtick run would otherwise close that fence
+    # and let the following text escape its data slot (S3). Collapse such runs —
+    # the same neutralization PR_BODY already gets. The cache key is computed by
+    # the caller on the pre-collapse diff; collapse is deterministic, so identical
+    # diffs still map to identical prompts (cache stays correct).
     prompt = _fill_template(prompt_template, {
-        "FILE_PATH": file_path,
-        "FILE_DIFF": file_diff,
+        "FILE_PATH": _safe_inline_code(file_path),
+        "FILE_DIFF": _collapse_fence_backticks(file_diff),
         "DECL_CONTEXT_SECTION": _format_decl_context_section(decl_context),
     })
     return _call_prose(prompt, model_name)
@@ -1108,13 +1132,14 @@ class DiffAnalyzer:
 
     def _check_quality_signals(self, line):
         content = line[1:]  # Strip the '+' prefix
-        # Block comments already filtered by _process_line; check inline -- comments
-        comment_match = re.search(r'(?:^|\s)--', content)
+        # String- and inline-comment-aware (U6): scan only the scrubbed *code*, so
+        # a keyword inside a string literal (`"... native_decide ..."`) or after a
+        # `--` comment is not counted. State is per-line — a keyword inside a
+        # multi-line string is an accepted, rare false positive; whole-line block
+        # comments are already filtered by _process_line via the source index.
+        code, _, _ = scrub_line(content, 0, False)
         for pattern, name, message in self._QUALITY_SIGNALS:
-            match = pattern.search(content)
-            if match:
-                if comment_match and match.start() > comment_match.start():
-                    continue
+            if pattern.search(code):
                 self.warnings.append({
                     'signal': name,
                     'message': message,
@@ -1151,13 +1176,13 @@ class DiffAnalyzer:
         # identifiers that merely contain the substring (e.g. `sorryAx`,
         # `my_sorry_lemma`) don't register as proof obligations. This keeps
         # detection consistent with _PROOF_RELEVANT_PATTERNS used in triage.
-        sorry_match = _SORRY_RE.search(content)
+        # String- and inline-comment-aware (U6): scan the scrubbed code, so a
+        # `sorry` inside a string literal (`IO.println "...use sorry..."`) or an
+        # inline `--` comment does not register a false `sorry-added`. Per-line
+        # state; multi-line-string false positives are an accepted, rare edge.
+        code_only, _, _ = scrub_line(content, 0, False)
+        sorry_match = _SORRY_RE.search(code_only)
         if sorry_match and self._current_decl_name:
-            # Inline comment guard: -- must be at line start or preceded by whitespace
-            comment_match = re.search(r'(?:^|\s)--', content)
-            if comment_match and sorry_match.start() > comment_match.start():
-                return
-
             stable_id = f"{self._current_decl_name}@{self._current_file}"
             # Unique key for each sorry instance to avoid overwriting
             line_num = self._new_line_num if line.startswith('+') else self._old_line_num
@@ -1228,9 +1253,14 @@ class DiffAnalyzer:
                 self.removed_sorries.append({'file': info['file'], 'header': info['header'], 'line': info['line']})
 
 # --- Caching ---
-def _compute_config_fingerprint(model_name, prompt_template):
-    """Hash the model name and prompt template so cache invalidates when either changes."""
-    content = f"{model_name}\n{prompt_template}"
+def _compute_config_fingerprint(model_name, prompt_template, reasoning_effort=""):
+    """Hash the model name, prompt template, and reasoning effort so the cache
+    invalidates when any changes. Reasoning effort alters the model's output for
+    an identical prompt, so it must be part of the config fingerprint (U6) —
+    otherwise switching effort silently reuses summaries generated at the old
+    effort."""
+    effort = (reasoning_effort or "").strip().lower()
+    content = f"{model_name}\n{prompt_template}\n{effort}"
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
@@ -1570,7 +1600,7 @@ def _format_coverage_section(partially_analyzed_files, instructions_skipped, ins
     return res
 
 
-def format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, issues, display_summaries, instructions_report, cache, warnings=None, title_note="", upstream_note="", partially_analyzed_files=None, instructions_skipped=False, authenticator=None, comment_author="", instructions_untrusted_note=""):
+def format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, issues, display_summaries, instructions_report, cache, warnings=None, title_note="", upstream_note="", partially_analyzed_files=None, instructions_skipped=False, authenticator=None, comment_author="", instructions_untrusted_note="", reserved=0):
     """Formats the final summary comment in Markdown.
 
     `authenticator`/`comment_author` are required when `cache` is set: the
@@ -1580,7 +1610,13 @@ def format_summary(ai_summary, stats, added, removed, affected, added_decls, rem
     order of importance: first the embedded cache (regenerable — its loss just
     causes a full re-summarize next run), then the per-file summaries, then the
     additional-analysis section, and only as a last resort hard-truncate. The
-    core summary, statistics, and `sorry` tracking are always preserved."""
+    core summary, statistics, and `sorry` tracking are always preserved.
+
+    `reserved` is char headroom the caller will prepend AFTER this returns (the
+    loud banner + budget skip-marker on a degraded run, U5); the effective size
+    budget is lowered by it so the final posted body — prefix included — never
+    exceeds MAX_COMMENT_CHARS."""
+    budget = MAX_COMMENT_CHARS - max(0, reserved)
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H-%M-%S")
     comment_id = COMMENT_IDENTIFIER.replace("{{timestamp}}", timestamp)
     cache_html = f"{CACHE_IDENTIFIER}{cache.to_embedded(authenticator, comment_author)}-->\n\n" if cache else ""
@@ -1623,7 +1659,7 @@ def format_summary(ai_summary, stats, added, removed, affected, added_decls, rem
         return "".join(parts)
 
     candidate = assemble(True, True, True)
-    if len(candidate) <= MAX_COMMENT_CHARS:
+    if len(candidate) <= budget:
         return candidate
 
     omit_note = "> ℹ️ Some sections were omitted to fit GitHub's comment size limit.\n\n"
@@ -1631,12 +1667,12 @@ def format_summary(ai_summary, stats, added, removed, affected, added_decls, rem
     for include_per_file, include_instructions in ((True, True), (False, True), (False, False)):
         note = omit_note if not (include_per_file and include_instructions) else ""
         candidate = assemble(False, include_per_file, include_instructions, note)
-        if len(candidate) <= MAX_COMMENT_CHARS:
+        if len(candidate) <= budget:
             return candidate
 
     # Last resort: hard-truncate the (cache-free, sections-dropped) body.
     trunc_note = "\n\n> ⚠️ Summary truncated to fit GitHub's comment size limit."
-    return candidate[:MAX_COMMENT_CHARS - len(trunc_note)].rstrip() + trunc_note
+    return candidate[:max(0, budget - len(trunc_note))].rstrip() + trunc_note
 
 def find_sorry_issues(repo: Repository):
     """Finds all open issues with the 'proof wanted' label."""
@@ -1711,7 +1747,9 @@ def apply_deterministic_labels(repo, pr, desired):
 # --- PR Title Validation ---
 _CONVENTIONAL_COMMIT_RE = re.compile(
     r'^(?P<type>feat|fix|doc|docs|style|refactor|chore|ci|test|perf|build|revert)'
-    r'(?:\((?P<scope>[^)]+)\))?:\s+(?P<subject>.+)$'
+    r'(?:\((?P<scope>[^)]+)\))?'
+    r'(?P<breaking>!)?'  # optional breaking-change marker: `feat!:` / `feat(scope)!:`
+    r':\s+(?P<subject>.+)$'
 )
 
 def validate_pr_title(title):
@@ -1941,7 +1979,7 @@ def main():
     instructions_skipped = False
 
     summarize_template = _read_prompt_template("summarize_file.md")
-    config_fp = _compute_config_fingerprint(model_name, summarize_template)
+    config_fp = _compute_config_fingerprint(model_name, summarize_template, reasoning_effort)
     # S5: authenticate the comment/cache with a MAC keyed on the (stable)
     # OpenRouter key and bound to this repo#PR — see CommentAuthenticator.
     authenticator = CommentAuthenticator(
@@ -2080,6 +2118,13 @@ def main():
         """Build the comment body for a given carrying-comment author. The
         cache (with its author-bound MAC) is embedded only when an author is
         known — pass author=None for a cache-less first-create body."""
+        # Compute the degraded-run prefix FIRST so format_summary can reserve its
+        # length: the banner + skip-marker are prepended below and must count
+        # against the size limit, or a near-limit degraded run 422s on post
+        # exactly when the loud signal matters (U5).
+        prefix = ""
+        if run_health.degraded:
+            prefix = _LOUD_BANNER + "\n" + _summary_skipped_marker() + "\n\n"
         body = format_summary(
             ai_summary,
             analyzer.stats,
@@ -2101,12 +2146,18 @@ def main():
             authenticator=authenticator,
             comment_author=comment_author or "",
             instructions_untrusted_note=instructions_untrusted_note,
+            reserved=len(prefix),
         )
         # Loud-on-failure: prepend the fixed banner + budget skip-marker when the
         # run degraded. summary.py's stdout is NOT the comment channel (it posts
         # via the API), so the ::error:: annotation below lands in the checks UI.
-        if run_health.degraded:
-            body = _LOUD_BANNER + "\n" + _summary_skipped_marker() + "\n\n" + body
+        body = prefix + body
+        # Belt-and-braces: no path may exceed GitHub's hard limit. format_summary
+        # reserved the prefix length, but guard the total unconditionally so a
+        # miscount can never turn into a 422 on post.
+        if len(body) > MAX_COMMENT_CHARS:
+            trunc_note = "\n\n> ⚠️ Summary truncated to fit GitHub's comment size limit."
+            body = body[:max(0, MAX_COMMENT_CHARS - len(trunc_note))].rstrip() + trunc_note
         return body
 
     if run_health.degraded:
