@@ -14,8 +14,9 @@ inputs:
     description: 'The Pull Request number'
     required: true
   model:
-    description: 'OpenRouter model slug (e.g., anthropic/claude-opus-4.8, google/gemini-3-pro-preview, openai/gpt-5)'
-    required: true
+    description: 'OpenRouter model slug (e.g., anthropic/claude-opus-4.8, google/gemini-3-pro-preview, openai/gpt-5). Defaults to the open-weight deepseek/deepseek-v4-flash (1M context, flash-tier pricing).'
+    required: false
+    default: 'deepseek/deepseek-v4-flash'
   lean_keywords:
     description: 'Comma-separated list of Lean keywords (e.g., theorem, def) to track for declaration changes and sorries'
     required: false
@@ -30,6 +31,15 @@ inputs:
     default: ''
   validate_title:
     description: 'Validate PR title against conventional commit format: type[(scope)]: subject (scope is optional)'
+    required: false
+    default: 'false'
+  apply_labels:
+    description: >-
+      When "true", reconcile deterministic PR labels from the diff signals:
+      `sorry-added`, `native_decide`, `axiom-added`. The action manages ONLY
+      these labels (adding those that apply, removing the rest) and never
+      touches others; missing labels are created. Requires the token to have
+      `pull-requests: write` (or `issues: write`). Default "false".
     required: false
     default: 'false'
   upstream_path:
@@ -55,6 +65,17 @@ inputs:
       a smaller-context model.
     required: false
     default: '400000'
+  max_summary_files:
+    description: >-
+      Hard ceiling on the number of files individually summarized by the LLM in
+      one run (U4). 0 (default) = unlimited (quality>cost). When set, proof-signal
+      files (sorry/admit/native_decide) are summarized first, then other
+      high-priority files up to this count; the rest are listed as "not
+      individually summarized" (still fully covered by deterministic
+      sorry/declaration/label tracking). Bounds worst-case LLM calls on a very
+      large PR.
+    required: false
+    default: '0'
   llm_max_run_tokens:
     description: 'Per-run token ceiling (C3). Once exceeded, no further LLM calls are made and the summary degrades gracefully (partial results + a loud banner) instead of consuming unbounded spend on a shared key. Empty = disabled. The token ceiling is authoritative; source from workflow/secrets config, NEVER from PR content.'
     required: false
@@ -83,9 +104,12 @@ runs:
         allow-unsafe-pr-checkout: true
 
     - name: Mask secrets
+      env:
+        API_KEY: ${{ inputs.api_key }}
+        GH_TOKEN_TO_MASK: ${{ inputs.github_token }}
       run: |
-        echo "::add-mask::${{ inputs.api_key }}"
-        echo "::add-mask::${{ inputs.github_token }}"
+        echo "::add-mask::$API_KEY"
+        echo "::add-mask::$GH_TOKEN_TO_MASK"
       shell: bash
 
     - name: Install uv
@@ -98,15 +122,27 @@ runs:
       shell: bash
 
     - name: Generate diff
+      env:
+        # Keep event metadata out of the shell source. The values are still
+        # passed to git as quoted arguments, but branch/sha names must never be
+        # interpolated directly into a `run:` script.
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
       run: |
         # Under pull_request_target the checkout is the PR (possibly fork) head;
         # the base commit is often not in the local object graph, which makes
         # `git merge-base` fail. Fetch it from origin (the base repo) first,
         # falling back to the base branch ref.
-        BASE_SHA="${{ github.event.pull_request.base.sha }}"
-        git fetch --no-tags origin "$BASE_SHA" \
-          || git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
-        MERGE_BASE=$(git merge-base "$BASE_SHA" HEAD)
+        merge_base_ref="$BASE_SHA"
+        if ! git fetch --no-tags origin "$BASE_SHA"; then
+          # A runner may be unable to fetch the event SHA directly. Fetch the
+          # base branch through an explicit refs/ path (so a branch name cannot
+          # become a git option) and use FETCH_HEAD as the documented fallback.
+          git fetch --no-tags origin "refs/heads/$BASE_REF"
+          merge_base_ref=FETCH_HEAD
+          echo "::warning::Base SHA was unavailable; diffing against the fetched base branch tip."
+        fi
+        MERGE_BASE=$(git merge-base "$merge_base_ref" HEAD)
         echo "MERGE_BASE=$MERGE_BASE" >> "$GITHUB_ENV"
         git diff "$MERGE_BASE" HEAD > pr.diff
       shell: bash
@@ -121,10 +157,19 @@ runs:
         INPUT_LEAN_KEYWORDS: ${{ inputs.lean_keywords }}
         INPUT_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
         INPUT_ADDITIONAL_INSTRUCTIONS_PATH: ${{ inputs.additional_instructions_path }}
+        # Trusted ref for the additional-instructions file (S4). base.sha is the
+        # base-branch head at event time — writable only by maintainers, unlike
+        # the checked-out PR head. Its objects are fetched by the "Generate
+        # diff" step above; summary.py fails CLOSED (skips instructions, warns)
+        # if the ref is empty or unresolvable, and never reads the instructions
+        # file from the PR checkout in PR context.
+        INSTRUCTIONS_BASE_REF: ${{ github.event.pull_request.base.sha }}
         INPUT_VALIDATE_TITLE: ${{ inputs.validate_title }}
+        INPUT_APPLY_LABELS: ${{ inputs.apply_labels }}
         INPUT_UPSTREAM_PATH: ${{ inputs.upstream_path }}
         INPUT_MAX_FILE_DIFF_CHARS: ${{ inputs.max_file_diff_chars }}
         INPUT_MAX_INSTRUCTIONS_DIFF_CHARS: ${{ inputs.max_instructions_diff_chars }}
+        INPUT_MAX_SUMMARY_FILES: ${{ inputs.max_summary_files }}
         # MERGE_BASE is set in the preceding "Generate diff" step via
         # `echo "MERGE_BASE=..." >> "$GITHUB_ENV"`. Re-declaring it here
         # makes the dependency explicit (the CI env-var consistency check

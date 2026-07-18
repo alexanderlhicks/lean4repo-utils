@@ -5,6 +5,7 @@ import sys
 import os
 import json
 import contextlib
+import subprocess
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -65,6 +66,39 @@ diff --git a/Bar.lean b/Bar.lean
 
     def test_empty_diff(self):
         assert split_diff_into_files("") == {}
+
+    def test_quoted_unicode_path(self):
+        # git's default core.quotePath=true C-quotes non-ASCII paths. Missing
+        # them is not just a display bug: the file escapes review AND the
+        # coverage check, so an added `sorry` could ride under "Approved".
+        diff = "\n".join([
+            'diff --git "a/M\\303\\266bius.lean" "b/M\\303\\266bius.lean"',
+            "new file mode 100644",
+            '--- /dev/null',
+            '+++ "b/M\\303\\266bius.lean"',
+            "@@ -0,0 +1,2 @@",
+            "+theorem m : True := by",
+            "+  sorry",
+        ]) + "\n"
+        result = split_diff_into_files(diff)
+        assert "Möbius.lean" in result
+        assert "+  sorry" in result["Möbius.lean"]
+
+    def test_quoted_rename_target(self):
+        diff = "\n".join([
+            'diff --git a/Old.lean "b/M\\303\\266bius.lean"',
+            "similarity index 90%",
+            "rename from Old.lean",
+            'rename to "M\\303\\266bius.lean"',
+            '--- a/Old.lean',
+            '+++ "b/M\\303\\266bius.lean"',
+            "@@ -1 +1 @@",
+            "-old content",
+            "+new content",
+        ]) + "\n"
+        result = split_diff_into_files(diff)
+        assert "Möbius.lean" in result
+        assert "Old.lean" not in result
 
     def test_rename(self):
         diff = """diff --git a/Old.lean b/New.lean
@@ -209,6 +243,27 @@ class TestMechanicalPrechecks:
         # sorry in a line comment should not be flagged as introduced
         assert "**`sorry`** introduced" not in result
 
+    def test_sorry_in_multiline_string_is_ignored(self, tmp_path):
+        lean_file = tmp_path / "String.lean"
+        lean_file.write_text('def message := "first line\nsecond line contains sorry"\n')
+        diff = "@@ -1,2 +1,2 @@\n def message := \"first line\n+second line contains sorry\"\n"
+        scan = scan_escape_hatches({str(lean_file): diff})
+        assert scan["introduced"] == []
+        assert scan["preexisting"] == []
+
+    def test_no_newline_marker_does_not_misclassify_later_hatch(self, tmp_path):
+        lean_file = tmp_path / "Later.lean"
+        lean_file.write_text("theorem old : True := sorry\ntheorem later : True := sorry\n")
+        diff = """@@ -1 +1 @@
+ theorem old : True := sorry
+\\ No newline at end of file
+@@ -2 +2 @@
++theorem later : True := sorry
+"""
+        scan = scan_escape_hatches({str(lean_file): diff})
+        assert scan["preexisting"] == [(str(lean_file), "sorry", 1, "theorem old : True := sorry")]
+        assert scan["introduced"] == [(str(lean_file), "sorry", "theorem later : True := sorry")]
+
     def test_hatch_in_block_comment_not_flagged(self, tmp_path):
         """Regression: a keyword inside a `/- -/` block comment whose opener is
         an unchanged *context* line must NOT be treated as introduced live code
@@ -284,6 +339,16 @@ class TestMechanicalPrechecks:
         assert len(scan["introduced"]) == 1
         # Allow-listed hatch is still reported but does not trigger the verdict.
         assert introduced_hatches_triggering_verdict(scan) == []
+
+    def test_precheck_paths_and_snippets_cannot_break_markdown(self):
+        rendered = review.format_prechecks({
+            "introduced": [("evil`\npath.lean", "sorry", "line `\n injected")],
+            "preexisting": [],
+            "large_files": [],
+        })
+        assert "evil`" not in rendered
+        assert "evil path.lean" in rendered
+        assert "injected" in rendered
 
 
 class TestDnsPinning:
@@ -367,6 +432,15 @@ class TestGetDiffLines:
         assert 2 in lines
         # Only 2 lines in new file, no line 3
 
+    def test_no_newline_marker_does_not_shift_later_hunk(self):
+        diff = """@@ -1 +1 @@
++first
+\\ No newline at end of file
+@@ -10 +10 @@
++second
+"""
+        assert _get_diff_lines(diff) == {1, 10}
+
 
 # --- _load_prompt ---
 
@@ -384,6 +458,23 @@ class TestLoadPrompt:
             review.ACTION_PATH = str(tmp_path)
             result = _load_prompt("test_prompt.md", {"NAME": "Alice", "ROLE": "reviewer"})
             assert result == "Hello Alice, your role is reviewer."
+        finally:
+            review.ACTION_PATH = original_path
+
+    def test_replacement_values_are_not_rescanned_as_placeholders(self, tmp_path):
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "test_prompt.md").write_text("Diff: {{FILE_DIFF}}\nRules: {{VERDICT_RULES}}")
+
+        import review
+        original_path = review.ACTION_PATH
+        try:
+            review.ACTION_PATH = str(tmp_path)
+            result = _load_prompt(
+                "test_prompt.md",
+                {"FILE_DIFF": "literal {{VERDICT_RULES}}", "VERDICT_RULES": "trusted rules"},
+            )
+            assert result == "Diff: literal {{VERDICT_RULES}}\nRules: trusted rules"
         finally:
             review.ACTION_PATH = original_path
 
@@ -803,6 +894,39 @@ class TestMainFlow:
         output = capsys.readouterr().out
         assert "No Lean files were changed in this PR." in output
 
+    def test_planted_artifacts_deleted_even_on_no_lean_files_early_exit(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        # Threat model: the Lean build step runs PR-controlled lakefile code in
+        # this workspace BEFORE review.py; it can plant review_annotations.json
+        # (posted verbatim by Post Review) or review_health.json. The clean-
+        # slate deletion must run before EVERY exit that still lets Post Review
+        # run — including the exit-0 "No Lean files changed" path, which a PR
+        # touching only the lakefile triggers deliberately.
+        import review
+
+        monkeypatch.setattr(review, "get_pr_diff", lambda pr_number: ("diff --git a/README.md b/README.md\n", []))
+        monkeypatch.setattr(sys, "argv", ["review.py", "--pr-number", "123"])
+
+        planted = [
+            tmp_path / "review_annotations.json",
+            tmp_path / "review_comments.json",
+            tmp_path / review.REVIEW_HEALTH_FILE,
+        ]
+        for p in planted:
+            p.write_text('[{"path": "attacker", "body": "planted"}]')
+
+        cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            review.main()
+        finally:
+            os.chdir(cwd)
+
+        assert "No Lean files were changed in this PR." in capsys.readouterr().out
+        for p in planted:
+            assert not p.exists(), f"planted {p.name} survived the early exit"
+
 
 # --- _build_line_annotations ---
 
@@ -825,7 +949,17 @@ class TestBuildLineAnnotations:
 
     def _finding(self, location):
         from review import Finding
-        return Finding(description="d", location=location, suggested_fix="")
+        return Finding(
+            description="d",
+            location=location,
+            evidence="The changed declaration violates the downstream contract.",
+            evidence_source="lean_source",
+            evidence_locator="Foo.lean:6",
+            evidence_medium="lean",
+            confidence="high",
+            severity="high",
+            suggested_fix="",
+        )
 
     def test_in_diff_line_annotated(self):
         review = self._review(critical_misformalizations=[self._finding("Foo.lean:6")])
@@ -834,15 +968,25 @@ class TestBuildLineAnnotations:
         assert ann[0]["line"] == 6
         assert ann[0]["side"] == "RIGHT"
 
-    def test_nearby_line_snaps_into_diff(self):
-        # Line 9 is not in the diff, but 7 (=9-2) is within the ±5 window.
+    def test_nearby_line_is_not_misanchored(self):
+        # Line 9 is not in the diff. The finding remains in the main comment
+        # rather than being attached to unrelated line 7.
         review = self._review(lean_issues=[self._finding("Foo.lean:9")])
         ann = _build_line_annotations({"Foo.lean": review}, {"Foo.lean": self._DIFF})
-        assert len(ann) == 1
-        assert ann[0]["line"] == 7
+        assert ann == []
+
+    def test_other_file_location_is_not_attached_here(self):
+        review = self._review(lean_issues=[self._finding("Other.lean:6")])
+        ann = _build_line_annotations({"Foo.lean": review}, {"Foo.lean": self._DIFF})
+        assert ann == []
 
     def test_far_line_dropped(self):
         review = self._review(nitpicks=[self._finding("Foo.lean:100")])
+        ann = _build_line_annotations({"Foo.lean": review}, {"Foo.lean": self._DIFF})
+        assert ann == []
+
+    def test_advisory_nitpick_is_summary_only(self):
+        review = self._review(nitpicks=[self._finding("Foo.lean:6")])
         ann = _build_line_annotations({"Foo.lean": review}, {"Foo.lean": self._DIFF})
         assert ann == []
 
@@ -887,6 +1031,360 @@ class TestFindingRendering:
         assert "confidence: medium" in text
         assert "Evidence:" not in text
 
+    def test_finding_carries_actionability_metadata(self):
+        f = review.Finding(
+            description="relation is too weak",
+            category="contract",
+            severity="high",
+            how_to_confirm="Compare the changed relation with Definition 2.3.",
+            disconfirming_check="Search downstream use for the missing direction.",
+        )
+        rendered = "\n".join(_finding_lines(f))
+        assert "contract · high" in rendered
+        assert "How to confirm" in rendered
+        assert "Disconfirming check" in rendered
+
+    def test_provenance_is_rendered_and_docstring_is_explicit(self):
+        f = review.Finding(
+            description="The declaration does not match the paper.",
+            evidence="The paper requires an exact relation; the Lean signature omits one direction.",
+            evidence_source="paper_or_spec",
+            evidence_locator="Paper §3.2, Definition 4; Foo.lean:18",
+        )
+        rendered = "\n".join(_finding_lines(f))
+        assert "paper_or_spec" in rendered
+        assert "Paper §3.2" in rendered
+
+        doc = review.Finding(
+            description="Docstring says this is the completeness theorem.",
+            evidence="Foo.lean:10 docstring",
+            evidence_source="docstring_only",
+            evidence_locator="Foo.lean:10",
+        )
+        assert doc.evidence_source == "docstring_only"
+
+    def test_synthesis_findings_are_labeled_context_and_grounded_advisories_collapsed(self):
+        grounded = review.Finding(
+            description="The changed declaration omits a required hypothesis.",
+            evidence="The paper's Theorem 2 requires h : x ≠ 0.",
+            evidence_source="paper_or_spec",
+            evidence_locator="Paper §2, Theorem 2; Foo.lean:10",
+            evidence_medium="markdown",
+            confidence="high",
+            severity="high",
+        )
+        advisory = review.Finding(description="The documentation could be clearer.")
+        rendered = review._format_synthesis(
+            review.SynthesisSummary(
+                tldr="t",
+                precheck_summary="p",
+                critical_misformalizations=[grounded],
+                key_lean_issues=[advisory],
+                overall_verdict="Changes Requested",
+            ),
+            precheck_summary="exact p",
+        )
+        assert "Critical Misformalizations (synthesis context; not verdict basis)" in rendered
+        assert "Key Lean 4 / Mathlib Issues (advisory synthesis context)" in rendered
+        assert "deterministic verdict and basis above are authoritative" in rendered
+        assert "**Overall Verdict:**" not in rendered
+
+    def test_ungrounded_feedback_is_collapsible_and_not_an_inline_issue(self):
+        finding = review.Finding(
+            description="The declaration may not match its documentation.",
+            location="Foo.lean:10",
+            evidence="The docstring describes a stronger result.",
+            evidence_source="docstring_only",
+            evidence_locator="Foo.lean:8",
+            confidence="high",
+        )
+        rendered = review._format_file_review(
+            review.FileReview(
+                verdict="Changes Requested",
+                critical_misformalizations=[finding],
+            ),
+            "Foo.lean",
+        )
+        assert "**Critical Misformalizations:** None" in rendered
+        assert "<details><summary>💡 <b>Advisory feedback</b>" in rendered
+        assert finding.description in rendered
+        assert review._build_line_annotations(
+            {"Foo.lean": review.FileReview(verdict="Changes Requested", critical_misformalizations=[finding])},
+            {"Foo.lean": TestBuildLineAnnotations._DIFF},
+        ) == []
+
+
+class TestFindingHygiene:
+    _CLEAN_SCAN = {"introduced": [], "preexisting": [], "large_files": []}
+
+    def _review(self, **kwargs):
+        return review.FileReview(verdict="Changes Requested", **kwargs)
+
+    def test_successful_build_filters_bare_mechanical_claim(self):
+        finding = review.Finding(
+            description="This declaration will not typecheck.",
+            location="Foo.lean:12",
+            evidence="The expression appears to have the wrong type.",
+            category="build",
+        )
+        fr = self._review(lean_issues=[finding])
+        notes = review._filter_ungrounded_findings(
+            {"Foo.lean": fr}, None, self._CLEAN_SCAN, build_succeeded=True
+        )
+        assert fr.lean_issues == []
+        assert any("successful workflow build" in note for note in notes)
+
+    def test_compiler_evidence_preserves_build_claim(self):
+        finding = review.Finding(
+            description="The focused declaration does not typecheck.",
+            location="Foo.lean:12",
+            evidence="lake env lean Foo.lean emitted error: application type mismatch",
+            category="build",
+        )
+        fr = self._review(lean_issues=[finding])
+        notes = review._filter_ungrounded_findings(
+            {"Foo.lean": fr}, None, self._CLEAN_SCAN, build_succeeded=True
+        )
+        assert fr.lean_issues == [finding]
+        assert notes == []
+
+    def test_compiler_source_provenance_preserves_build_claim(self):
+        finding = review.Finding(
+            description="The focused declaration does not typecheck.",
+            location="Foo.lean:12",
+            evidence="The focused declaration has a type mismatch.",
+            evidence_source="compiler",
+            evidence_locator="focused `lake env lean` check at Foo.lean:12",
+            category="build",
+        )
+        fr = self._review(lean_issues=[finding])
+        notes = review._filter_ungrounded_findings(
+            {"Foo.lean": fr}, None, self._CLEAN_SCAN, build_succeeded=True
+        )
+        assert fr.lean_issues == [finding]
+        assert notes == []
+
+    def test_build_filter_does_not_misclassify_suggested_fix_text(self):
+        finding = review.Finding(
+            description="The changed relation omits the required symmetry law.",
+            evidence="Lean source Foo.lean:12 defines the relation without symmetry.",
+            evidence_source="lean_source",
+            evidence_locator="Foo.lean:12",
+            suggested_fix="Check that the replacement theorem still typechecks after adding the law.",
+        )
+        fr = self._review(lean_issues=[finding])
+        notes = review._filter_ungrounded_findings(
+            {"Foo.lean": fr}, None, self._CLEAN_SCAN, build_succeeded=True
+        )
+        assert fr.lean_issues == [finding]
+        assert notes == []
+
+    def test_preexisting_filter_does_not_trust_suggested_fix_dependency_language(self):
+        finding = review.Finding(
+            description="The pre-existing sorry makes this theorem incomplete.",
+            location="Foo.lean:20",
+            evidence="sorry at the theorem body",
+            suggested_fix="Update downstream callers after replacing the sorry.",
+        )
+        fr = self._review(lean_issues=[finding])
+        scan = {"introduced": [], "preexisting": [("Foo.lean", "sorry", 20, "sorry")], "large_files": []}
+        review._filter_ungrounded_findings({"Foo.lean": fr}, None, scan, False)
+        assert fr.lean_issues == []
+
+    def test_unrelated_preexisting_escape_hatch_is_not_pr_finding(self):
+        finding = review.Finding(
+            description="The pre-existing sorry makes this theorem incomplete.",
+            location="Foo.lean:20",
+            evidence="sorry at the theorem body",
+            category="trust",
+        )
+        fr = self._review(lean_issues=[finding])
+        scan = {"introduced": [], "preexisting": [("Foo.lean", "sorry", 20, "sorry")], "large_files": []}
+        notes = review._filter_ungrounded_findings({"Foo.lean": fr}, None, scan, False)
+        assert fr.lean_issues == []
+        assert any("pre-existing" in note for note in notes)
+
+    def test_changed_dependency_on_preexisting_escape_hatch_is_retained(self):
+        finding = review.Finding(
+            description="The changed theorem now depends on the pre-existing sorry through helperX.",
+            location="Foo.lean:20",
+            evidence="helperX calls the theorem containing sorry",
+            category="dependency",
+        )
+        fr = self._review(lean_issues=[finding])
+        scan = {"introduced": [], "preexisting": [("Foo.lean", "sorry", 20, "sorry")], "large_files": []}
+        review._filter_ungrounded_findings({"Foo.lean": fr}, None, scan, False)
+        assert fr.lean_issues == [finding]
+
+    def test_exact_duplicate_reports_collapse_across_channels(self):
+        critical = review.Finding(
+            description="A sorry was added here.", location="Foo.lean:20", category="trust",
+            evidence="sorry at Foo.lean:20", evidence_source="lean_source",
+            evidence_locator="Foo.lean:20",
+        )
+        duplicate = review.Finding(
+            description="A sorry was added here.", location="Foo.lean:20", category="trust",
+            evidence="sorry at Foo.lean:20", evidence_source="lean_source",
+            evidence_locator="Foo.lean:20",
+        )
+        fr = self._review(
+            critical_misformalizations=[critical],
+            nitpicks=[duplicate],
+        )
+        notes = review._filter_ungrounded_findings({"Foo.lean": fr}, None, self._CLEAN_SCAN, False)
+        assert len(fr.critical_misformalizations) == 1
+        assert fr.nitpicks == []
+        assert any("duplicate" in note for note in notes)
+
+    def test_docstring_only_substantive_finding_remains_visible_but_nonblocking(self):
+        finding = review.Finding(
+            description="The theorem is mathematically too weak according to its docstring.",
+            location="Foo.lean:20",
+            evidence="Docstring claims the exact completeness theorem.",
+            evidence_source="docstring_only",
+            evidence_locator="Foo.lean:18-20",
+        )
+        fr = self._review(critical_misformalizations=[finding])
+        notes = review._filter_ungrounded_findings(
+            {"Foo.lean": fr}, None, self._CLEAN_SCAN, False
+        )
+        assert fr.critical_misformalizations == [finding]
+        assert fr.nitpicks == []
+        assert finding.category == "correctness"
+        assert notes == []
+        assert not review._has_blocking_grounding(finding)
+
+    def test_paper_grounding_is_blocking_eligible(self):
+        finding = review.Finding(
+            description="Lean omits a hypothesis required by the paper.",
+            location="Foo.lean:20",
+            evidence="Paper §4, Theorem 7 requires h : x ≠ 0; the Lean statement has no such binder.",
+            evidence_source="paper_or_spec",
+            evidence_locator="Paper §4, Theorem 7; Foo.lean:20",
+            evidence_medium="markdown",
+            confidence="high",
+            severity="high",
+        )
+        assert review._has_blocking_grounding(finding)
+
+    def test_source_fidelity_grounding_is_blocking_eligible(self):
+        # source_fidelity is a substantive category: a grounded deviation from
+        # the CITED SOURCE of an admitted external must be able to block, even
+        # when the Lean statement faithfully mirrors the paper under review.
+        finding = review.Finding(
+            description="Lean drops the cited source's radius hypothesis.",
+            location="Foo.lean:20",
+            evidence="GCXK25 Thm 3 requires p < Δ_C; neither the Lean statement nor the paper's restatement carries it.",
+            evidence_source="paper_or_spec",
+            evidence_locator="GCXK25 Thm 3; Foo.lean:20",
+            evidence_medium="markdown",
+            confidence="high",
+            severity="high",
+            category="source_fidelity",
+        )
+        assert review._has_blocking_grounding(finding)
+
+    def test_grounding_requires_source_medium(self):
+        finding = review.Finding(
+            description="Lean omits a hypothesis required by the paper.",
+            evidence="The paper requires h : x ≠ 0.",
+            evidence_source="paper_or_spec",
+            evidence_locator="Section 4, Theorem 7",
+            confidence="high",
+            severity="high",
+        )
+        assert not review._has_blocking_grounding(finding)
+        finding.evidence_medium = "markdown"
+        assert review._has_blocking_grounding(finding)
+
+    def test_pdf_grounding_requires_visual_confirmation(self):
+        finding = review.Finding(
+            description="Lean omits a hypothesis required by the paper.",
+            evidence="Theorem 7 requires h : x ≠ 0.",
+            evidence_source="paper_or_spec",
+            evidence_locator="Section 4, Theorem 7; paper.pdf",
+            evidence_medium="pdf",
+            confidence="high",
+            severity="high",
+        )
+        assert review._is_pdf_evidence(finding)
+        assert not review._has_blocking_grounding(finding)
+        finding.confirmation_method = "visual"
+        assert review._has_blocking_grounding(finding)
+
+    def test_pdf_locator_is_detected_for_legacy_findings(self):
+        finding = review.Finding(
+            description="Lean omits a hypothesis required by the paper.",
+            evidence="Section 4, Theorem 7 requires h : x ≠ 0.",
+            evidence_source="paper_or_spec",
+            evidence_locator="Section 4, Theorem 7 in https://example.test/paper.pdf",
+            confidence="high",
+        )
+        assert review._is_pdf_evidence(finding)
+        assert not review._has_blocking_grounding(finding)
+
+    def test_verifier_uncertainty_does_not_suppress_grounded_finding(self):
+        finding = review.Finding(
+            description="Lean omits a hypothesis required by the paper.",
+            evidence="Paper §4, Theorem 7 requires h : x ≠ 0.",
+            evidence_source="paper_or_spec",
+            evidence_locator="Paper §4, Theorem 7; Foo.lean:20",
+            evidence_medium="markdown",
+            confidence="high",
+            severity="high",
+        )
+        assert review._has_blocking_grounding(finding, require_verification=True)
+        finding.verification_status = "confirmed"
+        assert review._has_blocking_grounding(finding, require_verification=True)
+
+    def test_provenance_requires_a_nonempty_locator_but_does_not_guess_its_validity(self):
+        finding = review.Finding(
+            description="Lean violates the contract.",
+            evidence="The declaration has the wrong shape.",
+            evidence_source="lean_source",
+            evidence_locator="the changed declaration",
+            evidence_medium="lean",
+            confidence="high",
+            severity="high",
+        )
+        assert review._has_blocking_grounding(finding)
+        finding.evidence_locator = ""
+        assert not review._has_blocking_grounding(finding)
+
+    def test_initial_model_cannot_self_certify_verification_status(self):
+        finding = review.Finding(
+            description="Grounded but not independently checked.",
+            evidence="The Lean declaration conflicts with its consumer.",
+            evidence_source="downstream_contract",
+            evidence_locator="A.lean:3 -> B.lean:8",
+            confirmation_method="visual",
+            verification_status="confirmed",
+        )
+        fr = self._review(lean_issues=[finding])
+        review._filter_ungrounded_findings({"A.lean": fr}, None, self._CLEAN_SCAN, False)
+        assert finding.confirmation_method == "unconfirmed"
+        assert finding.verification_status == "unverified"
+
+    def test_low_severity_grounding_is_advisory(self):
+        finding = review.Finding(
+            description="A low-impact contract concern is precisely located.",
+            evidence="The downstream consumer accepts the weaker behavior, but the preferred contract is stricter.",
+            evidence_source="downstream_contract",
+            evidence_locator="A.lean:3 -> B.lean:8",
+            confidence="high",
+            severity="low",
+        )
+        assert not review._has_blocking_grounding(finding)
+
+    def test_malformed_dependency_graph_is_ignored(self):
+        assert review.find_dependent_files(
+            '{"not": "a graph"}', {"Changed.lean"}, {}, 10
+        ) == {}
+        assert review.find_dependent_files(
+            '[{"name": "Consumer", "imports": "Changed"}]',
+            {"Changed.lean"}, {}, 10
+        ) == {}
+
 
 class TestLocalReferenceParts:
     def test_text_file_becomes_text_part(self, tmp_path):
@@ -904,6 +1402,53 @@ class TestLocalReferenceParts:
         parts, errors = get_local_reference_parts(str(p))
         assert len(parts) == 1
         assert parts[0].type == "pdf"
+
+    def test_pdf_http_failure_delegates_public_url_to_provider(self, monkeypatch):
+        import requests
+
+        def fail(url):
+            raise requests.HTTPError("403 Cloudflare challenge")
+
+        monkeypatch.setattr(review, "_fetch_url_content", fail)
+        parts, errors = review.get_document_content("https://eprint.iacr.org/2025/536.pdf")
+        assert len(parts) == 1
+        assert parts[0].type == "pdf"
+        assert parts[0].data == "https://eprint.iacr.org/2025/536.pdf"
+        assert errors and "delegated" in errors[0]
+
+    def test_pdf_url_with_query_is_classified_by_path(self, monkeypatch):
+        monkeypatch.setattr(
+            review,
+            "_fetch_url_content",
+            lambda url: (SimpleNamespace(
+                headers={},
+                content=b"%PDF-1.7",
+            ), "https://example.test/paper.pdf?download=1#page=2"),
+        )
+        parts, errors = review.get_document_content("https://example.test/paper.pdf?download=1")
+        assert errors == []
+        assert len(parts) == 1
+        assert parts[0].type == "pdf"
+
+    def test_pdf_validation_failure_is_not_delegated(self, monkeypatch):
+        monkeypatch.setattr(
+            review,
+            "_fetch_url_content",
+            lambda url: (_ for _ in ()).throw(ValueError("Blocked unsafe URL")),
+        )
+        parts, errors = review.get_document_content("https://example.test/paper.pdf")
+        assert parts == []
+        assert errors == ["Error processing document 'https://example.test/paper.pdf'."]
+
+    def test_normalization_failure_is_reported_not_raised(self, monkeypatch):
+        monkeypatch.setattr(
+            review,
+            "_normalize_external_url",
+            lambda url: (_ for _ in ()).throw(ValueError("invalid reference")),
+        )
+        parts, errors = review.get_document_content("not-a-url")
+        assert parts == []
+        assert errors == ["Error processing document 'not-a-url'."]
 
     def test_missing_path_reports_error(self):
         parts, errors = get_local_reference_parts("/no/such/spec.md")
@@ -1147,6 +1692,7 @@ class TestTriageRobustness:
         """run_triage budget-guards with ALL_DIFFS as the trimmable key so a huge
         PR degrades instead of failing to a per-file fallback."""
         monkeypatch.delenv("LAKE_GRAPH", raising=False)
+        monkeypatch.delenv("LAKE_GRAPH_PATH", raising=False)
         captured = {}
 
         def fake_fit(template_name, replacements, max_chars=review.MAX_PROMPT_CHARS,
@@ -1316,6 +1862,51 @@ class TestVerifyFindings:
         assert [f.description for f, _ in refuted] == ["bad hyp"]
         assert r.critical_misformalizations == []
         assert [f.description for f in r.lean_issues] == ["ok issue"]
+        assert r.lean_issues[0].verification_status == "confirmed"
+
+    def _provider_with_verdicts(self, verdict_map):
+        """Like _provider but the map values are full FindingVerdict objects."""
+        def gen(model, contents, schema, thinking_budget=None):
+            text = contents[-1].data
+            for desc, verdict in verdict_map.items():
+                if desc in text:
+                    return verdict, review.TokenUsage()
+            return review.FindingVerdict(verdict="uncertain", reasoning="?"), review.TokenUsage()
+        return SimpleNamespace(generate_structured=gen, name="fake")
+
+    def test_confirmed_correction_lowers_severity(self, monkeypatch):
+        monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
+        r = self._review(critical_misformalizations=[
+            review.Finding(description="real but over-escalated", severity="critical",
+                           confidence="high")])
+        v = review.FindingVerdict(verdict="confirmed", reasoning="defused out-of-band",
+                                  corrected_severity="low")
+        provider = self._provider_with_verdicts({"real but over-escalated": v})
+        review.verify_findings(provider, {"A.lean": r}, None, {"A.lean": "d"}, "", "m")
+        f = r.critical_misformalizations[0]
+        assert f.severity == "low"                       # kept, down-ranked
+        assert f.verification_status == "confirmed"
+
+    def test_correction_never_raises_severity(self, monkeypatch):
+        # A verifier must not be able to push a finding over the blocking bar.
+        monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
+        r = self._review(lean_issues=[
+            review.Finding(description="minor nit", severity="low")])
+        v = review.FindingVerdict(verdict="confirmed", reasoning="actually terrible",
+                                  corrected_severity="critical")
+        provider = self._provider_with_verdicts({"minor nit": v})
+        review.verify_findings(provider, {"A.lean": r}, None, {"A.lean": "d"}, "", "m")
+        assert r.lean_issues[0].severity == "low"
+
+    def test_correction_ignored_unless_confirmed(self, monkeypatch):
+        monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
+        r = self._review(lean_issues=[
+            review.Finding(description="unsettled", severity="high")])
+        v = review.FindingVerdict(verdict="uncertain", reasoning="cannot tell",
+                                  corrected_severity="low")
+        provider = self._provider_with_verdicts({"unsettled": v})
+        review.verify_findings(provider, {"A.lean": r}, None, {"A.lean": "d"}, "", "m")
+        assert r.lean_issues[0].severity == "high"       # untouched
 
     def test_verifier_error_keeps_finding(self, monkeypatch):
         monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
@@ -1369,6 +1960,73 @@ class TestVerifyFindings:
         assert refuted == []
         assert called["n"] == 0
 
+    def test_pdf_verifier_receives_original_part_and_requires_visual_confirmation(self, monkeypatch):
+        monkeypatch.setattr(review.file_cache, "read", lambda p: "content")
+        finding = review.Finding(
+            description="The Lean statement is weaker than the paper theorem.",
+            location="A.lean:12",
+            evidence="Section 3, Theorem 4 has an additional conclusion.",
+            evidence_source="paper_or_spec",
+            evidence_locator="Section 3, Theorem 4; source.pdf",
+            evidence_medium="pdf",
+            confidence="high",
+            severity="high",
+        )
+        r = self._review(critical_misformalizations=[finding])
+        pdf = review.ContentPart(type="pdf", data=b"%PDF-1.7 original", mime_type="application/pdf")
+        seen = {"pdf": 0}
+
+        def text_only(model, contents, schema, thinking_budget=None):
+            seen["pdf"] = sum(part.type == "pdf" for part in contents)
+            return review.FindingVerdict(
+                verdict="confirmed", reasoning="text supports it", confirmation_method="text"
+            ), review.TokenUsage()
+
+        review.verify_findings(
+            SimpleNamespace(generate_structured=text_only, name="fake"),
+            {"A.lean": r}, None, {"A.lean": "diff"}, "", "m", external_parts=[pdf]
+        )
+        assert seen["pdf"] == 1
+        assert finding.verification_status == "unverified"
+        assert finding.confirmation_method == "unconfirmed"
+
+        def visual(model, contents, schema, thinking_budget=None):
+            assert any(part.type == "pdf" for part in contents)
+            return review.FindingVerdict(
+                verdict="confirmed", reasoning="visually checked", confirmation_method="visual"
+            ), review.TokenUsage()
+
+        review.verify_findings(
+            SimpleNamespace(generate_structured=visual, name="fake"),
+            {"A.lean": r}, None, {"A.lean": "diff"}, "", "m", external_parts=[pdf]
+        )
+        assert finding.verification_status == "confirmed"
+        assert finding.confirmation_method == "visual"
+
+    def test_pdf_verifier_budget_accounts_for_original_part(self, monkeypatch):
+        captured = {}
+
+        def budget(provider, **kwargs):
+            captured["external_parts"] = kwargs.get("external_parts")
+            return review.MAX_PROMPT_CHARS
+
+        monkeypatch.setattr(review, "_call_prompt_char_budget", budget)
+        provider = SimpleNamespace(
+            generate_structured=lambda model, contents, schema, thinking_budget=None: (
+                review.FindingVerdict(verdict="uncertain", reasoning=""), review.TokenUsage()
+            ),
+            name="fake",
+        )
+        pdf = review.ContentPart(type="pdf", data=b"%PDF", mime_type="application/pdf")
+        review._verify_one_finding(
+            provider,
+            review.Finding(description="issue"),
+            "context",
+            "m",
+            external_parts=[pdf],
+        )
+        assert captured["external_parts"] == [pdf]
+
 
 # --- compute_deterministic_verdict ---
 
@@ -1381,6 +2039,24 @@ class TestDeterministicVerdict:
     def test_clean_approved(self):
         v, _ = review.compute_deterministic_verdict(self._CLEAN, {"A.lean": self._fr()}, None, False)
         assert v == "Approved"
+
+    def test_unconfirmed_pdf_finding_is_advisory(self):
+        finding = review.Finding(
+            description="The Lean statement is weaker than the paper theorem.",
+            evidence="Section 3, Theorem 4 has an additional conclusion.",
+            evidence_source="paper_or_spec",
+            evidence_locator="Section 3, Theorem 4; source.pdf",
+            evidence_medium="pdf",
+            confidence="high",
+            severity="high",
+        )
+        fr = self._fr(critical_misformalizations=[finding])
+        verdict, _ = review.compute_deterministic_verdict(self._CLEAN, {"A.lean": fr}, None, False)
+        assert verdict == "Needs Minor Revisions"
+
+        finding.confirmation_method = "visual"
+        verdict, _ = review.compute_deterministic_verdict(self._CLEAN, {"A.lean": fr}, None, False)
+        assert verdict == "Changes Requested"
 
     def test_introduced_hatch_forces_changes_requested(self):
         scan = {"introduced": [("A.lean", "sorry", "x")], "preexisting": [], "large_files": []}
@@ -1395,8 +2071,32 @@ class TestDeterministicVerdict:
         assert v == "Approved"
 
     def test_critical_finding_changes_requested(self):
-        fr = self._fr(critical_misformalizations=[review.Finding(description="bad")])
+        fr = self._fr(critical_misformalizations=[review.Finding(
+            description="bad", evidence="Lean declaration violates the changed contract.",
+            evidence_source="lean_source", evidence_locator="A.lean:3",
+            evidence_medium="lean",
+            severity="high",
+        )])
         v, _ = review.compute_deterministic_verdict(self._CLEAN, {"A.lean": fr}, None, False)
+        assert v == "Changes Requested"
+
+    def test_low_confidence_substantive_finding_is_advisory(self):
+        fr = self._fr(lean_issues=[review.Finding(description="maybe", confidence="low")])
+        v, reasons = review.compute_deterministic_verdict(self._CLEAN, {"A.lean": fr}, None, False)
+        assert v == "Needs Minor Revisions"
+        assert any("unconfirmed" in reason for reason in reasons)
+
+    def test_verified_grounding_blocks_when_verification_is_required(self):
+        fr = self._fr(critical_misformalizations=[review.Finding(
+            description="bad", evidence="Lean declaration violates the changed contract.",
+            evidence_source="lean_source", evidence_locator="A.lean:3",
+            evidence_medium="lean",
+            verification_status="confirmed",
+            severity="high",
+        )])
+        v, _ = review.compute_deterministic_verdict(
+            self._CLEAN, {"A.lean": fr}, None, False, verification_required=True
+        )
         assert v == "Changes Requested"
 
     def test_only_nitpicks_minor(self):
@@ -1405,7 +2105,12 @@ class TestDeterministicVerdict:
         assert v == "Needs Minor Revisions"
 
     def test_cross_file_issue_changes_requested(self):
-        cf = review.CrossFileAnalysis(composition_issues=[review.Finding(description="mismatch")])
+        cf = review.CrossFileAnalysis(composition_issues=[review.Finding(
+            description="mismatch", evidence="Changed type is consumed with the old type.",
+            evidence_source="downstream_contract", evidence_locator="A.lean:3 -> B.lean:8",
+            evidence_medium="downstream",
+            severity="high",
+        )])
         v, _ = review.compute_deterministic_verdict(self._CLEAN, {"A.lean": self._fr()}, cf, False)
         assert v == "Changes Requested"
 
@@ -1415,7 +2120,12 @@ class TestDeterministicVerdict:
         assert any("coverage gap" in r for r in reasons)
 
     def test_incomplete_does_not_downgrade_changes_requested(self):
-        fr = self._fr(critical_misformalizations=[review.Finding(description="bad")])
+        fr = self._fr(critical_misformalizations=[review.Finding(
+            description="bad", evidence="Lean declaration violates the changed contract.",
+            evidence_source="lean_source", evidence_locator="A.lean:3",
+            evidence_medium="lean",
+            severity="high",
+        )])
         v, _ = review.compute_deterministic_verdict(self._CLEAN, {"A.lean": fr}, None, True)
         assert v == "Changes Requested"
 
@@ -1550,7 +2260,7 @@ class TestMainOrchestration:
         monkeypatch.setattr(review, "analyze_file_changes_with_context", fake_review)
         monkeypatch.setenv("API_KEY", "sk-test")
         # Keep env clean of stray context from other tests.
-        for var in ("SUMMARY_FILES", "LEAN_INFO", "DISCOVERED_FILES", "BUILD_OUTPUT", "LAKE_GRAPH"):
+        for var in ("SUMMARY_FILES", "LEAN_INFO", "DISCOVERED_FILES", "BUILD_OUTPUT", "LAKE_GRAPH", "LAKE_GRAPH_PATH"):
             monkeypatch.delenv(var, raising=False)
         return review, calls
 
@@ -1574,6 +2284,31 @@ class TestMainOrchestration:
         assert "Review for `Foo.lean`" in out
         assert "Verdict (deterministic): Approved" in out   # authoritative headline
         assert calls["review"] == 1
+
+    def test_captured_build_diagnostics_reach_review_context(self, monkeypatch, tmp_path, capsys):
+        import review
+        captured = {}
+        fr = review.FileReview(verdict="Approved", analysis="fine")
+        monkeypatch.setattr(review, "get_pr_diff", lambda pr: (self._SINGLE, []))
+        monkeypatch.setattr(review, "create_provider", lambda key, **kw: SimpleNamespace(name="fake"))
+        monkeypatch.setattr(review, "analyze_specification", lambda *a, **k: "")
+
+        def fake_review(provider, ctx, fp, fd, fc, spec, ext, chk, vr):
+            captured["repo_context"] = ctx["repo_context"]
+            return fr, "FORMATTED-REVIEW"
+
+        monkeypatch.setattr(review, "analyze_file_changes_with_context", fake_review)
+        monkeypatch.setenv("API_KEY", "sk-test")
+        monkeypatch.setenv("BUILD_STATUS", "success")
+        monkeypatch.setenv("BUILD_OUTPUT", "Main.lean:12:4: warning: declaration uses 'sorry'")
+        for var in ("SUMMARY_FILES", "LEAN_INFO", "DISCOVERED_FILES", "LAKE_GRAPH", "LAKE_GRAPH_PATH"):
+            monkeypatch.delenv(var, raising=False)
+
+        self._run(monkeypatch, tmp_path, capsys)
+
+        assert "Lake Build Diagnostics" in captured["repo_context"]
+        assert "declaration uses 'sorry'" in captured["repo_context"]
+        assert "exact checked-out PR commit passed" in captured["repo_context"]
 
     def test_two_files_run_cross_file_and_synthesis(self, monkeypatch, tmp_path, capsys):
         review, calls = self._common_patches(monkeypatch, self._TWO)
@@ -1614,7 +2349,7 @@ class TestMainOrchestration:
         monkeypatch.setattr(review, "create_provider",
                             lambda key, **kw: SimpleNamespace(name="fake", generate_structured=gen))
         monkeypatch.setenv("API_KEY", "sk-test")
-        for var in ("SUMMARY_FILES", "LEAN_INFO", "DISCOVERED_FILES", "BUILD_OUTPUT", "LAKE_GRAPH"):
+        for var in ("SUMMARY_FILES", "LEAN_INFO", "DISCOVERED_FILES", "BUILD_OUTPUT", "LAKE_GRAPH", "LAKE_GRAPH_PATH"):
             monkeypatch.delenv(var, raising=False)
 
         out = self._run(monkeypatch, tmp_path, capsys)
@@ -1645,7 +2380,7 @@ class TestC3Containment:
         monkeypatch.setattr(sys, "argv", argv)
         monkeypatch.setenv("API_KEY", "sk-test")
         for var in ("SUMMARY_FILES", "LEAN_INFO", "DISCOVERED_FILES", "BUILD_OUTPUT",
-                    "LAKE_GRAPH", "LLM_MAX_RUN_TOKENS", "LLM_MAX_RUN_COST",
+                    "LAKE_GRAPH", "LAKE_GRAPH_PATH", "LLM_MAX_RUN_TOKENS", "LLM_MAX_RUN_COST",
                     "LLM_BUDGET_MODE", "LLM_LOUD_EXIT"):
             monkeypatch.delenv(var, raising=False)
         for k, v in (env or {}).items():
@@ -1890,6 +2625,46 @@ class TestC3ActionWiring:
         run_env = self._run_step(doc)["env"]
         assert run_env["DISCOVERED_FILES"] == "${{ steps.discover_files.outputs.discovered_files }}"
 
+    def test_build_diagnostics_are_captured_and_threaded_to_review(self):
+        doc, raw = self._action()
+        build = next(s for s in doc["runs"]["steps"] if s.get("id") == "lean_build")
+        assert build["continue-on-error"] is True
+        assert "lake build" in build["run"]
+        assert "PIPESTATUS[0]" in build["run"]
+        assert "build_output<<" in build["run"]
+        assert "BUILD_SUCCEEDED=true" in build["run"]
+        assert "BUILD_SUCCEEDED=false" in build["run"]
+        assert "BUILD_STATUS=success" in build["run"]
+        assert "BUILD_STATUS=failure" in build["run"]
+        assert "middle of compiler log omitted" in build["run"]
+        assert "head -c 60000" in build["run"]
+        assert "tail -c 60000" in build["run"]
+        run_env = self._run_step(doc)["env"]
+        assert run_env["BUILD_OUTPUT"] == "${{ steps.lean_build.outputs.build_output }}"
+        assert run_env["BUILD_SUCCEEDED"] == "${{ steps.lean_build.outputs.build_succeeded }}"
+        assert run_env["BUILD_STATUS"] == "${{ steps.lean_build.outputs.build_status }}"
+        assert "Record successful Lean build" not in raw
+
+    def test_annotated_review_is_marked_and_same_head_reviews_are_superseded(self):
+        doc, raw = self._action()
+        post = next(s for s in doc["runs"]["steps"] if s.get("name") == "Post Review")
+        script = post["with"]["script"]
+        assert "lean-ai-review:" in script
+        assert "listReviews" in script
+        assert "dismissReview" in script
+        assert "github.paginate" in script
+        assert "Could not supersede an earlier review" in script
+        assert "review.body.includes('### 🤖 AI Review')" not in script
+        assert "Annotated review posted, but overflow comments failed" in script
+        assert "Review comment posted, but overflow comments failed" in script
+        assert "review.commit_id === commit_id" in script
+        assert "body: markedBody" in script
+        assert "reviewMarker + '\\n' + part" in script
+        assert "c.body.includes(reviewMarker)" in script
+        assert "OUR_REVIEW_PREFIX" not in script
+        assert "removeSameHeadRegularComments" in script
+        assert "old regular comment cleanup failed" in script
+
     def test_s1_resolve_step_routes_pr_number_via_env_not_run_body(self):
         # Expression-injection guard: pr_number must reach the resolve script via an env
         # var, never interpolated into the run: body (the file's own standard).
@@ -2083,6 +2858,16 @@ class TestPinnedDiff:
         monkeypatch.delenv("PR_HEAD_SHA", raising=False)
         review.get_pr_diff("42")
         assert seen["cmd"][:3] == ["gh", "pr", "diff"]
+
+    def test_get_pr_diff_timeout_is_reported_as_a_recoverable_error(self, monkeypatch):
+        def timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(args[0], kwargs.get("timeout", 0))
+        monkeypatch.setattr(review.subprocess, "run", timeout)
+
+        diff, errors = review.get_pr_diff("42")
+
+        assert diff == ""
+        assert errors == ["Failed to fetch PR diff for PR #42."]
 
     def test_discover_changed_files_pinned_to_shas(self, monkeypatch):
         # The discovery half of the "diff + discovery pinned to ONE SHA" S1 claim.

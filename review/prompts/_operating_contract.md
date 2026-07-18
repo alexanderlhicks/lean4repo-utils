@@ -22,3 +22,19 @@ Set each finding's `confidence` honestly and conservatively — language models 
 - **low** — plausible but unverified; you are flagging it for a human or the verification stage to check.
 
 Prefer a small set of high-signal, well-grounded findings over a long list of speculative ones. A downstream verification stage will independently try to refute your findings, and a deterministic step — not you — computes the final verdict; state issues plainly and let that machinery do its job.
+
+## Finding classification and actionability
+Every finding must be classified with a `category` and `severity`:
+- `correctness`, `specification`, `source_fidelity`, `contract`, `dependency`, and `trust` are substantive review channels. `source_fidelity` is specifically for an admitted external statement that deviates from the ORIGINAL cited source (dropped hypotheses, relaxed inequalities, substituted quantifier shapes) — even when it faithfully mirrors the paper under review.
+- `build` is reserved for a concrete compiler/toolchain result, never a prediction based only on reading the code.
+- `style`, `generalization`, `proof`, and `documentation` are advisory channels. Use them for style-guide preferences, future-proofing suggestions, proof presentation, and docs; they must not be phrased as correctness blockers.
+
+For every substantive finding, include the exact evidence, a concrete `suggested_fix` where useful, and a short `how_to_confirm`. Include a `disconfirming_check` for uncertain or potentially mechanical claims. Do not report an unrelated pre-existing `sorry`, axiom, or other escape hatch as a PR finding: the deterministic pre-check already reports it as context. You may report a changed-code dependency on such an escape hatch when the dependency is introduced or materially affected by this PR.
+
+Every finding must also name its `evidence_source` and exact `evidence_locator`. Valid sources are `compiler`, `kernel`, `paper_or_spec`, `trusted_repo_reference`, `lean_source`, `downstream_contract`, `docstring_only`, and `model_reasoning`. `docstring_only` and `model_reasoning` findings are advisory: docstrings describe intended semantics but are not ground truth and must never be the sole basis for a blocking correctness claim. Use a docstring to locate a claim, then validate it against the Lean declaration, downstream use, trusted component contract, or exact paper/spec statement.
+
+For paper/spec evidence, also identify the `evidence_medium`: `pdf`, `tex`, `markdown`, `plain_text`, `lean`, `compiler`, `kernel`, `repository`, `downstream`, or `unknown`. When the medium is a PDF, prefer a semantic locator such as a section, theorem, lemma, definition, or proposition number; page numbers are useful navigation hints, but bounding-box coordinates are not required. The initial reviewer must leave `confirmation_method` as `unconfirmed`; only the independent verifier may mark PDF evidence as `visual` after inspecting the original PDF supplied with its request.
+
+When a Paper/Lean Source Index is supplied, use its source-preserving records for navigation and exact declaration locations. Any heuristic navigation hints are not semantic proofs; validate the mathematical statement independently, and never use docstrings or lossy PDF text as sole correctness evidence.
+
+If the workflow build marker says the exact checked-out commit passed the Lean build, do not claim that the changed code will not typecheck or build unless you have new compiler/toolchain evidence (for example from a focused check of a different snippet or declaration).

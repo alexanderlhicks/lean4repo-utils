@@ -104,6 +104,60 @@ def strip_comments(line: str, nesting_depth: int) -> Tuple[str, int]:
     return ''.join(out), nesting_depth
 
 
+def strip_comments_preserve_strings(
+    line: str, nesting_depth: int, in_string: bool,
+) -> Tuple[str, int, bool]:
+    """Remove Lean comments while preserving string contents and open-string state.
+
+    This is the stateful counterpart to :func:`strip_comments`. It is useful for
+    bounded signature/context extraction: callers need the readable contents of
+    strings, but a string can span lines and must not make ``--``, ``/-``, ``:=``
+    or ``where`` on a continuation line look like Lean syntax.
+    """
+    out = []
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if in_string:
+            out.append(ch)
+            if ch == '\\' and i + 1 < n:
+                out.append(line[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if nesting_depth == 0:
+            if ch == '"':
+                in_string = True
+                out.append(ch)
+                i += 1
+                continue
+            pair = line[i:i + 2]
+            if pair == '/-':
+                nesting_depth += 1
+                i += 2
+                continue
+            if pair == '--':
+                break
+            out.append(ch)
+            i += 1
+            continue
+        pair = line[i:i + 2]
+        if pair == '/-':
+            nesting_depth += 1
+            i += 2
+            continue
+        if pair == '-/':
+            nesting_depth -= 1
+            i += 2
+            continue
+        i += 1
+    return ''.join(out), nesting_depth, in_string
+
+
 def scrub_line(line: str, nesting_depth: int, in_string: bool) -> Tuple[str, int, bool]:
     """Return the scannable code of a line, with Lean comments **and string
     literal contents** removed, threading both block-comment nesting and

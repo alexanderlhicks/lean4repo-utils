@@ -202,6 +202,23 @@ class BudgetExceededError(Exception):
         self.usage = usage if usage is not None else TokenUsage()
 
 
+class LLMResponseEnvelopeError(RuntimeError):
+    """A completion arrived structurally unusable: an OpenRouter in-body error
+    object (HTTP 200 + ``{"error": ...}``) or an empty/missing ``choices`` list.
+
+    Carries ``.status_code`` when the in-body error names one, so
+    :func:`is_hard_llm_failure` applies its normal status-first policy — an
+    in-body 402 is as hard as an HTTP 402; an in-body 429/5xx stays soft. A
+    statusless envelope error is soft (RuntimeError is not in _API_ERRORS, so
+    the statusless billing markers — which the error message, being provider/
+    content-influenced, must never reach — are not consulted).
+    """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code  # _status_code_of ignores a None
+
+
 # 403 disambiguation. OpenRouter returns 403 for BOTH an auth/permission failure
 # and a *moderation-flagged input* (docs/api/reference/errors, verified 2026-07-08).
 # The input is attacker-controllable PR content, so a bare 403 must NOT be treated
@@ -784,6 +801,7 @@ class OpenRouterProvider:
                     ) from e
             break
 
+        completion = self._checked(completion, model)
         message = completion.choices[0].message
         parsed = getattr(message, "parsed", None)
         if parsed is None:
@@ -828,6 +846,7 @@ class OpenRouterProvider:
                     max_tokens=max_tokens,
                     extra_body=extra_body,
                 )
+            completion = self._checked(completion, model)
             rounds_usage.append(self._record_usage(completion))
             message = completion.choices[0].message
             tool_calls = getattr(message, "tool_calls", None)
@@ -877,16 +896,41 @@ class OpenRouterProvider:
         messages = [{"role": "user", "content": blocks}]
         extra_body = self._build_extra_body(thinking_budget, has_pdf, healing=False)
 
-        with self._api_semaphore:
-            completion = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=self._max_tokens_for(thinking_budget),
-                extra_body=extra_body,
+        # finish_reason parity with the structured path: a "length" finish is a
+        # silently truncated answer, so escalate the cap and retry (each
+        # truncated attempt is still billed and recorded). Unlike JSON, partial
+        # prose is still usable, so exhausting the escalation returns the
+        # truncated text with a warning instead of raising.
+        max_tokens = self._max_tokens_for(thinking_budget)
+        usage_total = TokenUsage()
+        for attempt in range(self.length_retry_attempts + 1):
+            with self._api_semaphore:
+                completion = self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    extra_body=extra_body,
+                )
+            completion = self._checked(completion, model)
+            usage_total = _sum_usage(usage_total, self._record_usage(completion))
+            choice = completion.choices[0]
+            text = (choice.message.content or "").strip()
+            if getattr(choice, "finish_reason", None) != "length":
+                return text, usage_total
+            if (attempt >= self.length_retry_attempts
+                    or max_tokens >= self.length_retry_max_tokens
+                    or self.budget.exceeded):
+                logging.warning(
+                    f"Model '{model}' text output truncated at max_tokens={max_tokens}; "
+                    f"returning partial text (escalation exhausted or over budget)."
+                )
+                return text, usage_total
+            new_max = min(max_tokens * 2, self.length_retry_max_tokens)
+            logging.warning(
+                f"Model '{model}' text output truncated at max_tokens={max_tokens}; "
+                f"retrying with max_tokens={new_max}."
             )
-
-        text = completion.choices[0].message.content or ""
-        return text.strip(), self._record_usage(completion)
+            max_tokens = new_max
 
     def _parse(self, **kwargs):
         """Call the SDK's structured-output parse helper across SDK versions."""
@@ -894,6 +938,39 @@ class OpenRouterProvider:
         if parse is None:  # older SDK: parse lives under .beta
             parse = self.client.beta.chat.completions.parse
         return parse(**kwargs)
+
+    def _checked(self, completion, model: str):
+        """Validate the response envelope before any field access.
+
+        OpenRouter can return HTTP 200 with an in-body ``error`` object (e.g. a
+        provider failure mid-generation), and a degenerate response can carry an
+        empty ``choices`` list. Either way the generation may still have been
+        billed, so its usage is recorded (fail-closed: absent usage becomes
+        cost_missing) BEFORE raising — an unusable envelope must not also
+        escape spend accounting. Callers that reach the normal path record
+        usage themselves; _checked records only on the raising paths.
+        """
+        err = getattr(completion, "error", None)
+        if err:
+            if isinstance(err, dict):
+                code, message = err.get("code"), str(err.get("message", ""))
+            else:
+                code = getattr(err, "code", None)
+                message = str(getattr(err, "message", "") or err)
+            self._record_usage(completion)
+            code_int = code if isinstance(code, int) and not isinstance(code, bool) else None
+            raise LLMResponseEnvelopeError(
+                f"Model '{model}' returned an in-body error"
+                + (f" (code {code})" if code is not None else "")
+                + (f": {message[:200]}" if message else "."),
+                status_code=code_int,
+            )
+        if not getattr(completion, "choices", None):
+            self._record_usage(completion)
+            raise LLMResponseEnvelopeError(
+                f"Model '{model}' returned a response with no choices."
+            )
+        return completion
 
     def _record_usage(self, completion) -> TokenUsage:
         """THE authoritative usage sink (R2). Parse this completion's usage exactly

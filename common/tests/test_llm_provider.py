@@ -123,6 +123,12 @@ class MessageContentTests(unittest.TestCase):
         self.assertTrue(blocks[0]["file"]["file_data"].startswith("data:application/pdf;base64,"))
         self.assertNotIn("cache_control", blocks[0])
 
+    def test_pdf_url_passthrough(self):
+        url = "https://eprint.iacr.org/2025/536.pdf"
+        blocks, has_pdf = self.p._to_message_content([ContentPart("pdf", url)])
+        self.assertTrue(has_pdf)
+        self.assertEqual(blocks[0]["file"]["file_data"], url)
+
     def test_cache_control_honored_on_pdf_and_image(self):
         # Regression: a trailing PDF/image reference must still carry the cache
         # breakpoint, not just text parts.
@@ -194,6 +200,127 @@ class MaxTokensTests(unittest.TestCase):
 
     def test_zero_budget_is_base(self):
         self.assertEqual(_bare_provider(max_tokens=65536)._max_tokens_for(0), 65536)
+
+
+class ResponseEnvelopeTests(unittest.TestCase):
+    """The envelope is validated before any choices[0] access: OpenRouter can
+    return HTTP 200 with an in-body error object, and a degenerate response can
+    carry empty choices. Both must raise the typed error AND keep the billed
+    generation inside the fail-closed spend accounting."""
+
+    def _provider_with_create(self, completion):
+        p = _bare_provider()
+        create = mock.Mock(return_value=completion)
+        p.client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+        )
+        return p
+
+    def test_empty_choices_raises_typed_error_not_indexerror(self):
+        completion = types.SimpleNamespace(choices=[], usage=None)
+        p = self._provider_with_create(completion)
+        with self.assertRaises(llm_provider.LLMResponseEnvelopeError):
+            p.generate_text("m", [ContentPart("text", "hi")])
+        # The unusable-but-possibly-billed call must not escape spend
+        # accounting: absent usage is recorded fail-closed (cost_missing),
+        # which stickily flips cost-cap trust off.
+        self.assertFalse(p.budget.cost_reliable)
+
+    def test_missing_choices_attribute_raises_typed_error(self):
+        completion = types.SimpleNamespace(usage=None)
+        p = self._provider_with_create(completion)
+        with self.assertRaises(llm_provider.LLMResponseEnvelopeError):
+            p.generate_text("m", [ContentPart("text", "hi")])
+
+    def test_in_body_402_error_is_hard_failure(self):
+        completion = types.SimpleNamespace(
+            choices=[], usage=None,
+            error={"code": 402, "message": "Insufficient credits"},
+        )
+        p = self._provider_with_create(completion)
+        with self.assertRaises(llm_provider.LLMResponseEnvelopeError) as ctx:
+            p.generate_text("m", [ContentPart("text", "hi")])
+        self.assertEqual(ctx.exception.status_code, 402)
+        self.assertTrue(llm_provider.is_hard_llm_failure(ctx.exception))
+        self.assertIn("402", str(ctx.exception))
+
+    def test_in_body_5xx_error_is_soft(self):
+        completion = types.SimpleNamespace(
+            choices=[], usage=None,
+            error={"code": 502, "message": "Provider returned error"},
+        )
+        p = self._provider_with_create(completion)
+        with self.assertRaises(llm_provider.LLMResponseEnvelopeError) as ctx:
+            p.generate_text("m", [ContentPart("text", "hi")])
+        self.assertFalse(llm_provider.is_hard_llm_failure(ctx.exception))
+
+    def test_statusless_in_body_error_is_soft(self):
+        completion = types.SimpleNamespace(
+            choices=[], usage=None,
+            error={"message": "insufficient credit"},  # billing words in the
+            # message must NOT make a statusless envelope error hard: the text
+            # is provider/content-influenced (same policy as ValueError).
+        )
+        p = self._provider_with_create(completion)
+        with self.assertRaises(llm_provider.LLMResponseEnvelopeError) as ctx:
+            p.generate_text("m", [ContentPart("text", "hi")])
+        self.assertIsNone(ctx.exception.status_code)
+        self.assertFalse(llm_provider.is_hard_llm_failure(ctx.exception))
+
+    def test_structured_path_validates_envelope(self):
+        completion = types.SimpleNamespace(choices=[], usage=None)
+        p = _bare_provider()
+        p.client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(parse=mock.Mock(return_value=completion))
+            )
+        )
+        with self.assertRaises(llm_provider.LLMResponseEnvelopeError):
+            p.generate_structured("m", [ContentPart("text", "hi")], _Schema)
+
+
+class GenerateTextLengthTests(unittest.TestCase):
+    """finish_reason parity for the free-form path: a "length" finish escalates
+    the cap like the structured path; exhaustion returns the partial text (prose
+    stays useful truncated, unlike JSON) with every attempt's usage summed."""
+
+    def _provider_with_side_effect(self, completions, **kwargs):
+        p = _bare_provider(**kwargs)
+        create = mock.Mock(side_effect=completions)
+        p.client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+        )
+        return p, create
+
+    def test_length_finish_escalates_and_returns_complete_text(self):
+        usage = _FakeUsage({"prompt_tokens": 10, "completion_tokens": 16384})
+        truncated = _FakeCompletion(_FakeMessage(content="partial"), usage=usage,
+                                    finish_reason="length")
+        complete = _FakeCompletion(_FakeMessage(content="full answer"), usage=usage,
+                                   finish_reason="stop")
+        p, create = self._provider_with_side_effect([truncated, complete])
+
+        text, tokens = p.generate_text("m", [ContentPart("text", "hi")])
+
+        self.assertEqual(text, "full answer")
+        self.assertEqual(create.call_count, 2)
+        first_cap = create.call_args_list[0].kwargs["max_tokens"]
+        second_cap = create.call_args_list[1].kwargs["max_tokens"]
+        self.assertEqual(second_cap, first_cap * 2)
+        # Both attempts were billed; both must be in the returned total.
+        self.assertEqual(tokens.output_tokens, 2 * 16384)
+
+    def test_length_exhaustion_returns_partial_text(self):
+        usage = _FakeUsage({"prompt_tokens": 10, "completion_tokens": 16384})
+        truncated = _FakeCompletion(_FakeMessage(content="partial"), usage=usage,
+                                    finish_reason="length")
+        p, create = self._provider_with_side_effect(
+            [truncated, truncated], length_retry_attempts=1)
+
+        text, _ = p.generate_text("m", [ContentPart("text", "hi")])
+
+        self.assertEqual(text, "partial")
+        self.assertEqual(create.call_count, 2)
 
 
 class GenerateStructuredTests(unittest.TestCase):

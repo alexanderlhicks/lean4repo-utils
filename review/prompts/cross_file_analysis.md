@@ -73,6 +73,10 @@ You MUST respond with a JSON object matching this schema:
   - `description`: What the issue is
   - `location`: Relevant file paths and lines (e.g., "FileA.lean:42 -> FileB.lean:88")
   - `evidence`: What grounds this finding — the specific symbols/types involved and where they are defined vs consumed, or the checklist item at stake. Cite specifics so a human can verify it.
+  - `evidence_source`: One of `compiler`, `kernel`, `paper_or_spec`, `trusted_repo_reference`, `lean_source`, `downstream_contract`, `docstring_only`, or `model_reasoning`
+  - `evidence_locator`: Exact declaration/use-site lines, command/output, paper section, or component path
+  - `evidence_medium`: One of `pdf`, `tex`, `markdown`, `plain_text`, `lean`, `compiler`, `kernel`, `repository`, `downstream`, or `unknown`; use `pdf` for evidence read from a PDF
+  - `confirmation_method`: Leave as `unconfirmed`; the independent verifier sets this after checking the cited source
   - `confidence`: "high", "medium", or "low" — your confidence that this is a genuine issue and not a false positive.
   - `suggested_fix`: How to fix it (optional, use "" if none)
 - `escape_hatch_impact`: Array of findings about axioms/sorries and their downstream impact through the dependency chain, same structure (with `evidence` and `confidence`)

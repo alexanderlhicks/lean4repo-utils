@@ -23,6 +23,15 @@ You are the first step in a multi-agent review pipeline. Your output must be a r
 {{DEPENDENCY_GRAPH}}
 ---
 
+**Paper/Lean Source Index (navigation only):**
+---
+Use this only to find declarations and source locations. Heuristic navigation hints
+are not semantic matches and are intentionally not included in this prompt.
+Docstrings and lossy PDF text are never proof of faithfulness; PDF claims require
+visual confirmation against the original PDF.
+{{PAPER_LEAN_EVIDENCE}}
+---
+
 **Your Task:**
 Your primary job is to read the external references (papers) **first**, extract the mathematical results, and then check whether the PR diff formalizes them correctly. Work paper → Lean, not diff → paper.
 
@@ -32,9 +41,10 @@ Mathematicians frequently omit "obvious" details in prose that are absolutely cr
 For each theorem, lemma, definition, or protocol step in the paper that is relevant to this PR, produce a mapping entry:
 - **Paper Result:** The theorem/definition as stated in the paper (section number, statement in mathematical notation)
 - **Mathematical Content:** The precise mathematical content that any correct formalization must preserve — enumerate the hypotheses (including implicit ones), the conclusion, and the specific mathematical objects involved (domains, codomains, fields, metrics, error bounds). Do NOT predict the Lean syntax; describe the mathematics.
-- **Status:** Whether the diff appears to contain a corresponding formalization, is missing it, or partially covers it
+- **Status:** Whether the diff appears to contain a corresponding formalization, is missing it, or partially covers it. A statement that is present but *different* (weaker definition shape, substituted hypotheses) is **Partial**, never Present — record what differs in `deviations_from_source`.
+- **Cited source (source-of-source fidelity):** When the paper result is itself **cited from another work** — typically an admitted external lemma the PR `sorry`s with a citation — record the ULTIMATE source (paper + theorem number) in `cited_source`, and treat *that source's* statement, not the paper under review's restatement, as ground truth. Papers weaken their own citations: a dropped radius hypothesis, a real-valued relaxation of an integer bound, a strict inequality made non-strict, a dropped invariant. If the cited source's document is available in the references, enumerate every such deviation in `deviations_from_source`; if it is not available, say so there explicitly — an unverifiable admitted external is a checklist item, not a pass.
 
-This catches the critical case where a paper result is **absent** from the diff, not just different.
+This catches the two critical cases: a paper result **absent** from the diff, and an admitted external that faithfully mirrors the paper under review while the paper itself deviated from the source it cites.
 
 **Step 2 — Formalization Checklist:**
 For each concept relevant to the PR, provide a severity tag ('Critical', 'Major', or 'Minor') and a list of specific, actionable verification steps.

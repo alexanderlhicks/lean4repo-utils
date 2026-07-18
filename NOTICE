@@ -1,0 +1,17 @@
+lean4repo-utils
+Copyright 2025-2026 Alexander Hicks
+
+Licensed under the Apache License, Version 2.0.
+
+Attribution notices for reused or adapted code (including code ported
+from the maintainer's own repositories, per the project reuse policy)
+are recorded in this file.
+
+- summary/ is ported from alexanderlhicks/lean-summary-workflow
+  (https://github.com/alexanderlhicks/lean-summary-workflow), port base
+  commit 871a07c12ab7f8d0ae555d54efe4d1c05ec0833d (2026-06-30). That
+  source is licensed Apache-2.0 but left the Apache copyright appendix as
+  the unfilled template (no copyright holder declared upstream); the
+  holder asserted above is newly stated here, not carried over. The 2025
+  portion of the copyright range derives from that repository's history
+  (first commit 2025-12-25). This repository consolidates and supersedes it.

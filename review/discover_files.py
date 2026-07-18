@@ -1,6 +1,7 @@
 import subprocess
 import json
 import os
+import re
 import sys
 
 from leanrepo_common.lean_utils import file_path_to_module_name
@@ -17,10 +18,10 @@ def get_changed_lean_files(pr_number):
     else:
         cmd = ["gh", "pr", "diff", str(pr_number), "--name-only"]
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
         changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip().endswith('.lean')]
         return changed_files
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         # Do not echo raw stderr (may carry token-adjacent detail on a public log).
         print(f"::error::Failed to get changed files for PR #{pr_number}.")
         return []
@@ -86,6 +87,7 @@ def partition_context_tiers(final_file_list, changed_files, dep_files_with_depth
 
     Returns (full_context_files, summary_context_files), both lists of paths.
     """
+    context_limit = max(0, context_limit)
     changed_set = set(changed_files)
     changed_first = [f for f in final_file_list if f in changed_set]
     others = [f for f in final_file_list if f not in changed_set]
@@ -108,6 +110,45 @@ def build_lean_file_index():
                 index.append(path)
     return index
 
+# Anchored at column 0: Lean import statements are never indented. Tolerates
+# the module-system modifiers (`public`/`private`/`meta`) and `import all`.
+# A stray column-0 `import` inside a block comment can only ever add a
+# repo-local module to the context set (targets are filtered to local modules),
+# so no comment-awareness is needed.
+_IMPORT_LINE_RE = re.compile(
+    r'^(?:(?:public|private|meta)\s+)*import\s+(?:all\s+)?(\S+)', re.MULTILINE
+)
+
+
+def build_import_graph(index):
+    """Build the [{name, imports}] module graph by scanning the repo's own
+    `import` lines.
+
+    Deliberately NOT `lake exe graph`: the importGraph CLI pinned by target
+    repos has no JSON output mode, requires a *built* package (it loads
+    .olean files), and only covers modules reachable from the default lake
+    target — silently missing every other lean_lib in a multi-target repo.
+    A source scan needs no toolchain, covers every tracked file, and cannot
+    time out. Imports are restricted to repo-local modules: external
+    (Mathlib, ...) imports are irrelevant to the dependent/dependency passes
+    and would bloat the serialized graph."""
+    module_of_path = {p: file_path_to_module_name(p) for p in index}
+    local_modules = set(module_of_path.values())
+    graph = []
+    for path, module in sorted(module_of_path.items()):
+        try:
+            with open(path, 'r', errors='replace') as f:
+                source = f.read()
+        except OSError:
+            continue
+        imports = {
+            m.group(1) for m in _IMPORT_LINE_RE.finditer(source)
+            if m.group(1) in local_modules and m.group(1) != module
+        }
+        graph.append({"name": module, "imports": sorted(imports)})
+    return graph
+
+
 def convert_module_to_file_path(module_name, index):
     expected_suffix = module_name.replace('.', os.sep) + '.lean'
     for path in index:
@@ -129,18 +170,10 @@ def main():
     dep_files_with_depth = {}  # file_path -> depth (for priority ordering)
 
     try:
-        print("Attempting to generate Lake dependency graph...")
-        lake_graph_output = subprocess.run(
-            ['lake', 'exe', 'graph', '--json'],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=300
-        ).stdout
-        lake_graph_json = json.loads(lake_graph_output)
-        print("Successfully generated Lake dependency graph.")
-
+        print("Building the Lean import graph from source `import` lines...")
         lean_files_index = build_lean_file_index()
+        lake_graph_json = build_import_graph(lean_files_index)
+        print(f"Import graph built: {len(lake_graph_json)} modules.")
 
         # Find files that depend ON our changed files (depth 1 only — deeper fans out too fast)
         dependent_modules = get_dependent_lean_files(changed_modules, lake_graph_json)
@@ -159,8 +192,8 @@ def main():
             dep_files_with_depth[fp] = depth
         all_relevant_files.update(dep_files_with_depth.keys())
 
-    except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
-        print(f"::warning::Could not generate or parse Lake graph for full dependency analysis: {e}")
+    except (OSError, TypeError, KeyError, AttributeError, ValueError) as e:
+        print(f"::warning::Could not build the import graph for full dependency analysis: {e}")
         print("::warning::Falling back to only changed files for context.")
 
     final_file_list = sorted([f for f in all_relevant_files if os.path.exists(f)])
@@ -170,6 +203,7 @@ def main():
         CONTEXT_LIMIT = int(os.environ.get('CONTEXT_LIMIT', 50))
     except ValueError:
         CONTEXT_LIMIT = 50
+    CONTEXT_LIMIT = max(0, CONTEXT_LIMIT)
 
     full_context_files, summary_context_files = partition_context_tiers(
         final_file_list, set(changed_files), dep_files_with_depth, CONTEXT_LIMIT,
@@ -186,18 +220,24 @@ def main():
     if summary_string:
         print(f"::notice::Summary-context files: {summary_string}")
 
-    # Serialize lake graph for downstream steps (avoids re-running lake exe graph)
-    lake_graph_serialized = ""
+    # Serialize the graph to a FILE and hand downstream steps its path: a real
+    # repo's graph can exceed both GITHUB_OUTPUT's 1 MB cap and Linux's 128 KiB
+    # per-env-string cap, either of which would fail the step. Written
+    # unconditionally (empty graph -> "[]") so a file planted by PR-controlled
+    # build code earlier in the job never survives to the review step.
+    lake_graph_path = "lake_graph.json"
     try:
-        lake_graph_serialized = json.dumps(lake_graph_json)
-    except Exception:
-        pass
+        with open(lake_graph_path, 'w') as f:
+            json.dump(lake_graph_json, f)
+    except OSError as e:
+        print(f"::warning::Could not write {lake_graph_path}: {e}")
+        lake_graph_path = ""
 
     with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
         f.write(f"changed_files={changed_string}\n")
         f.write(f"discovered_files={output_string}\n")
         f.write(f"summary_files={summary_string}\n")
-        f.write(f"lake_graph={lake_graph_serialized}\n")
+        f.write(f"lake_graph_path={lake_graph_path}\n")
 
 if __name__ == "__main__":
     main()

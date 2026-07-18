@@ -1,8 +1,8 @@
 """Unit tests for discover_files.py core functions."""
 
+import json
 import sys
 import os
-import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -230,9 +230,66 @@ class TestPartitionContextTiers:
         # All 8 still accounted for, order preserved.
         assert full + summary == final
 
+    def test_negative_context_limit_is_clamped(self):
+        full, summary = partition_context_tiers(["A.lean", "B.lean"], set(), {}, -1)
+        assert full == []
+        assert summary == ["A.lean", "B.lean"]
+
+
+class TestBuildImportGraph:
+    """The graph is built by scanning source `import` lines — NOT
+    `lake exe graph`, which has no JSON mode in the importGraph the target
+    repos pin, needs a built package, and only covers the default target."""
+
+    def _write(self, tmp_path, rel, content):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+
+    def _graph(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        idx = discover_files.build_lean_file_index()
+        graph = discover_files.build_import_graph(idx)
+        return {g["name"]: g["imports"] for g in graph}
+
+    def test_scans_imports_restricted_to_local_modules(self, tmp_path, monkeypatch):
+        self._write(tmp_path, "MyLib/A.lean",
+                    "import Mathlib.Data.Set.Basic\nimport MyLib.B\n\ndef a := 1\n")
+        self._write(tmp_path, "MyLib/B.lean", "def b := 1\n")
+        by = self._graph(tmp_path, monkeypatch)
+        assert by["MyLib.A"] == ["MyLib.B"]  # external import filtered out
+        assert by["MyLib.B"] == []
+
+    def test_module_system_modifiers_and_import_all(self, tmp_path, monkeypatch):
+        self._write(tmp_path, "L/A.lean",
+                    "module\n\npublic import L.B\nmeta import L.C\nimport all L.D\n")
+        for m in ("B", "C", "D"):
+            self._write(tmp_path, f"L/{m}.lean", "def x := 1\n")
+        by = self._graph(tmp_path, monkeypatch)
+        assert by["L.A"] == ["L.B", "L.C", "L.D"]
+
+    def test_indented_or_line_commented_imports_not_matched(self, tmp_path, monkeypatch):
+        self._write(tmp_path, "L/A.lean",
+                    "  import L.B\n-- import L.C\ndef a := 1\n")
+        for m in ("B", "C"):
+            self._write(tmp_path, f"L/{m}.lean", "def x := 1\n")
+        by = self._graph(tmp_path, monkeypatch)
+        assert by["L.A"] == []
+
+    def test_covers_multiple_top_level_libs(self, tmp_path, monkeypatch):
+        # The lake-exe-graph gap this replaces: an importer in a NON-default
+        # lib must still produce an edge.
+        self._write(tmp_path, "Core/Basic.lean", "def core := 1\n")
+        self._write(tmp_path, "Extras/Uses.lean", "import Core.Basic\ndef e := core\n")
+        monkeypatch.chdir(tmp_path)
+        idx = discover_files.build_lean_file_index()
+        graph = discover_files.build_import_graph(idx)
+        dependents = discover_files.get_dependent_lean_files({"Core.Basic"}, graph)
+        assert dependents == ["Extras.Uses"]
+
 
 class TestMainOutputs:
-    def test_writes_changed_files_separately_from_context(self, tmp_path, monkeypatch):
+    def test_writes_changed_files_and_graph_path(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         (tmp_path / "Changed.lean").write_text("def changed := 1\n")
         github_output = tmp_path / "out.txt"
@@ -240,12 +297,34 @@ class TestMainOutputs:
         monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
         monkeypatch.setattr(discover_files, "get_changed_lean_files", lambda pr: ["Changed.lean"])
 
-        def fail_graph(*args, **kwargs):
-            raise subprocess.CalledProcessError(1, args[0])
-        monkeypatch.setattr(discover_files.subprocess, "run", fail_graph)
-
         discover_files.main()
 
         out = github_output.read_text()
         assert "changed_files=Changed.lean\n" in out
         assert "discovered_files=Changed.lean\n" in out
+        # The graph travels by FILE, not inline: a real repo's serialized graph
+        # can exceed GITHUB_OUTPUT's 1 MB cap and Linux's 128 KiB env cap
+        # (measured 183 KB on VCV-io).
+        assert "lake_graph_path=lake_graph.json\n" in out
+        assert "lake_graph=" not in out.replace("lake_graph_path=", "")
+        graph = json.loads((tmp_path / "lake_graph.json").read_text())
+        assert {"name": "Changed", "imports": []} in graph
+
+    def test_graph_failure_falls_back_to_changed_files(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "Changed.lean").write_text("def changed := 1\n")
+        github_output = tmp_path / "out.txt"
+        monkeypatch.setenv("PR_NUMBER", "1")
+        monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+        monkeypatch.setattr(discover_files, "get_changed_lean_files", lambda pr: ["Changed.lean"])
+
+        def boom(index):
+            raise OSError("disk on fire")
+        monkeypatch.setattr(discover_files, "build_import_graph", boom)
+
+        discover_files.main()
+
+        assert "discovered_files=Changed.lean\n" in github_output.read_text()
+        # Fallback still writes the (empty) graph file: a lake_graph.json
+        # planted by PR-controlled build code must never survive to review.
+        assert (tmp_path / "lake_graph.json").read_text() == "[]"

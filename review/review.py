@@ -19,7 +19,11 @@ import urllib3.util.connection as urllib3_connection
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 
-from leanrepo_common.lean_utils import strip_comments, FileCache, file_path_to_module_name
+from leanrepo_common.diff_utils import parse_git_diff_header, unquote_git_path
+from leanrepo_common.lean_utils import (
+    scrub_line, strip_comments_preserve_strings,
+    FileCache, file_path_to_module_name,
+)
 from leanrepo_common.llm_provider import (
     LLMProvider, ContentPart, TokenUsage, create_provider,
     RunHealth, BudgetExceededError, is_hard_llm_failure, _reraise_if_fatal,
@@ -52,7 +56,9 @@ OPERATING_CONTRACT = _read_prompt_file("_operating_contract.md")
 class ReferenceMappingEntry(BaseModel):
     paper_result: str = Field(description="The theorem/definition as stated in the paper (section number, statement).")
     mathematical_content: str = Field(description="The precise mathematical content (hypotheses, conclusion, objects) that any correct formalization must preserve.")
-    status: Literal["Present", "Missing", "Partial"] = Field(description="Whether the diff contains a corresponding formalization.")
+    status: Literal["Present", "Missing", "Partial"] = Field(description="Whether the diff contains a corresponding formalization. Use Partial (with deviations_from_source filled) for present-but-different statements.")
+    cited_source: str = Field(default="", description="When the paper result is itself cited from another work (an admitted external lemma), the ULTIMATE source (paper + theorem number). The cited source, not the paper under review, governs the admitted statement.")
+    deviations_from_source: str = Field(default="", description="For an admitted external: every hypothesis, quantifier shape, or inequality of the cited source's statement that the paper's restatement or the Lean statement drops, relaxes (strict→non-strict, integer→real), or substitutes. Empty when faithful or not applicable.")
 
 class ChecklistItem(BaseModel):
     concept: str = Field(description="The mathematical concept or theorem name.")
@@ -73,8 +79,17 @@ class Finding(BaseModel):
     description: str = Field(description="Description of the finding.")
     location: str = Field(default="", description="File path and line/range if applicable, e.g. 'MyFile.lean:42' or 'MyFile.lean:42-55'.")
     evidence: str = Field(default="", description="What grounds this finding: the specific paper section/checklist item, the repository symbol or definition being misused, or the compiler/toolchain output it rests on. Cite specifics so a human can verify it independently.")
+    evidence_source: Literal["compiler", "kernel", "paper_or_spec", "trusted_repo_reference", "lean_source", "downstream_contract", "docstring_only", "model_reasoning"] = Field(default="model_reasoning", description="The primary source of truth for this finding. Docstrings are intent metadata, never sufficient evidence for a blocking correctness finding; model_reasoning is advisory only.")
+    evidence_locator: str = Field(default="", description="Exact locator for the evidence source: command/output, paper section/page/statement, declaration and line, ArkLib/component path, or downstream consumer line.")
+    evidence_medium: Literal["pdf", "tex", "markdown", "plain_text", "lean", "compiler", "kernel", "repository", "downstream", "unknown"] = Field(default="unknown", description="The medium containing the cited evidence. PDF-derived paper evidence requires visual confirmation by the verifier; logical section/theorem anchors are preferred over page coordinates.")
+    confirmation_method: Literal["unconfirmed", "visual", "text", "compiler", "kernel", "downstream"] = Field(default="unconfirmed", description="Internal confirmation method set by the verifier, never by the initial reviewer. PDF evidence is blocking only after visual confirmation.")
+    verification_status: Literal["unverified", "confirmed"] = Field(default="unverified", description="Internal precision-stage status. The adversarial verifier sets this to confirmed; do not set it based on the initial review alone.")
     confidence: Literal["high", "medium", "low"] = Field(default="medium", description="Your confidence that this finding is genuinely correct and not a false positive.")
     suggested_fix: str = Field(default="", description="Suggested fix or corrected code snippet, if applicable.")
+    severity: Literal["critical", "high", "medium", "low"] = Field(default="medium", description="Impact if true: critical/high findings are blockers, medium/low findings are advisory unless the deterministic rules say otherwise.")
+    category: Literal["correctness", "build", "specification", "source_fidelity", "contract", "dependency", "trust", "style", "generalization", "proof", "documentation"] = Field(default="correctness", description="Primary finding category. Use source_fidelity when a Lean statement (or the paper's own restatement) deviates from the ORIGINAL cited source of an admitted external result. Use style/generalization/proof/documentation for advisory feedback rather than presenting it as a correctness issue.")
+    disconfirming_check: str = Field(default="", description="A concrete check that could show this finding is false, such as a compiler command, declaration lookup, or specification passage.")
+    how_to_confirm: str = Field(default="", description="The shortest actionable way for a maintainer to confirm and resolve this finding.")
 
 class FileReview(BaseModel):
     analysis: str = Field(default="", description="Step-by-step analysis BEFORE findings: (1) What does the changed code do mathematically? (2) How do changes relate to the spec checklist? (3) What are the riskiest aspects? (4) Any ambiguities in mathematical intent?")
@@ -122,6 +137,8 @@ class FindingVerdict(BaseModel):
         description="'confirmed' = the finding is a real issue; 'refuted' = the finding is wrong / a false positive; 'uncertain' = cannot be determined from the provided context."
     )
     reasoning: str = Field(description="Brief justification, citing the specific code or specification that confirms or refutes the finding.")
+    confirmation_method: Literal["unconfirmed", "visual", "text", "compiler", "kernel", "downstream"] = Field(default="unconfirmed", description="How the verifier confirmed the finding. Use visual for PDF-derived evidence; do not claim visual confirmation without inspecting the original PDF representation.")
+    corrected_severity: Literal["", "critical", "high", "medium", "low"] = Field(default="", description="Optional: when the finding is CONFIRMED as a true fact but the reviewer over-escalated its impact, the corrected (lower) severity. The pipeline applies corrections downward only — a verifier can never raise severity — and ignores this field unless verdict is confirmed.")
 
 
 # --- Token Usage Tracking ---
@@ -171,6 +188,8 @@ ENV_MAX_RUN_TOKENS = "LLM_MAX_RUN_TOKENS"
 ENV_MAX_RUN_COST = "LLM_MAX_RUN_COST"
 ENV_BUDGET_MODE = "LLM_BUDGET_MODE"
 ENV_LOUD_EXIT = "LLM_LOUD_EXIT"
+ENV_BUILD_SUCCEEDED = "BUILD_SUCCEEDED"
+ENV_BUILD_STATUS = "BUILD_STATUS"
 # Process exit code when loud-exit is enabled AND the run degraded. Applied ONLY at
 # the entrypoint via sys.exit(main()) — never inside a finally, and only after the
 # comment has been written. Do NOT set this action as a required check with loud-exit
@@ -316,7 +335,7 @@ def _emit_degraded_review(per_file_reviews: dict, records: "Optional[List[Contex
     if completed:
         comment += "\n**Partial results — reviews that completed before the run stopped:**\n"
         for fp, text in completed.items():
-            comment += f"\n<details><summary>📄 **Review for `{fp}`**</summary>\n\n{text}\n</details>\n"
+            comment += f"\n<details><summary>📄 **Review for `{_safe_md_path(fp)}`**</summary>\n\n{text}\n</details>\n"
     # The manifest belongs on the degraded path too — it is most diagnostic exactly when
     # the run aborted (what context HAD been loaded before it stopped).
     comment += _render_reference_manifest(records)
@@ -390,11 +409,10 @@ def _load_prompt(template_name: str, replacements: Dict[str, str]) -> str:
     with open(path, "r") as f:
         template = f.read()
 
-    # Validate: warn about unreplaced placeholders after substitution
-    result = template
-    for key, value in replacements.items():
-        placeholder = "{{" + key + "}}"
-        result = result.replace(placeholder, value)
+    # Substitute in one pass. Re-scanning the already-substituted values lets
+    # attacker-controlled source such as ``{{VERDICT_RULES}}`` acquire prompt
+    # structure when a later replacement happens to use that key.
+    result = _render(template, replacements)
 
     # Check for any remaining unreplaced placeholders
     remaining = re.findall(r'\{\{([A-Za-z_]+)\}\}', result)
@@ -406,10 +424,11 @@ def _load_prompt(template_name: str, replacements: Dict[str, str]) -> str:
 
 def _render(template: str, replacements: Dict[str, str]) -> str:
     """Apply {{KEY}} substitutions to a template string."""
-    result = template
-    for key, value in replacements.items():
-        result = result.replace("{{" + key + "}}", value)
-    return result
+    return re.sub(
+        r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}",
+        lambda match: replacements.get(match.group(1), match.group(0)),
+        template,
+    )
 
 
 def _fit_replacements_to_budget(
@@ -728,16 +747,19 @@ def get_document_content(urls_str: str, records: "Optional[List[ContextRecord]]"
     logging.info(f"Fetching content from {len(urls)} external references...")
 
     for url in urls:
+        processed_url = ""
+        fallback_delegated = False
         try:
             logging.info(f"Processing URL: {url}")
             processed_url = _normalize_external_url(url)
             response, final_url = _fetch_url_content(processed_url)
             content_type = response.headers.get("Content-Type", "")
+            final_path = urlparse(final_url).path.lower()
 
-            if "application/pdf" in content_type or final_url.lower().endswith('.pdf'):
+            if "application/pdf" in content_type or final_path.endswith('.pdf'):
                 parts.append(ContentPart(type="pdf", data=response.content, mime_type="application/pdf"))
                 logging.info(f"Added PDF part from: {url}")
-            elif "text/html" in content_type or final_url.lower().endswith(('.html', '.htm')):
+            elif "text/html" in content_type or final_path.endswith(('.html', '.htm')):
                 soup = BeautifulSoup(response.content, "html.parser")
                 for element in soup(["script", "style", "nav", "footer", "header"]):
                     element.decompose()
@@ -756,9 +778,21 @@ def get_document_content(urls_str: str, records: "Optional[List[ContextRecord]]"
             # R6: the errors list renders into the PR comment's Context Warnings —
             # keep the exception body out of it; log the detail (class/status/truncated).
             logging.error(f"Error processing document '{url}': {describe_exc(e)}")
-            errors.append(f"Error processing document '{url}'.")
+            # A validated public PDF may still reject ordinary HTTP clients (for
+            # example, a Cloudflare challenge). OpenRouter can fetch public PDF
+            # URLs itself, so preserve the URL as a provider-native file part.
+            # Never use this fallback for validation failures: doing so would
+            # bypass the workflow's SSRF boundary.
+            if (isinstance(e, requests.RequestException) and processed_url and
+                    urlparse(processed_url).path.lower().endswith(".pdf")):
+                parts.append(ContentPart(type="pdf", data=processed_url, mime_type="application/pdf"))
+                fallback_delegated = True
+                logging.info(f"Delegated PDF URL fallback to provider: {url}")
+                errors.append(f"Could not fetch PDF reference '{url}' locally; delegated the public URL to the provider.")
+            else:
+                errors.append(f"Error processing document '{url}'.")
             if records is not None:
-                records.append(ContextRecord(url, "external", False))
+                records.append(ContextRecord(url, "external", fallback_delegated))
     return parts, errors
 
 def get_local_reference_parts(paths_str: str, records: "Optional[List[ContextRecord]]" = None) -> Tuple[List[ContentPart], List[str]]:
@@ -898,6 +932,8 @@ def _added_line_numbers(diff_text: str) -> set:
             added.add(current)
         elif line.startswith('-'):
             pass  # deletion: does not advance the new-file counter
+        elif line == r'\ No newline at end of file':
+            continue  # unified-diff metadata, not a source line
         else:
             current += 1  # context line advances the new-file counter
     return added
@@ -979,23 +1015,27 @@ def scan_escape_hatches(diff_by_file: Dict[str, str]) -> Dict[str, list]:
             # is approximate; it is only reached when the accurate full-file scan
             # is impossible.
             comment_depth = 0
+            in_string = False
             for line in _extract_added_lines(diff):
-                code, comment_depth = strip_comments(line, comment_depth)
+                code, comment_depth, in_string = strip_comments_preserve_strings(
+                    line, comment_depth, in_string,
+                )
                 if not code.strip():
                     continue
                 for keyword in ESCAPE_HATCHES:
-                    if re.search(rf'\b{keyword}\b', code) and not _is_in_string(keyword, code):
+                    if re.search(rf'\b{keyword}\b', code):
                         introduced.append((file_path, keyword, line.strip()[:120]))
             continue
 
         full_lines = full_content.splitlines(keepends=True)
         comment_depth = 0
+        in_string = False
         for i, line in enumerate(full_lines, 1):
-            code, comment_depth = strip_comments(line, comment_depth)
+            code, comment_depth, in_string = scrub_line(line, comment_depth, in_string)
             if not code.strip():
                 continue
             for keyword in ESCAPE_HATCHES:
-                if re.search(rf'\b{keyword}\b', code) and not _is_in_string(keyword, code):
+                if re.search(rf'\b{keyword}\b', code):
                     snippet = line.strip()[:120]
                     if i in added:
                         introduced.append((file_path, keyword, snippet))
@@ -1021,14 +1061,17 @@ def format_prechecks(scan: Dict[str, list]) -> str:
         lines = []
         for file_path, keyword, snippet in scan["introduced"]:
             allow = " *(allow-listed — does not affect verdict)*" if keyword in ESCAPE_HATCH_ALLOWLIST else ""
-            lines.append(f"- **`{keyword}`** introduced in `{file_path}`{allow}: `{snippet}`")
+            lines.append(
+                f"- **`{keyword}`** introduced in `{_safe_md_path(file_path)}`{allow}: "
+                f"`{_safe_md_path(snippet)}`"
+            )
         parts.append("**Escape hatches introduced in this PR (triggers hard verdict rule):**\n" + "\n".join(lines))
     if scan["preexisting"]:
-        lines = [f"- `{keyword}` in `{file_path}` line {ln}: `{snippet}`"
+        lines = [f"- `{keyword}` in `{_safe_md_path(file_path)}` line {ln}: `{_safe_md_path(snippet)}`"
                  for file_path, keyword, ln, snippet in scan["preexisting"]]
         parts.append("**Pre-existing escape hatches in touched files (context only, does not affect verdict):**\n" + "\n".join(lines))
     if scan["large_files"]:
-        lines = [f"- **Large file**: `{file_path}` is {n} lines (exceeds {LARGE_FILE_LINE_THRESHOLD}-line lint threshold)"
+        lines = [f"- **Large file**: `{_safe_md_path(file_path)}` is {n} lines (exceeds {LARGE_FILE_LINE_THRESHOLD}-line lint threshold)"
                  for file_path, n in scan["large_files"]]
         parts.append("**File size (context only, does not affect verdict):**\n" + "\n".join(lines))
 
@@ -1173,12 +1216,29 @@ def _build_contents(prompt_text: str, external_parts: Optional[List[ContentPart]
     return stable + [ContentPart(type="text", data=prompt_text)]
 
 
+def get_lake_graph_str() -> str:
+    """The serialized module import graph from the discover step.
+
+    Prefers the file path in LAKE_GRAPH_PATH (a real repo's graph can exceed
+    Linux's 128 KiB per-env-string cap, so the discover step hands over a file,
+    not a value); the inline LAKE_GRAPH env remains as a fallback for local
+    runs and tests."""
+    path = (os.environ.get('LAKE_GRAPH_PATH') or '').strip()
+    if path:
+        try:
+            with open(path, 'r', errors='replace') as f:
+                return f.read()
+        except OSError as e:
+            logging.warning(f"Could not read LAKE_GRAPH_PATH {path!r}: {describe_exc(e)}")
+    return os.environ.get('LAKE_GRAPH', '')
+
+
 def run_triage(provider: LLMProvider, diff_by_file: Dict[str, str], spec_checklist: str, additional_comments: str, model_name: str) -> List[ReviewCluster]:
     """Triage Agent: Groups changed files into review clusters based on dependencies and coupling."""
     all_diffs = "\n".join([f"--- {f} ---\n{d}" for f, d in diff_by_file.items()])
 
-    # Use lake graph from discover step (avoids redundant subprocess call)
-    dep_graph = os.environ.get('LAKE_GRAPH', '') or "Dependency graph not available."
+    # Use the import graph from the discover step (avoids rebuilding it)
+    dep_graph = get_lake_graph_str() or "Dependency graph not available."
 
     # Generate type signatures of changed files for semantic clustering
     changed_files_str = ','.join(f for f in diff_by_file.keys() if f.endswith('.lean'))
@@ -1239,6 +1299,7 @@ def analyze_specification(provider: LLMProvider, external_parts: List[ContentPar
             "FILE_DIFFS": all_diffs,
             "REPO_STRUCTURE": summary_context or "No repository structure available.",
             "DEPENDENCY_GRAPH": lake_graph or "Dependency graph not available.",
+            "PAPER_LEAN_EVIDENCE": os.environ.get("PAPER_LEAN_EVIDENCE", "No paper/Lean source index available."),
         }
         replacements = _fit_prompt_to_budget(
             "analyze_spec.md",
@@ -1274,6 +1335,10 @@ def analyze_specification(provider: LLMProvider, external_parts: List[ContentPar
                     checklist_str += f"- {status_icon} **{entry.paper_result}**\n"
                     checklist_str += f"  - Mathematical content: {entry.mathematical_content}\n"
                     checklist_str += f"  - Status: {entry.status}\n"
+                    if entry.cited_source:
+                        checklist_str += f"  - Cited source (governs the admitted statement): {entry.cited_source}\n"
+                    if entry.deviations_from_source:
+                        checklist_str += f"  - ⚠️ Deviations from cited source: {entry.deviations_from_source}\n"
                 checklist_str += "\n"
 
             # Checklist items
@@ -1307,14 +1372,14 @@ def get_pr_diff(pr_number: str) -> Tuple[str, List[str]]:
     else:
         cmd = ["gh", "pr", "diff", pr_number]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
         diff = result.stdout.strip()
         if not diff:
             logging.warning("PR diff is empty.")
             errors.append("Could not retrieve PR diff or diff is empty.")
         logging.info("Successfully fetched PR diff.")
         return diff, errors
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
         # R6/public-log: do not echo raw git stderr (may carry token-adjacent detail);
         # log a sanitized description, surface a generic error upward.
         logging.error(f"Failed to fetch PR diff for PR #{pr_number}: {describe_exc(e)}")
@@ -1383,17 +1448,21 @@ def split_diff_into_files(diff_content: str) -> Dict[str, str]:
     """Splits a full git diff into a dictionary of per-file diffs.
     Handles renames by using the new (b/) path as the key."""
     files = {}
-    file_diffs = re.split(r'(?=^diff --git a/.+ b/.+$)', diff_content, flags=re.MULTILINE)
+    # Split on every `diff --git ` line start, not on the full unquoted-path
+    # pattern: with core.quotePath=true (git's default) non-ASCII paths arrive
+    # C-quoted and a `a/(.+) b/(.+)` pattern misses them entirely — the file
+    # would silently escape both review and the coverage check.
+    file_diffs = re.split(r'(?=^diff --git )', diff_content, flags=re.MULTILINE)
     for file_diff in file_diffs:
         if not file_diff.strip():
             continue
-        match = re.search(r'^diff --git a/(.+) b/(.+)$', file_diff, re.MULTILINE)
-        if match:
-            new_path = match.group(2)
+        parsed = parse_git_diff_header(file_diff.splitlines()[0])
+        if parsed:
+            new_path = parsed[1]
             # For renames, check the rename header
             rename_match = re.search(r'^rename to (.+)$', file_diff, re.MULTILINE)
             if rename_match:
-                new_path = rename_match.group(1)
+                new_path = unquote_git_path(rename_match.group(1))
             files[new_path] = file_diff
     return files
 
@@ -1402,22 +1471,56 @@ def _finding_lines(f: Finding, include_fix: bool = True) -> List[str]:
     confidence so a human can validate it."""
     loc = f" (`{f.location}`)" if f.location else ""
     conf = f" _(confidence: {f.confidence})_" if f.confidence else ""
-    lines = [f"- {f.description}{loc}{conf}"]
+    tags = []
+    if f.category:
+        tags.append(f.category)
+    if f.severity:
+        tags.append(f.severity)
+    tag_text = f" _({' · '.join(tags)})_" if tags else ""
+    lines = [f"- {f.description}{loc}{tag_text}{conf}"]
     if f.evidence:
         lines.append(f"  - Evidence: {f.evidence}")
+    if f.evidence_source:
+        lines.append(f"  - Evidence source: `{f.evidence_source}`")
+    if f.evidence_locator:
+        lines.append(f"  - Evidence locator: `{f.evidence_locator}`")
+    if f.evidence_medium != "unknown":
+        lines.append(f"  - Evidence medium: `{f.evidence_medium}`")
+    if f.confirmation_method != "unconfirmed":
+        lines.append(f"  - Confirmation method: `{f.confirmation_method}`")
+    if f.verification_status == "confirmed":
+        lines.append("  - Verification: independently confirmed")
     if include_fix and f.suggested_fix:
         lines.append(f"  - Suggested fix: {f.suggested_fix}")
+    if f.how_to_confirm:
+        lines.append(f"  - How to confirm: {f.how_to_confirm}")
+    if f.disconfirming_check:
+        lines.append(f"  - Disconfirming check: {f.disconfirming_check}")
     return lines
 
 
 def _format_file_review(review: FileReview, file_path: str) -> str:
-    """Formats a structured FileReview into markdown."""
+    """Formats a structured FileReview into markdown.
+
+    The per-file model verdict is explicitly labeled as an agent assessment;
+    the overall deterministic policy is rendered separately. Findings that do
+    not meet the blocking grounding contract remain visible in an advisory
+    details block instead of looking like ordinary blocking issues.
+    """
     parts = []
 
     if review.analysis:
         parts.append(f"**Analysis:**\n{review.analysis}\n")
 
-    parts.append(f"**Verdict:** {review.verdict}\n")
+    parts.append(f"**Agent assessment:** {review.verdict}\n")
+
+    critical = [f for f in review.critical_misformalizations if _has_blocking_grounding(f)]
+    lean_issues = [f for f in review.lean_issues if _has_blocking_grounding(f)]
+    advisory = [
+        *[f for f in review.critical_misformalizations if not _has_blocking_grounding(f)],
+        *[f for f in review.lean_issues if not _has_blocking_grounding(f)],
+        *review.nitpicks,
+    ]
 
     if review.checklist_results:
         parts.append("**Checklist Verification:**")
@@ -1426,29 +1529,29 @@ def _format_file_review(review: FileReview, file_path: str) -> str:
             parts.append(f"- {icon} **{cr.item}**: {cr.explanation}")
         parts.append("")
 
-    if review.critical_misformalizations:
+    if critical:
         parts.append("**Critical Misformalizations:**")
-        for f in review.critical_misformalizations:
+        for f in critical:
             parts.extend(_finding_lines(f))
         parts.append("")
     else:
         parts.append("**Critical Misformalizations:** None\n")
 
-    if review.lean_issues:
+    if lean_issues:
         parts.append("**Lean 4 / Mathlib Issues:**")
-        for f in review.lean_issues:
+        for f in lean_issues:
             parts.extend(_finding_lines(f))
         parts.append("")
     else:
         parts.append("**Lean 4 / Mathlib Issues:** None\n")
 
-    if review.nitpicks:
-        parts.append("**Nitpicks:**")
-        for f in review.nitpicks:
+    if advisory:
+        parts.append("<details><summary>💡 <b>Advisory feedback</b></summary>\n")
+        for f in advisory:
             parts.extend(_finding_lines(f, include_fix=False))
-        parts.append("")
+        parts.append("\n</details>\n")
     else:
-        parts.append("**Nitpicks:** None\n")
+        parts.append("**Advisory feedback:** None\n")
 
     return "\n".join(parts)
 
@@ -1534,6 +1637,219 @@ def _diff_for_range(header: str, hunks: List[Tuple[int, int, str]], start_line: 
     inclusive line range [start_line, end_line]. Empty string if none overlap."""
     selected = [text for (hs, he, text) in hunks if hs <= end_line and he >= start_line]
     return header + "".join(selected) if selected else ""
+
+
+_MECHANICAL_BUILD_CLAIM = re.compile(
+    r"\b(?:won['’]?t|will not|does not|doesn't|cannot|can't|fails to|unable to)"
+    r"\s+(?:typecheck|type-check|compile|build|elaborate)|"
+    r"\b(?:unknown identifier|unknown constant|declaration .* not found|type mismatch|failed to synthesize)\b",
+    re.IGNORECASE,
+)
+_COMPILER_EVIDENCE = re.compile(
+    r"\b(?:compiler|toolchain|lake(?:\s+env)?\s+lean|lean_(?:check|typecheck|print)|"
+    r"stderr|stdout|error:\s|diagnostic)\b",
+    re.IGNORECASE,
+)
+_PREEXISTING_DEPENDENCY_LANGUAGE = re.compile(
+    r"\b(?:depend|impact|transitive|rel(?:y|ies)|uses?|calls?|changed code|new code|"
+    r"introduced|downstream|inherited)\b",
+    re.IGNORECASE,
+)
+_NON_BLOCKING_EVIDENCE_SOURCES = {"docstring_only", "model_reasoning"}
+_ADVISORY_CATEGORIES = {"style", "generalization", "proof", "documentation"}
+
+# Ordering for the verifier's downward-only severity correction (survives()).
+_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+_EVIDENCE_SOURCE_MEDIA = {
+    "compiler": {"compiler"},
+    "kernel": {"kernel"},
+    "paper_or_spec": {"pdf", "tex", "markdown", "plain_text", "lean"},
+    "trusted_repo_reference": {"repository", "lean", "downstream"},
+    "lean_source": {"lean"},
+    "downstream_contract": {"downstream", "repository", "lean"},
+}
+
+
+def _finding_location(location: str) -> Tuple[str, Optional[int]]:
+    """Extract a normalized path and first line from a model-supplied location."""
+    if not location:
+        return "", None
+    match = re.search(r"(.+?):(\d+)", location.strip())
+    if not match:
+        return location.strip().lower(), None
+    return match.group(1).strip().lower(), int(match.group(2))
+
+
+def _finding_text(finding: Finding) -> str:
+    return " ".join((finding.description, finding.evidence, finding.suggested_fix)).lower()
+
+
+def _is_pdf_evidence(finding: Finding) -> bool:
+    """Detect PDF-backed evidence, including older findings without the medium field."""
+    if finding.evidence_medium == "pdf":
+        return True
+    locator = f"{finding.evidence_locator} {finding.evidence}".lower()
+    return bool(re.search(r"(?:\.pdf\b|\bpdf\b|arxiv\.org/pdf/)", locator))
+
+
+def _has_blocking_grounding(finding: Finding, require_verification: bool = False) -> bool:
+    """Whether a finding has enough provenance to drive a blocking verdict.
+
+    This is intentionally a conservative gate. The evidence text is still
+    shown to reviewers, but a model assertion without an exact source locator,
+    or a claim based only on a docstring/model reasoning, cannot block a PR.
+    this gate. Only critical/high-severity findings can drive a blocking
+    verdict; medium/low findings remain advisory even when well located.
+    """
+    # Verification is precision metadata: an explicit refutation removes a
+    # finding and confirmation is displayed, but an unavailable or uncertain
+    # verifier must not silently erase a grounded issue from the issue path.
+    # ``require_verification`` remains accepted for compatibility with callers
+    # using the earlier policy. PDF evidence remains special because visual
+    # confirmation is required.
+    return (
+        finding.confidence in ("high", "medium")
+        and finding.severity in ("critical", "high")
+        and finding.category not in _ADVISORY_CATEGORIES
+        and finding.evidence_source not in _NON_BLOCKING_EVIDENCE_SOURCES
+        and bool(finding.evidence.strip())
+        and bool(finding.evidence_locator.strip())
+        and (
+            finding.evidence_source not in _EVIDENCE_SOURCE_MEDIA
+            or finding.evidence_medium in _EVIDENCE_SOURCE_MEDIA[finding.evidence_source]
+        )
+        and (not _is_pdf_evidence(finding) or finding.confirmation_method == "visual")
+    )
+
+
+def _finding_fingerprint(finding: Finding) -> Tuple[str, str, str]:
+    """Build a conservative duplicate key.
+
+    Only exact normalized duplicates are collapsed. This layer must not infer
+    that differently worded reports about the same token are identical; that is
+    semantic work for the agents and verifier.
+    """
+    path, line = _finding_location(finding.location)
+    text = _finding_text(finding)
+    normalized = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    return path, str(line or ""), f"{finding.category}:{' '.join(normalized.split())}"
+
+
+def _deduplicate_finding_lists(
+    per_file_structured: Dict[str, "FileReview"],
+    cross_file_structured: Optional["CrossFileAnalysis"],
+) -> int:
+    """Deduplicate findings across chunk/category/agent boundaries in place."""
+    seen = set()
+    removed = 0
+    lists = []
+    for review in per_file_structured.values():
+        if review is not None:
+            lists.extend((review, name) for name in ("critical_misformalizations", "lean_issues", "nitpicks"))
+    if cross_file_structured is not None:
+        lists.extend((cross_file_structured, name) for name in _CROSS_FILE_CATEGORIES)
+
+    # Keep blockers ahead of advisory entries when duplicate reports compete.
+    lists.sort(key=lambda item: {"critical_misformalizations": 0, "lean_issues": 1, "composition_issues": 1,
+                                  "escape_hatch_impact": 1, "external_dependency_issues": 1,
+                                  "missing_cross_file_verification": 1, "nitpicks": 2}.get(item[1], 3))
+    for owner, name in lists:
+        kept = []
+        for finding in getattr(owner, name):
+            key = _finding_fingerprint(finding)
+            if key in seen:
+                removed += 1
+                continue
+            seen.add(key)
+            kept.append(finding)
+        setattr(owner, name, kept)
+    return removed
+
+
+def _filter_ungrounded_findings(
+    per_file_structured: Dict[str, "FileReview"],
+    cross_file_structured: Optional["CrossFileAnalysis"],
+    precheck_scan: Dict[str, list],
+    build_succeeded: bool,
+) -> List[str]:
+    """Apply deterministic boundaries around common false-positive classes.
+
+    The model remains responsible for semantic judgment. This function only
+    removes claims that contradict facts the workflow itself established: a
+    successful build cannot be used as evidence for a bare build failure claim,
+    and a pre-existing escape hatch is not a newly introduced PR defect unless
+    the finding explicitly discusses dependency/impact.
+    """
+    notes: List[str] = []
+    preexisting = precheck_scan.get("preexisting", [])
+
+    # `verification_status` is an internal pipeline field. Reset any value
+    # emitted by the initial model before the independent verifier gets a
+    # chance to confirm findings; otherwise the model could self-certify its
+    # own report by returning ``confirmed`` in structured JSON.
+    for review in per_file_structured.values():
+        if review is not None:
+            for name in ("critical_misformalizations", "lean_issues", "nitpicks"):
+                for finding in getattr(review, name):
+                    finding.confirmation_method = "unconfirmed"
+                    finding.verification_status = "unverified"
+    if cross_file_structured is not None:
+        for name in _CROSS_FILE_CATEGORIES:
+            for finding in getattr(cross_file_structured, name):
+                finding.confirmation_method = "unconfirmed"
+                finding.verification_status = "unverified"
+
+    def should_drop(finding: Finding) -> Optional[str]:
+        text = _finding_text(finding)
+        # A suggested fix may legitimately say "if this does not typecheck";
+        # it is not evidence that the finding itself is a build claim. Restrict
+        # this mechanical filter to the report and its cited evidence.
+        claim_text = " ".join((finding.description, finding.evidence)).lower()
+        compiler_evidence = (
+            finding.evidence_source in {"compiler", "kernel"}
+            or bool(_COMPILER_EVIDENCE.search(
+                " ".join((finding.evidence, finding.evidence_locator))
+            ))
+        )
+        if (build_succeeded and _MECHANICAL_BUILD_CLAIM.search(claim_text)
+                and not compiler_evidence):
+            return "successful workflow build; no compiler/toolchain evidence supplied"
+
+        path, line = _finding_location(finding.location)
+        for old_path, keyword, old_line, _snippet in preexisting:
+            if path != old_path.lower() or line is None or abs(line - old_line) > 1:
+                continue
+            # A suggested fix is remediation advice, not evidence that the PR
+            # introduced a dependency. Otherwise a model could keep a
+            # pre-existing `sorry` finding alive merely by writing
+            # "update downstream callers" in its fix field.
+            report_text = " ".join((finding.description, finding.evidence)).lower()
+            if (re.search(rf"\b{re.escape(keyword)}\b", text, re.IGNORECASE)
+                    and not _PREEXISTING_DEPENDENCY_LANGUAGE.search(report_text)):
+                return f"pre-existing `{keyword}` at {old_path}:{old_line}; no PR-introduced dependency/impact claimed"
+        return None
+
+    owners = []
+    for review in per_file_structured.values():
+        if review is not None:
+            owners.extend((review, name) for name in ("critical_misformalizations", "lean_issues", "nitpicks"))
+    if cross_file_structured is not None:
+        owners.extend((cross_file_structured, name) for name in _CROSS_FILE_CATEGORIES)
+
+    for owner, name in owners:
+        kept = []
+        for finding in getattr(owner, name):
+            reason = should_drop(finding)
+            if reason:
+                notes.append(f"{finding.description} ({finding.location or 'no location'}): {reason}.")
+            else:
+                kept.append(finding)
+        setattr(owner, name, kept)
+
+    removed_duplicates = _deduplicate_finding_lists(per_file_structured, cross_file_structured)
+    if removed_duplicates:
+        notes.append(f"{removed_duplicates} exact duplicate finding(s) collapsed across review sections/chunks.")
+    return notes
 
 
 def _merge_file_reviews(reviews: List[FileReview]) -> Optional[FileReview]:
@@ -1739,11 +2055,18 @@ def _format_cross_file(analysis: CrossFileAnalysis) -> str:
         sections.append(f"**Cross-File Analysis:**\n{analysis.analysis}\n")
 
     def _fmt_findings(title: str, findings: list[Finding]) -> str:
-        if not findings:
+        blocking = [f for f in findings if _has_blocking_grounding(f)]
+        advisory = [f for f in findings if not _has_blocking_grounding(f)]
+        if not blocking and not advisory:
             return f"**{title}:** None"
-        lines = [f"**{title}:**"]
-        for f in findings:
+        lines = [f"**{title}:**"] if blocking else []
+        for f in blocking:
             lines.extend(_finding_lines(f))
+        if advisory:
+            lines.append(f"<details><summary>💡 <b>{title} (advisory)</b></summary>")
+            for f in advisory:
+                lines.extend(_finding_lines(f, include_fix=False))
+            lines.append("</details>")
         return "\n".join(lines)
 
     sections.append(_fmt_findings("Cross-File Composition Issues", analysis.composition_issues))
@@ -1821,6 +2144,15 @@ def find_dependent_files(lake_graph_str: str, changed_files: set, repo_files_by_
         graph = json.loads(lake_graph_str)
     except (json.JSONDecodeError, TypeError):
         return {}
+    if not isinstance(graph, list):
+        return {}
+    graph = [
+        module for module in graph
+        if isinstance(module, dict)
+        and isinstance(module.get("name"), str)
+        and isinstance(module.get("imports", []), list)
+        and all(isinstance(import_name, str) for import_name in module.get("imports", []))
+    ]
 
     changed_modules = {file_path_to_module_name(f) for f in changed_files}
     dependent_modules = {
@@ -1912,10 +2244,20 @@ def _merge_cross_file(base: Optional[CrossFileAnalysis], extra: CrossFileAnalysi
     return base
 
 
-def _format_synthesis(summary: SynthesisSummary) -> str:
-    """Formats a structured SynthesisSummary into markdown."""
+def _format_synthesis(summary: SynthesisSummary, precheck_summary: Optional[str] = None) -> str:
+    """Formats a structured SynthesisSummary into markdown.
+
+    Synthesis is a narrative aggregation step, not an additional source of
+    verdict facts. Its findings are therefore labeled as context and use the
+    same grounding/advisory split as per-file reviews; the deterministic
+    verdict and basis rendered above remain authoritative.
+    """
     parts = [f"**TL;DR:** {summary.tldr}\n"]
-    parts.append(f"**Mechanical Pre-Check Results:** {summary.precheck_summary}\n")
+    # Mechanical facts are authoritative and must not be paraphrased by the
+    # synthesis model. The optional argument is used by the orchestration path;
+    # retaining the fallback keeps this formatter useful in isolated callers.
+    exact_prechecks = precheck_summary if precheck_summary is not None else summary.precheck_summary
+    parts.append(f"**Mechanical Pre-Check Results:** {exact_prechecks}\n")
 
     if summary.checklist_coverage:
         parts.append(f"**Checklist Coverage:** {summary.checklist_coverage}\n")
@@ -1923,19 +2265,26 @@ def _format_synthesis(summary: SynthesisSummary) -> str:
     if summary.cross_file_summary:
         parts.append(f"**Cross-File Issues:** {summary.cross_file_summary}\n")
 
-    if summary.critical_misformalizations:
-        parts.append("**Critical Misformalizations:**")
-        for f in summary.critical_misformalizations:
-            parts.extend(_finding_lines(f))
-        parts.append("")
+    synthesized = [
+        ("Critical Misformalizations", summary.critical_misformalizations),
+        ("Key Lean 4 / Mathlib Issues", summary.key_lean_issues),
+    ]
+    for title, findings in synthesized:
+        blocking = [f for f in findings if _has_blocking_grounding(f)]
+        advisory = [f for f in findings if not _has_blocking_grounding(f)]
+        if blocking:
+            parts.append(f"**{title} (synthesis context; not verdict basis):**")
+            for f in blocking:
+                parts.extend(_finding_lines(f))
+            parts.append("")
+        if advisory:
+            parts.append(f"<details><summary>💡 <b>{title} (advisory synthesis context)</b></summary>\n")
+            for f in advisory:
+                parts.extend(_finding_lines(f, include_fix=False))
+            parts.append("\n</details>\n")
 
-    if summary.key_lean_issues:
-        parts.append("**Key Lean 4 / Mathlib Issues:**")
-        for f in summary.key_lean_issues:
-            parts.extend(_finding_lines(f))
-        parts.append("")
-
-    parts.append(f"**Overall Verdict:** {summary.overall_verdict}")
+    parts.append("_The deterministic verdict and basis above are authoritative; this synthesis is context only._\n")
+    parts.append(f"**Synthesis Agent Assessment:** {summary.overall_verdict}")
     return "\n".join(parts)
 
 
@@ -1987,7 +2336,7 @@ def synthesize_overall_summary(provider: LLMProvider, per_file_reviews: Dict[str
         logging.info("Synthesizing overall summary...")
         contents = _build_contents(prompt)
         summary = _call_provider(provider, model_name, contents, SynthesisSummary, thinking_budget=THINKING_BUDGET_LOW)
-        formatted = _format_synthesis(summary)
+        formatted = _format_synthesis(summary, precheck_summary=pre_check_findings)
         return summary, formatted
     except Exception as e:
         _reraise_if_fatal(e)  # budget/hard → re-raised to the handler that records + contains it
@@ -1997,7 +2346,8 @@ def synthesize_overall_summary(provider: LLMProvider, per_file_reviews: Dict[str
 
 def _verify_one_finding(provider: LLMProvider, finding: Finding, context: str, model: str,
                         budget_parallelism: int = 1,
-                        toolbox: Optional[LeanToolbox] = None) -> FindingVerdict:
+                        toolbox: Optional[LeanToolbox] = None,
+                        external_parts: Optional[List[ContentPart]] = None) -> FindingVerdict:
     """Run the adversarial verifier on a single finding. Raises on API failure.
     With a toolbox, the verifier can check the claim against the Lean toolchain
     (e.g. actually elaborate the code a reviewer says won't typecheck)."""
@@ -2007,25 +2357,30 @@ def _verify_one_finding(provider: LLMProvider, finding: Finding, context: str, m
             "FINDING_DESCRIPTION": finding.description,
             "FINDING_LOCATION": finding.location or "(unspecified)",
             "FINDING_EVIDENCE": finding.evidence or "(none provided)",
+            "FINDING_EVIDENCE_SOURCE": finding.evidence_source or "(unspecified)",
+            "FINDING_EVIDENCE_LOCATOR": finding.evidence_locator or "(unspecified)",
+            "FINDING_EVIDENCE_MEDIUM": finding.evidence_medium or "(unspecified)",
             "CONTEXT": context,
         },
         max_chars=_call_prompt_char_budget(
             provider,
             thinking_budget=THINKING_BUDGET_LOW,
+            external_parts=external_parts,
             parallelism=budget_parallelism,
         ),
         context_label="verify",
         trimmable=("CONTEXT",),
     )
     prompt_text = _load_prompt("verify_finding.md", replacements)
-    contents = _build_contents(prompt_text)
+    contents = _build_contents(prompt_text, external_parts)
     return _call_provider(provider, model, contents, FindingVerdict,
                           thinking_budget=THINKING_BUDGET_LOW, toolbox=toolbox)
 
 
 def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileReview],
                     cross_file_structured: Optional[CrossFileAnalysis], diff_by_file: Dict[str, str],
-                    spec_checklist: str, model: str, max_workers: int = 5) -> List[Tuple[Finding, FindingVerdict]]:
+                    spec_checklist: str, model: str, max_workers: int = 5,
+                    external_parts: Optional[List[ContentPart]] = None) -> List[Tuple[Finding, FindingVerdict]]:
     """Precision stage: independently (adversarially) verify each verdict-driving
     finding — the per-file critical misformalizations and Lean issues, plus all
     cross-file findings. Findings the verifier can *refute* are removed from the
@@ -2089,6 +2444,7 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
             executor.submit(
                 _verify_one_finding,
                 provider, f, ctx, model, max_workers, _make_toolbox(module),
+                external_parts,
             ): f
             for (f, ctx, module) in jobs
         }
@@ -2108,6 +2464,31 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
         if v is not None and v.verdict == "refuted":
             refuted.append((f, v))
             return False
+        if v is not None and v.verdict == "confirmed":
+            # PDF-backed evidence must be visually checked against the original
+            # PDF supplied to this verifier. Text-only confirmation is not enough
+            # because equations/layout may have been lost during extraction.
+            if _is_pdf_evidence(f) and v.confirmation_method != "visual":
+                logging.warning(
+                    "Verifier confirmed a PDF finding without visual confirmation; keeping it advisory: %s",
+                    f.description,
+                )
+            else:
+                f.confirmation_method = v.confirmation_method if v.confirmation_method != "unconfirmed" else "text"
+                f.verification_status = "confirmed"
+                # Severity correction, DOWNWARD only: the verifier may down-rank
+                # a confirmed-but-over-escalated finding without discarding the
+                # underlying true fact. Never upward — a single model must not be
+                # able to push a finding over the blocking severity bar without
+                # the grounding the deterministic gate demands.
+                if (v.corrected_severity
+                        and _SEVERITY_RANK.get(v.corrected_severity, 99)
+                        < _SEVERITY_RANK.get(f.severity, -1)):
+                    logging.info(
+                        "Verifier corrected severity %s -> %s for: %s",
+                        f.severity, v.corrected_severity, f.description[:80],
+                    )
+                    f.severity = v.corrected_severity
         return True
 
     for fp, review in per_file_structured.items():
@@ -2146,6 +2527,11 @@ def _get_diff_lines(diff_text: str) -> set:
             diff_lines.add(current_line)
         elif line.startswith('-'):
             pass  # deleted line, don't advance new-file counter
+        elif line == r'\ No newline at end of file':
+            # This unified-diff metadata is not a source line. Counting it as
+            # context shifts every later line in the hunk and mis-anchors
+            # GitHub inline comments.
+            continue
         else:
             current_line += 1
             diff_lines.add(current_line)  # context line
@@ -2170,42 +2556,56 @@ def _build_line_annotations(per_file_structured: Dict[str, FileReview], diff_by_
             all_findings.append(("🔴 Critical", f))
         for f in review.lean_issues:
             all_findings.append(("🟡 Issue", f))
-        for f in review.nitpicks:
-            all_findings.append(("💡 Nitpick", f))
+        # Inline annotations are reserved for findings that meet the grounding
+        # contract. All other substantive reports remain in the advisory section
+        # of the main review comment; they are not silently discarded.
 
         for severity, finding in all_findings:
+            if not _has_blocking_grounding(finding):
+                continue
             if not finding.location:
                 continue
 
-            m = re.search(r':(\d+)', finding.location)
+            location_path, _ = _finding_location(finding.location)
+            normalized_file_path = file_path.strip().lower().removeprefix("./")
+            if location_path.removeprefix("./") != normalized_file_path:
+                # A model can cite another file in a cross-file explanation;
+                # never attach that finding to the current file by accident.
+                continue
+
+            m = re.search(r':(\d+)(?:-(\d+))?', finding.location)
             if not m:
                 continue
 
-            line_num = int(m.group(1))
-
-            # Check if line is in diff, or try nearby lines
-            target_line = None
-            if line_num in diff_lines:
-                target_line = line_num
-            else:
-                for offset in range(1, 6):
-                    if line_num + offset in diff_lines:
-                        target_line = line_num + offset
-                        break
-                    if line_num - offset in diff_lines:
-                        target_line = line_num - offset
-                        break
-
-            if target_line is None:
-                continue  # line not in diff, can't annotate
+            start_line = int(m.group(1))
+            end_line = int(m.group(2) or m.group(1))
+            target_lines = sorted(line for line in diff_lines if start_line <= line <= end_line)
+            if not target_lines:
+                # Keep the finding in the main comment, but do not invent a
+                # nearby anchor: inline feedback must identify exact changed
+                # code to remain actionable.
+                continue
+            target_line = target_lines[0]
 
             body = f"**{severity}:** {finding.description}"
             if finding.confidence:
                 body += f" _(confidence: {finding.confidence})_"
             if finding.evidence:
                 body += f"\n\n**Evidence:** {finding.evidence}"
+            if finding.evidence_source:
+                body += f"\n\n**Evidence source:** `{finding.evidence_source}`"
+            if finding.evidence_locator:
+                body += f"\n\n**Evidence locator:** `{finding.evidence_locator}`"
+            if finding.evidence_medium != "unknown":
+                body += f"\n\n**Evidence medium:** `{finding.evidence_medium}`"
+            if finding.confirmation_method != "unconfirmed":
+                body += f"\n\n**Confirmation method:** `{finding.confirmation_method}`"
+            if finding.verification_status == "confirmed":
+                body += "\n\n**Verification:** independently confirmed"
             if finding.suggested_fix:
                 body += f"\n\n**Suggested fix:** {finding.suggested_fix}"
+            if finding.how_to_confirm:
+                body += f"\n\n**How to confirm:** {finding.how_to_confirm}"
 
             annotations.append({
                 "path": file_path,
@@ -2222,6 +2622,7 @@ def compute_deterministic_verdict(
     per_file_structured: Dict[str, "FileReview"],
     cross_file_structured: Optional["CrossFileAnalysis"],
     review_incomplete: bool,
+    verification_required: bool = False,
 ) -> Tuple[str, List[str]]:
     """Compute the authoritative overall verdict from mechanical facts and
     structured findings, rather than trusting the synthesis LLM to apply the
@@ -2229,9 +2630,14 @@ def compute_deterministic_verdict(
 
     Rules (worst wins):
       * Introduced, non-allow-listed escape hatch  -> Changes Requested (hard rule)
-      * Any critical misformalization or Lean issue -> Changes Requested
-      * Any cross-file issue                        -> Changes Requested
-      * Only nitpicks                              -> Needs Minor Revisions
+      * Any critical/high-severity, medium/high-confidence, source-grounded
+        critical/Lean issue -> Changes Requested
+      * Any critical/high-severity, medium/high-confidence, source-grounded
+        cross-file issue   -> Changes Requested
+      * Verification may refute and remove findings, but uncertainty does not
+        erase a grounded issue; unconfirmed findings remain visible and can block
+      * Docstring-only, low-confidence, or otherwise ungrounded findings remain advisory
+      * Only nitpicks/advisory findings                -> Needs Minor Revisions
       * A file that could not be fully reviewed     -> at least Needs Minor
         Revisions (a coverage gap must never be certified as Approved)
       * Otherwise                                  -> Approved
@@ -2250,28 +2656,48 @@ def compute_deterministic_verdict(
         bump("Changes Requested")
         reasons.append(f"Escape hatch(es) introduced in this PR ({kws}) — hard verdict rule.")
 
-    # Strict by design: any critical/Lean finding blocks, regardless of a
-    # finding's `confidence`. Confidence is informational (it helps a human
-    # triage), not verdict-gating — we prefer a false block over a missed issue.
-    n_critical = sum(len(r.critical_misformalizations) for r in per_file_structured.values() if r)
-    n_lean = sum(len(r.lean_issues) for r in per_file_structured.values() if r)
+    # Low-confidence model reports remain visible in the comment, but do not
+    # independently block a PR. This is the first R1 step toward separating
+    # recall (showing a plausible issue) from precision (blocking only on a
+    # sufficiently grounded issue); deterministic escape-hatch rules above are
+    # unaffected by model confidence.
+    def blocking(findings: list[Finding]) -> list[Finding]:
+        return [f for f in findings if _has_blocking_grounding(f, verification_required)]
+
+    n_critical = sum(len(blocking(r.critical_misformalizations)) for r in per_file_structured.values() if r)
+    n_lean = sum(len(blocking(r.lean_issues)) for r in per_file_structured.values() if r)
+    n_advisory_substantive = sum(
+        sum(1 for f in r.critical_misformalizations + r.lean_issues if not _has_blocking_grounding(f, verification_required))
+        for r in per_file_structured.values() if r
+    )
     n_nit = sum(len(r.nitpicks) for r in per_file_structured.values() if r)
     if n_critical or n_lean:
         bump("Changes Requested")
         reasons.append(f"{n_critical} critical misformalization(s) and {n_lean} Lean/Mathlib issue(s) across files.")
-    elif n_nit:
+    elif n_nit or n_advisory_substantive:
         bump("Needs Minor Revisions")
-        reasons.append(f"{n_nit} nitpick(s) only.")
+        advisory_parts = []
+        if n_nit:
+            advisory_parts.append(f"{n_nit} nitpick(s)")
+        if n_advisory_substantive:
+            advisory_parts.append(f"{n_advisory_substantive} unconfirmed substantive finding(s)")
+        reasons.append(" and ".join(advisory_parts) + ".")
 
     if cross_file_structured is not None:
         cf = cross_file_structured
-        cf_count = (
-            len(cf.composition_issues) + len(cf.escape_hatch_impact)
-            + len(cf.external_dependency_issues) + len(cf.missing_cross_file_verification)
+        cf_blocking = sum(
+            len(blocking(getattr(cf, cat))) for cat in _CROSS_FILE_CATEGORIES
         )
-        if cf_count:
+        cf_advisory = sum(
+            sum(1 for f in getattr(cf, cat) if not _has_blocking_grounding(f, verification_required))
+            for cat in _CROSS_FILE_CATEGORIES
+        )
+        if cf_blocking:
             bump("Changes Requested")
-            reasons.append(f"{cf_count} cross-file issue(s).")
+            reasons.append(f"{cf_blocking} cross-file issue(s).")
+        elif cf_advisory:
+            bump("Needs Minor Revisions")
+            reasons.append(f"{cf_advisory} unconfirmed cross-file issue(s) require review.")
 
     if review_incomplete:
         bump("Needs Minor Revisions")
@@ -2384,6 +2810,22 @@ def main():
     THINKING_BUDGET_HIGH = args.thinking_budget
     THINKING_BUDGET_LOW = max(1024, args.thinking_budget // 5)
 
+    # Delete any stale output files before we run — and before EVERY early
+    # exit below. The Lean build step executes PR-branch lakefile code in this
+    # same workspace BEFORE review.py, and lean_tools run model-directed Lean
+    # IO — either could plant a crafted review_annotations.json /
+    # review_comments.json (posted verbatim by Post Review) or a
+    # review_health.json (read by the shell step). This must precede the
+    # no-Lean-files return and the API_KEY/budget exits: those paths still let
+    # Post Review run, so a planted file would otherwise be posted verbatim.
+    for _stale in ("review_annotations.json", "review_comments.json", REVIEW_HEALTH_FILE):
+        try:
+            os.remove(_stale)
+        except FileNotFoundError:
+            pass
+        except OSError as _e:
+            logging.warning(f"Could not remove stale {_stale}: {describe_exc(_e)}")
+
     diff, diff_errors = get_pr_diff(args.pr_number)
     if diff_errors and not diff:
         logging.error("Aborting review: Could not fetch PR diff. Errors:\n" + "\n".join(diff_errors))
@@ -2442,9 +2884,44 @@ def main():
             "Axiom dependencies and compiler diagnostics are unavailable for this review."
         )
 
-    # Append build output (warnings/errors captured from lake build)
+    paper_lean_evidence = os.environ.get("PAPER_LEAN_EVIDENCE", "")
+    if paper_lean_evidence:
+        repo_context_appendix += f"\n\n{paper_lean_evidence}\n"
+    elif args.spec_refs or args.external_refs:
+        context_warnings.append(
+            "The paper/Lean source index was unavailable despite specification references being configured. "
+            "Paper fidelity must be checked from the supplied references directly."
+        )
+
+    build_status = os.environ.get(ENV_BUILD_STATUS, "").strip().lower()
+    if not build_status:
+        build_status = "success" if os.environ.get(ENV_BUILD_SUCCEEDED, "").lower() in ("1", "true", "yes") else "unavailable"
+    if build_status == "success":
+        repo_context_appendix += (
+            "\n\n**Deterministic workflow fact:** the exact checked-out PR commit passed the "
+            "workflow Lean build before this review ran. Do not report a bare claim that "
+            "the changed code will not typecheck/build unless you provide new compiler or "
+            "toolchain evidence for that claim.\n"
+        )
+    elif build_status == "failure":
+        repo_context_appendix += (
+            "\n\n**Deterministic workflow fact:** the exact checked-out PR commit failed the "
+            "workflow Lean build. Compiler diagnostics below are authoritative for "
+            "mechanical build claims; semantic findings still require independent analysis.\n"
+        )
+    else:
+        repo_context_appendix += (
+            "\n\n**Build-status note:** no workflow build status is available for this "
+            "review. Treat mechanical build claims as requiring explicit compiler or "
+            "toolchain evidence.\n"
+        )
+
+    # Append build output (warnings/errors captured from the explicit workflow
+    # lake build). The action bounds the value before it reaches this process;
+    # retain even a successful build's diagnostics because warnings can explain
+    # a finding without implying that the build failed.
     build_output = os.environ.get("BUILD_OUTPUT", "")
-    if build_output and build_output.strip() and "no warnings" not in build_output.lower():
+    if build_output and build_output.strip():
         repo_context_appendix += f"\n\n**Lake Build Diagnostics (compiler output):**\n{build_output}\n"
 
     # Full repo_context used by cross-file analysis (no per-file filtering).
@@ -2478,19 +2955,6 @@ def main():
     global run_health
     run_health = RunHealth()
 
-    # Delete any stale output files before we run. The Lean build step executes
-    # PR-branch lakefile code in this same workspace BEFORE review.py, and lean_tools
-    # run model-directed Lean IO — either could plant a crafted review_annotations.json
-    # / review_comments.json (posted verbatim by Post Review) or a review_health.json
-    # (read by the shell step). Start from a clean slate so only THIS run's files count.
-    for _stale in ("review_annotations.json", "review_comments.json", REVIEW_HEALTH_FILE):
-        try:
-            os.remove(_stale)
-        except FileNotFoundError:
-            pass
-        except OSError as _e:
-            logging.warning(f"Could not remove stale {_stale}: {describe_exc(_e)}")
-
     hard_budget = budget if budget_mode == "hard" else None
     provider = create_provider(api_key, enable_web_search=enable_web_search, budget=hard_budget)
     # In advisory mode, the configured budget is still tracked and used by
@@ -2522,7 +2986,7 @@ def main():
     # trip / hard LLM failure) aborts the run before these are reached inside the try.
     per_file_reviews, per_file_structured, review_errors = {}, {}, []
     cross_file_text, cross_file_structured = "", None
-    refuted_findings, clusters = [], []
+    refuted_findings, clusters, filtered_findings = [], [], []
 
     try:
         review_context = {
@@ -2534,6 +2998,7 @@ def main():
             "additional_comments": args.additional_comments,
             "review_model": args.review_model,
             "max_workers": args.max_workers,
+            "build_succeeded": build_status == "success",
         }
         
         lean4_checklist_path = os.path.join(ACTION_PATH, "prompts", "lean4_checklist.md")
@@ -2565,7 +3030,7 @@ def main():
         # --- Multi-Agent Orchestration Step 1: Spec Analysis ---
         spec_checklist = analyze_specification(
             provider, external_parts, args.spec_model, all_diffs,
-            summary_context=summary_context, lake_graph=os.environ.get('LAKE_GRAPH', '')
+            summary_context=summary_context, lake_graph=get_lake_graph_str()
         )
         if spec_checklist:
             logging.info("Spec Analysis complete. Handing off checklist to Code Reviewers.")
@@ -2611,6 +3076,7 @@ def main():
                 provider, augmented_ctx, file_path, file_diff, full_content,
                 spec_checklist, external_parts, lean4_checklist, verdict_rules
             )
+
             return file_path, structured_review, formatted_text
 
         per_file_reviews = {}      # file_path -> formatted markdown
@@ -2694,8 +3160,8 @@ def main():
                 logging.warning("Cross-file analysis skipped: per-run budget exhausted.")
         else:
             logging.info("Single file PR — skipping cross-file analysis.")
-            # Deterministic downstream impact note from lake graph
-            lake_graph_str = os.environ.get('LAKE_GRAPH', '')
+            # Deterministic downstream impact note from the import graph
+            lake_graph_str = get_lake_graph_str()
             if lake_graph_str:
                 try:
                     lake_graph_data = json.loads(lake_graph_str)
@@ -2723,7 +3189,7 @@ def main():
         except ValueError:
             dep_max = 10
         dependents = find_dependent_files(
-            os.environ.get('LAKE_GRAPH', ''), set(lean_files), repo_files_by_path, dep_max,
+            get_lake_graph_str(), set(lean_files), repo_files_by_path, dep_max,
         )
         if dependents:
             logging.info(f"Dependent-impact: reviewing {len(dependents)} unchanged consumer(s).")
@@ -2740,6 +3206,23 @@ def main():
                 cross_file_structured = _merge_cross_file(cross_file_structured, dep_result)
                 cross_file_text = _format_cross_file(cross_file_structured)
 
+        # --- Deterministic finding hygiene (before verification/verdict) ---
+        # These filters use only workflow-established facts. They do not judge
+        # mathematical correctness; they prevent known classes of noisy output
+        # from becoming inline comments or verdict-driving findings.
+        filtered_findings = _filter_ungrounded_findings(
+            per_file_structured,
+            cross_file_structured,
+            precheck_scan,
+            build_status == "success",
+        )
+        if filtered_findings:
+            for fp, r in per_file_structured.items():
+                if r is not None:
+                    per_file_reviews[fp] = _format_file_review(r, fp)
+            if cross_file_structured is not None:
+                cross_file_text = _format_cross_file(cross_file_structured)
+
         # --- Verification pass (precision stage) ---
         # Adversarially re-check each verdict-driving finding and drop the ones a
         # verifier can refute, BEFORE the verdict is computed or findings are
@@ -2751,6 +3234,7 @@ def main():
                     provider, per_file_structured, cross_file_structured,
                     diff_by_file, spec_checklist, args.verify_model,
                     max_workers=args.max_workers,
+                    external_parts=external_parts,
                 )
             except BudgetExceededError:
                 # Verification runs BEFORE the verdict, so recording the trip here flips
@@ -2762,7 +3246,16 @@ def main():
                 if is_hard_llm_failure(e):
                     raise  # hard failure → top-level containment records + contains it
                 logging.warning(f"Verification pass failed; reporting unfiltered findings: {describe_exc(e)}")
-            if refuted_findings:
+            verifier_confirmed = any(
+                f.verification_status == "confirmed"
+                for r in per_file_structured.values() if r
+                for f in r.critical_misformalizations + r.lean_issues
+            ) or any(
+                f.verification_status == "confirmed"
+                for cat in _CROSS_FILE_CATEGORIES
+                for f in (getattr(cross_file_structured, cat) if cross_file_structured else [])
+            )
+            if refuted_findings or verifier_confirmed:
                 # Re-render the affected outputs from the filtered structured data.
                 for fp, r in per_file_structured.items():
                     if r is not None:
@@ -2782,7 +3275,8 @@ def main():
                                     # compute_deterministic_verdict then cannot Approve an outage run.
         )
         det_verdict, det_reasons = compute_deterministic_verdict(
-            precheck_scan, per_file_structured, cross_file_structured, review_incomplete
+            precheck_scan, per_file_structured, cross_file_structured, review_incomplete,
+            verification_required=verification_enabled,
         )
         logging.info(f"Deterministic verdict: {det_verdict}")
 
@@ -2812,7 +3306,7 @@ def main():
                 # computed deterministically — override whatever the model chose.
                 if summary_structured is not None:
                     summary_structured.overall_verdict = det_verdict
-                    summary_text = _format_synthesis(summary_structured)
+                    summary_text = _format_synthesis(summary_structured, precheck_summary=pre_check_findings)
             except Exception as e:
                 if isinstance(e, BudgetExceededError):
                     run_health.record_budget_trip()
@@ -2831,7 +3325,8 @@ def main():
         if run_health.degraded and not review_incomplete:
             review_incomplete = True
             det_verdict, det_reasons = compute_deterministic_verdict(
-                precheck_scan, per_file_structured, cross_file_structured, review_incomplete
+                precheck_scan, per_file_structured, cross_file_structured, review_incomplete,
+                verification_required=verification_enabled,
             )
             logging.info(f"Verdict re-derived after post-verdict degradation: {det_verdict}")
 
@@ -2879,6 +3374,15 @@ def main():
                 final_comment += f"- ~~{f.description}~~{loc}\n  - Verifier: {v.reasoning}\n"
             final_comment += "\n</details>\n"
 
+        if filtered_findings:
+            final_comment += (
+                "\n<details><summary>🧹 **Deterministic finding hygiene**</summary>\n\n"
+                "The workflow removed the following model reports from the issue/inline path "
+                "because they were contradicted by deterministic workflow facts or duplicated:\n\n"
+            )
+            final_comment += "\n".join(f"- {note}" for note in filtered_findings)
+            final_comment += "\n\n</details>\n"
+
         # Group per-file reviews by cluster
         shown_files = set()
         for cluster in clusters:
@@ -2890,13 +3394,13 @@ def main():
                 if cluster.review_question:
                     final_comment += f"*{cluster.review_question}*\n"
             for file_path in cluster_files:
-                final_comment += f"\n<details><summary>📄 **Review for `{file_path}`**</summary>\n\n{per_file_reviews[file_path]}\n</details>\n"
+                final_comment += f"\n<details><summary>📄 **Review for `{_safe_md_path(file_path)}`**</summary>\n\n{per_file_reviews[file_path]}\n</details>\n"
                 shown_files.add(file_path)
 
         # Show any files not in clusters (non-Lean files that were reviewed)
         for file_path, review_text in per_file_reviews.items():
             if file_path not in shown_files:
-                final_comment += f"\n<details><summary>📄 **Review for `{file_path}`**</summary>\n\n{review_text}\n</details>\n"
+                final_comment += f"\n<details><summary>📄 **Review for `{_safe_md_path(file_path)}`**</summary>\n\n{review_text}\n</details>\n"
 
         # GitHub PR comments have a ~65536 char limit. Rather than truncate (and
         # lose the tail), split into multiple comment-sized parts: the first goes

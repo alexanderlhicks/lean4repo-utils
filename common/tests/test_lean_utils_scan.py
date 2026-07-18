@@ -5,6 +5,7 @@ import os
 from leanrepo_common.lean_utils import (
     is_in_comment,
     strip_comments,
+    strip_comments_preserve_strings,
     scrub_line,
     detect_src_dir,
     import_search_dirs,
@@ -72,6 +73,14 @@ class TestStripComments:
         code, depth = strip_comments('def f := "a -- sorry b"', 0)
         assert code.strip() == 'def f := "a -- sorry b"'
         assert depth == 0
+
+    def test_multiline_string_state_is_preserved(self):
+        code, depth, in_str = strip_comments_preserve_strings('def m := "line one', 0, False)
+        assert code == 'def m := "line one'
+        assert depth == 0 and in_str is True
+        code, depth, in_str = strip_comments_preserve_strings('still -- text" -- comment', depth, in_str)
+        assert code == 'still -- text" '
+        assert depth == 0 and in_str is False
 
 
 class TestIsInComment:

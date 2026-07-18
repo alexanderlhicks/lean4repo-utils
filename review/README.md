@@ -98,8 +98,8 @@ jobs:
           # Both MUST support tool-calling (for lean_tools) + structured output;
           # confirm current slugs and the per-model "Tool Call Error Rate" at
           # https://openrouter.ai/models.
-          model: deepseek/deepseek-v4-pro   # deep agents — top open intelligence, 1M ctx, prompt caching
-          verify_model: z-ai/glm-5.2        # verifier — a top model of a DIFFERENT family
+          model: z-ai/glm-5.2                  # deep agents — top open repo-level coder, 1M ctx
+          verify_model: deepseek/deepseek-v4-pro  # verifier — a top model of a DIFFERENT family
           # Optional cost tier — light structural agents on a cheaper open model:
           # triage_model: minimax/minimax-m3
           # synthesis_model: minimax/minimax-m3
@@ -134,7 +134,7 @@ Project conventions are in docs/spec.md.
 ```
 
 The text is freeform. From it, the action automatically:
-- **fetches URLs** (`https://arxiv.org/...`) as external references (PDFs, HTML, raw text);
+- **fetches URLs** (`https://arxiv.org/...`) as external references (PDFs, HTML, raw text); if a validated public PDF rejects the workflow's ordinary HTTP client (for example, a Cloudflare challenge), the URL is preserved as a provider-native PDF fallback;
 - **loads repo paths that exist** (`docs/spec.md`, `references/paper.pdf`, `MyLib/Core/`) — `.pdf`/`.tex` files as specification references, everything else as repository context. Paths must be repo-relative; a bare word is only treated as a path if it contains a `/` or an extension, so ordinary prose is never misread as one;
 - **passes the whole text** to the reviewers as focus instructions.
 
@@ -170,7 +170,7 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_API_KEY }}
-          # model / verify_model default to open-weight deepseek/deepseek-v4-pro + z-ai/glm-5.2; override with any slug.
+          # model / verify_model default to open-weight z-ai/glm-5.2 + deepseek/deepseek-v4-pro; override with any slug.
           pr_number: ${{ github.event.pull_request.number }}
 ```
 
@@ -178,7 +178,7 @@ jobs:
 
 The [combined (auto + ChatOps) workflow above](#recommended-combined-workflow-auto--chatops) is ready to use as-is for Mathlib-based Lean 4 projects. Its defaults:
 
-- **A two-family, open-weight model combination** — the deep agents share a strong `model`, and the verification pass runs on a *different* family (`verify_model`), because an independent, different-family verifier catches false positives a same-model one rationalizes away. (A single model everywhere works and is simpler, but forgoes that benefit; optionally, put the light structural agents — `triage_model`/`synthesis_model` — on a cheaper variant.) Any strong open model qualifies as long as it supports **tool-calling** (for `lean_tools`) and **structured output**; confirm the current slug and the per-model *Tool Call Error Rate* at [openrouter.ai/models](https://openrouter.ai/models). Good open-weight picks as of mid-2026 (pick two *different families* for `model` and `verify_model`): `deepseek/deepseek-v4-pro` (deep agents — top open intelligence, 1M context, prompt caching) and `z-ai/glm-5.2` (verifier — a different top model), with `minimax/minimax-m3` or `deepseek/deepseek-v4-flash` for the optional cheap `triage`/`synthesis` tier. Cheaper strong-agentic verifier alternatives: `xiaomi/mimo-v2.5-pro`, `minimax/minimax-m3`. (`moonshotai/kimi-k2.6` is exceptional at tool-call *throughput* but ranks a notch lower on raw intelligence, so it's a weaker choice for the judgement-heavy verifier.) Avoid `*-max`-style tiers that are proprietary — they aren't open-weight. The pipeline runs tool-calling and structured output in **separate phases**, so it avoids the known issue where models given both at once mis-emit tool arguments.
+- **A two-family, open-weight model combination** — the deep agents share a strong `model`, and the verification pass runs on a *different* family (`verify_model`), because an independent, different-family verifier catches false positives a same-model one rationalizes away. (A single model everywhere works and is simpler, but forgoes that benefit; optionally, put the light structural agents — `triage_model`/`synthesis_model` — on a cheaper variant.) Any strong open model qualifies as long as it supports **tool-calling** (for `lean_tools`) and **structured output**; confirm the current slug and the per-model *Tool Call Error Rate* at [openrouter.ai/models](https://openrouter.ai/models). Good open-weight picks as of mid-2026 (pick two *different families* for `model` and `verify_model`): `z-ai/glm-5.2` (deep agents — the current open-weights leader on repo-level coding, 1M context) and `deepseek/deepseek-v4-pro` (verifier — a different top family, strongest open model on algorithmic reasoning, 1M context, prompt caching), with `minimax/minimax-m3` or `deepseek/deepseek-v4-flash` for the optional cheap `triage`/`synthesis` tier. Cheaper strong-agentic verifier alternatives: `xiaomi/mimo-v2.5-pro`, `minimax/minimax-m3`. (`moonshotai/kimi-k2.6` is exceptional at tool-call *throughput* but ranks a notch lower on raw intelligence, so it's a weaker choice for the judgement-heavy verifier.) Avoid `*-max`-style tiers that are proprietary — they aren't open-weight. The pipeline runs tool-calling and structured output in **separate phases**, so it avoids the known issue where models given both at once mis-emit tool arguments.
 - **`lean_tools: true`** — the reviewer/verifier check claims against the real compiler, so "won't typecheck / lemma doesn't exist" claims are grounded, not guessed. Fails open to a tool-free review if the model can't call tools.
 - **Strict escape-hatch verdict** (empty allowlist) by default.
 
@@ -194,7 +194,7 @@ Tune to your project's characteristics:
 | is **large**, with big PRs (many files and dependents to review) | raise `timeout-minutes` — the multi-agent review, not the Lean build, is what grows (`lean-action` fetches the prebuilt Mathlib cache, so Mathlib isn't rebuilt). Chunked review and budget-guards already handle the size. |
 
 **Prerequisites & caveats:**
-- **Dependency discovery needs `lake exe graph`** (from `import-graph`, a Mathlib dependency, so it resolves in most Mathlib-based projects — confirm for yours). If missing, discovery and the dependent-impact pass degrade gracefully to changed-files-only.
+- **Dependency discovery scans the repo's own `import` lines** — no `lake exe graph`, no built package, and no toolchain required, and it covers every `lean_lib` in a multi-target repo (not just the default target). If the scan fails, discovery and the dependent-impact pass degrade gracefully to changed-files-only.
 - **Cost scales with findings and dependents** — verification is one call per verdict-driving finding, dependent-impact one per unchanged consumer (capped by `dependent_impact_max`). Tune the caps if cost matters.
 - **Validate on a live PR and tune.** The defaults are reasoned baselines, not gospel — confirm model choice, thinking budget, and caps against a real review before relying on them.
 
@@ -204,7 +204,7 @@ Tune to your project's characteristics:
 |-------|----------|---------|-------------|
 | `github_token` | Yes | — | GitHub Token for API calls |
 | `api_key` | Yes | — | OpenRouter API key |
-| `model` | No | `deepseek/deepseek-v4-pro` | OpenRouter model slug for the deep agents. Defaults to an open-weight model; override with any slug (must support tool-calling + structured output). |
+| `model` | No | `z-ai/glm-5.2` | OpenRouter model slug for the deep agents. Defaults to an open-weight model; override with any slug (must support tool-calling + structured output). |
 | `pr_number` | Yes | — | The Pull Request number |
 | `spec_refs` | No | `""` | Comma-separated **local** paths (files or dirs; PDF/md/txt/tex/lean) to specification / knowledge-base documents. These drive the formalization checklist (Agent A) and ground every reviewer — the project's standing knowledge base belongs here. |
 | `additional_comments` | No | `""` | Freeform focus instructions for the reviewers (e.g. everything after `/review` in a PR comment). URLs it mentions are fetched as external references and existing repo-relative paths are loaded as spec/repo context, automatically. |
@@ -221,7 +221,7 @@ Tune to your project's characteristics:
 | `review_model` | No | `model` | Model override for the per-file Code Reviewer agent |
 | `cross_file_model` | No | `model` | Model override for the Cross-File Analysis agent |
 | `synthesis_model` | No | `model` | Model override for the Synthesis agent |
-| `verify_model` | No | `z-ai/glm-5.2` | Model for the verification pass. Defaults to a **different open-weight family** than `model` for an independent check (avoids self-agreement bias). Override with any slug; keep it a different family than `model`. |
+| `verify_model` | No | `deepseek/deepseek-v4-pro` | Model for the verification pass. Defaults to a **different open-weight family** than `model` for an independent check (avoids self-agreement bias). Override with any slug; keep it a different family than `model`. |
 | `llm_max_run_tokens` | No | `""` | Per-run token budget. In the default `llm_budget_mode=advisory`, this sizes/trims prompts but does **not** stop review coverage. In `hard` mode, once exceeded, no further LLM calls are made and the run degrades gracefully. Empty = disabled. |
 | `llm_max_run_cost` | No | `""` | Per-run cost budget in OpenRouter credits. **Requires** `llm_max_run_tokens` (a cost-only budget is rejected — cost can be BYOK-fee-only or absent). Empty = disabled. |
 | `llm_budget_mode` | No | `advisory` | `advisory` prioritizes reviewing all PRs: budgets are prompt-sizing hints and are tracked but not enforced. `hard` prioritizes spend containment: crossing the budget stops further LLM calls and posts an incomplete/degraded review. |
@@ -289,17 +289,18 @@ Tune to your project's characteristics:
 ## How it Works
 
 1.  **Checkout & Environment Setup:** Fetches full Git history, installs [uv](https://docs.astral.sh/uv/) (which provisions Python), and sets up Lean/Lake via `lean-action`.
-2.  **Build:** `lean-action` fetches the prebuilt Mathlib cache (`lake exe cache get`, auto-detected) so Mathlib isn't compiled from source, then builds the project's own files with `lake build` (with optional linting).
+2.  **Build:** `lean-action` fetches the prebuilt Mathlib cache (`lake exe cache get`, auto-detected) so Mathlib isn't compiled from source; the action then runs the project `lake build` explicitly, captures bounded compiler diagnostics for the reviewers, and records whether the exact checked-out commit passed.
 3.  **Discover Related Files:** Identifies changed `.lean` files, then uses the Lake dependency graph for BFS-based transitive dependency and dependent discovery. Splits results into full-context and summary-context tiers.
-4.  **Extract Lean Toolchain Info:** Runs `#print axioms` per declaration, scans for `sorry`/`admit`, and captures compiler diagnostics for changed files. Performs lightweight sorry/admit scanning on summary-context overflow files. Operates within a configurable time budget (default 300s).
+4.  **Extract Lean Toolchain Info:** Runs `#print axioms` per declaration, scans for `sorry`/`admit`, and captures compiler diagnostics for changed files. Performs lightweight sorry/admit scanning on summary-context overflow files. Operates within a configurable time budget (default 300s). A following deterministic step builds a source index of paper anchors and changed Lean declarations; heuristic navigation hints remain artifact-only.
 5.  **Run Multi-Agent Review Pipeline:**
     *   **Pre-checks** (deterministic): Scans diffs for escape hatches with nested block comment and string literal awareness.
-    *   **Agent A** (spec analysis): Reads external PDFs/papers with repository structure context, produces a formalization checklist.
+    *   **Agent A** (spec analysis): Reads external PDFs/papers with repository structure context, produces a formalization checklist. Records the *ultimate cited source* of each admitted external result (source-of-source fidelity): the cited source, not the paper under review, governs an admitted statement, and deviations from it are first-class `source_fidelity` findings.
     *   **Triage**: Groups files into review clusters using dependency graph and type signatures. Produces review strategies and key hypotheses per cluster.
     *   **Agent B** (per-file review, parallel): Writes a step-by-step analysis of each file, then derives findings from the analysis. Receives cluster review strategy, key hypotheses, and type signatures of related files.
     *   **Cross-File Agent**: Traces composition chains, type-flow, and axiom propagation, then reports issues grounded in that analysis.
     *   **Dependent-Impact Agent** (second-order): Re-reviews unchanged depth-1 importers of the changed files for breakage the PR causes; findings fold into the cross-file results.
-    *   **Verification Agent** (precision): Independently tries to refute each verdict-driving finding; refuted findings are dropped and disclosed separately.
+    *   **Verification Agent** (precision): Independently tries to refute each verdict-driving finding; refuted findings are dropped and disclosed separately. May also down-rank a confirmed-but-over-escalated finding's severity (downward only — a verifier can never raise severity).
+    *   **Finding hygiene** (deterministic): Separates substantive findings from advisory style/generalization/proof/documentation feedback, removes duplicate reports across chunks/channels, suppresses unrelated pre-existing escape-hatch reports, and rejects bare build-failure claims after the exact workflow build succeeds.
     *   **Deterministic Verdict**: Computed from mechanical facts, surviving findings, and review coverage — not from the LLM.
     *   **Synthesis**: Aggregates the (verified) structured review data and formatted reviews into an executive summary.
 6.  **Post Review:** Publishes or updates an AI review comment on the PR, with collapsible per-file details grouped by cluster (overflowing into follow-up comments if it exceeds GitHub's size limit). Line-level annotations are posted as GitHub Review comments where findings map to diff lines.
@@ -313,8 +314,9 @@ Tune to your project's characteristics:
     4.  **Code Reviewer (Agent B):** Evaluates each Lean file's diff and full content against the spec checklist, repository context, and Lean 4 best practices. Writes a structured **analysis** before producing findings (what the code does mathematically, risk assessment, spec mapping). Runs in parallel across files (up to 5 concurrent workers) with cluster-level type signatures, review strategy, and key hypotheses.
     5.  **Cross-File Analysis Agent:** Analyzes composition chains, type-flow across files, axiom/escape-hatch impact propagation, and external dependency correctness.
     6.  **Lead Synthesizer (Agent C):** Aggregates per-file reviews (both formatted and structured data) into a prioritized executive summary with deduplication.
-*   **Transitive Dependency Discovery:** Uses `lake exe graph --json` with BFS traversal (configurable depth, default 2) to find both direct and transitive dependencies. Asymmetric depth: dependencies (what we import) go to depth 2; dependents (what imports us) stay at depth 1.
+*   **Transitive Dependency Discovery:** Builds the module import graph by scanning the repo's `import` lines (source-level, toolchain-free), then BFS traversal (configurable depth, default 2) finds both direct and transitive dependencies. Asymmetric depth: dependencies (what we import) go to depth 2; dependents (what imports us) stay at depth 1. The graph is handed to the review step as a file (`lake_graph.json`), never inline — real-repo graphs exceed env-var size caps.
 *   **Lean Toolchain Extraction:** Post-build extraction of axiom dependencies (`#print axioms`), `sorry`/`admit` locations, and compiler diagnostics for all changed files, plus lightweight sorry/admit scanning for overflow files.
+*   **Paper/Lean Source Index:** A deterministic pre-review index records changed Lean declarations and source-preserving TeX/Markdown/text paper anchors. Bounded heuristic navigation hints are kept only in the JSON artifact; PDF candidates are explicitly lossy/visual-confirmation-required.
 *   **Tiered Context Management:** Full file content for up to 50 files (configurable via `CONTEXT_LIMIT`), with type-signature-only summaries for overflow files. Depth-1 dependencies are prioritized over depth-2 in the full-context tier, and the cap is enforced against the *total* tier size so very-large PRs gracefully demote excess files to summaries rather than blowing the prompt budget. Per-file reviewers additionally filter out sibling changed files from `REPO_CONTEXT` (each changed file gets its own review pass; cross-file coupling is surfaced by the dedicated cross-file analyzer and the triage-produced cluster signatures). A per-call character budget (`MAX_PROMPT_CHARS`, default ~2.5M chars ≈ 830K tokens) defensively trims dependency content if an individual review's assembled prompt would still exceed the model's context limit.
 *   **Context Completeness Guarantees:** External reference fetch errors and Lean toolchain extraction failures are surfaced as warnings in the review output.
 *   **Prompt caching:** The stable shared prefix — the operating contract, external reference documents, and (for per-file review) the formalization checklist, repository context, best-practices checklist, and verdict rules — is sent as a `cache_control`-marked block so it is reused across every agent call, while the volatile per-file content (diff, full content) trails after the cache breakpoint. This is a prefix match, so caching holds across the many per-file/chunk review calls of a run.
@@ -323,9 +325,16 @@ Tune to your project's characteristics:
 *   **Structured Output:** All agents produce Pydantic-validated JSON responses. Line-level annotations are posted via the GitHub Review API using the modern `line`/`side` parameters.
 *   **Per-Agent Model Selection:** Each pipeline stage can use a different model via CLI flags (`--spec-model`, `--review-model`, `--cross-file-model`, `--synthesis-model`).
 *   **Adaptive Pipeline:** Single-file PRs skip triage, cross-file analysis, and synthesis (the per-file review is the output, with a deterministic downstream impact note from the dependency graph). Two-file PRs skip triage but get cross-file analysis.
-*   **Deterministic Verdict:** The overall verdict is computed by the pipeline from mechanical facts (introduced escape hatches, honoring `escape_hatch_allowlist`), the structured finding counts, cross-file issues, and review-coverage — not taken from the LLM. The comment leads with the verdict and an explicit *basis*. A file that could not be fully reviewed is a coverage gap that can never be certified as "Approved".
+*   **Deterministic Verdict:** The overall verdict is computed by the pipeline from mechanical facts (introduced escape hatches, honoring `escape_hatch_allowlist`), source-grounded findings, verifier refutations, cross-file issues, and review coverage — not taken from the LLM. Low-confidence, ungrounded, and docstring-only findings remain visible as advisory context; verifier uncertainty does not silently suppress a grounded issue. The comment leads with the verdict and an explicit *basis*. A file that could not be fully reviewed is a coverage gap that can never be certified as "Approved".
 *   **Scales to Large PRs (map-reduce):** A changed file larger than `MAX_FILE_REVIEW_CHARS` (default ~400K chars) is reviewed in declaration-aligned sections and merged, so tens-of-thousands-of-line files are covered in full instead of failing the budget. Truncated structured outputs are retried with a larger token cap rather than lost. Cross-file and synthesis prompts are budget-guarded, and reviews that exceed GitHub's comment limit are split across multiple comments (nothing is truncated away).
-*   **Grounded, Legible Findings:** Every finding carries an `evidence` field (the paper section, repository symbol, or toolchain output it rests on) and a `confidence` level, so a human can validate it. Reviewers are instructed to flag **second-order issues** the diff *implicates* (misuse of an existing definition/abstraction, broken invariants) — not just lines inside the diff.
+*   **Grounded, Legible Findings:** Every finding carries evidence text, an explicit `evidence_source`, and an exact `evidence_locator` (paper/spec section, Lean declaration/line, compiler command, trusted component, or downstream consumer) plus a confidence level. Reviewers are instructed to flag **second-order issues** the diff *implicates* (misuse of an existing definition/abstraction, broken invariants) — not just lines inside the diff.
+*   **Docstring trust boundary:** Docstrings are treated as untrusted intent metadata. They can locate an intended claim or expose documentation drift, but docstring-only correctness findings remain visible only in advisory feedback and cannot block; the reviewer must validate against Lean, a paper/spec, a trusted component, or downstream use.
+*   **Actionable finding contract:** Findings carry category/severity, provenance, exact source location, and optional confirmation/disconfirmation checks. Style-guide, proof-presentation, documentation, and future-proofing suggestions remain visibly advisory and never become inline blocking annotations; semantic/specification/contract findings retain the issue path only when their evidence is independently grounded.
+*   **PDF evidence boundary:** PDF-backed findings carry a semantic paper locator (section/theorem/lemma/definition labels are preferred). The original PDF parts are supplied to the independent verifier, and such findings become verdict-driving only after that verifier reports visual confirmation; page coordinates and bounding boxes are not required.
+*   **Paper/Lean source index:** The action emits a JSON source index and compact source-preserving view for local TeX/Markdown/text/PDF references and changed Lean declarations. Heuristic navigation hints stay in the artifact for tooling but are not supplied as semantic links to the agent; PDF text remains visual-confirmation-required.
+*   **Build-grounded mechanical claims:** The action records a successful Lean build for the exact checked-out commit and exposes that fact to reviewers. A model cannot turn a code-reading guess into a build blocker; a focused compiler/toolchain diagnostic is required.
+*   **Compiler diagnostics in context:** The explicit project build exposes its bounded output as `BUILD_OUTPUT`, including warnings on successful builds and errors on failed builds, while the complete log remains in the Actions output.
+*   **Summary/review boundary:** The review action owns semantic correctness, paper fidelity, cross-file contracts, and blocking findings. It renders grounded blocking findings in the main review and all other feedback in a separate advisory section without inline annotations. The independently configured summary action remains the orientation and style/documentation/progress channel (including trusted `additional_instructions_path` guidance); it does not serve as an implicit semantic-verdict input.
 *   **Verification (precision) pass:** After the reviewers, an independent agent adversarially tries to **refute** each verdict-driving finding. Refuted findings are dropped (and disclosed in a "filtered by verification" section) before the verdict is computed — separating recall (reviewers) from precision (verifier) as human review does. Best run on a *different* model (`verify_model`) to avoid self-agreement bias.
 *   **Lean toolchain grounding:** The per-file reviewer and the verifier can call the real Lean toolchain during review — `lean_check` / `lean_print` / `lean_print_axioms` / `lean_typecheck` (via `lake env lean`) — so a claim like "this won't typecheck" or "that lemma doesn't exist" is checked against the compiler instead of guessed. The type checker is treated as ground truth, which kills the most common false-positive class. The Lean subprocess runs with secret-looking env vars scrubbed. The tool interface is pluggable — a richer [`lean-lsp-mcp`](https://github.com/oOo0oOo/lean-lsp-mcp) backend (proof-state, diagnostics, `loogle`/`leansearch`) can slot in behind it.
 *   **Dependent-impact (second-order) pass:** The unchanged depth-1 importers of the changed files are re-reviewed for breakage the PR causes (renamed/retyped symbols, weakened lemmas, dropped instances). Findings fold into the cross-file results, so they are verified and scored like any other.
@@ -354,6 +363,7 @@ review/                       # workspace member of the lean4repo-utils reposito
   review.py                   # Main review orchestration (multi-agent pipeline)
   discover_files.py           # Dependency discovery via lake graph (BFS)
   lean_info_extractor.py      # Lean toolchain data extraction (axioms, sorry, diagnostics)
+  paper_lean_evidence.py      # deterministic paper-anchor / Lean-declaration index
   lean_tools.py               # Lean toolchain tools for agents (lean_check/print/typecheck via `lake env lean`)
   pyproject.toml              # Project metadata + dependencies (uv workspace member)
   prompts/
@@ -387,7 +397,7 @@ The intelligence and behavior of the AI reviewer are governed by Markdown prompt
 ### Key prompt files and their placeholders:
 
 **`analyze_spec.md`** (Agent A — Specification Analyst):
-`{{EXTERNAL_CONTEXT}}`, `{{FILE_DIFFS}}`, `{{REPO_STRUCTURE}}`, `{{DEPENDENCY_GRAPH}}`
+`{{EXTERNAL_CONTEXT}}`, `{{FILE_DIFFS}}`, `{{REPO_STRUCTURE}}`, `{{DEPENDENCY_GRAPH}}`, `{{PAPER_LEAN_EVIDENCE}}`
 
 **`triage.md`** (Triage Agent):
 `{{DEPENDENCY_GRAPH}}`, `{{ALL_DIFFS}}`, `{{CHANGED_FILE_SIGNATURES}}`, `{{SPEC_CHECKLIST}}`, `{{ADDITIONAL_COMMENTS}}`

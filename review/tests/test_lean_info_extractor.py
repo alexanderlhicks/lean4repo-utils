@@ -51,6 +51,13 @@ noncomputable def myNonComp := Classical.choice ⟨0⟩
     def test_nonexistent_file(self):
         assert get_lean_declarations("/nonexistent/file.lean") == []
 
+    def test_ignores_declarations_inside_multiline_strings(self, tmp_path):
+        lean_file = tmp_path / "Strings.lean"
+        lean_file.write_text('def text := "first line\ntheorem fake : True := trivial"\ntheorem real : True := trivial\n')
+        decls = get_lean_declarations(str(lean_file))
+        assert "fake" not in decls
+        assert "real" in decls
+
 
 class TestGetModuleName:
     def test_with_src_prefix(self, tmp_path, monkeypatch):
@@ -94,6 +101,11 @@ class TestExtractSorryWarnings:
     def test_empty_file(self, tmp_path):
         lean_file = tmp_path / "Foo.lean"
         lean_file.write_text("")
+        assert extract_sorry_warnings(str(lean_file)) == []
+
+    def test_ignores_sorry_inside_multiline_string(self, tmp_path):
+        lean_file = tmp_path / "Strings.lean"
+        lean_file.write_text('def text := "first line\nsecond line says sorry"\n')
         assert extract_sorry_warnings(str(lean_file)) == []
 
 

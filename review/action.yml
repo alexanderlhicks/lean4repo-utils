@@ -17,9 +17,9 @@ inputs:
     description: 'Freeform focus instructions for the reviewers (e.g. everything after `/review` in a PR comment). URLs it mentions are fetched as external references, and existing repo-relative paths are loaded as spec/repo context, automatically.'
     required: false
   model:
-    description: 'OpenRouter model slug for the deep agents (spec, per-file review, cross-file, dependent-impact). Defaults to the open-weight deepseek/deepseek-v4-pro; override with any slug. Must support tool-calling + structured output.'
+    description: 'OpenRouter model slug for the deep agents (spec, per-file review, cross-file, dependent-impact). Defaults to the open-weight z-ai/glm-5.2; override with any slug. Must support tool-calling + structured output.'
     required: false
-    default: 'deepseek/deepseek-v4-pro'
+    default: 'z-ai/glm-5.2'
   lint:
     description: 'Whether to run the linter'
     required: false
@@ -64,9 +64,9 @@ inputs:
     description: 'Model override for the Synthesis agent. Falls back to model.'
     required: false
   verify_model:
-    description: 'Model for the verification pass. Defaults to the open-weight z-ai/glm-5.2 — a DIFFERENT family from the default model, for an independent check (less self-agreement bias). Override with any slug; keep it a different family than model.'
+    description: 'Model for the verification pass. Defaults to the open-weight deepseek/deepseek-v4-pro — a DIFFERENT family from the default model, for an independent check (less self-agreement bias). Override with any slug; keep it a different family than model.'
     required: false
-    default: 'z-ai/glm-5.2'
+    default: 'deepseek/deepseek-v4-pro'
   verify_findings:
     description: 'Run the adversarial verification pass that filters likely-false-positive findings. "false" to disable.'
     required: false
@@ -148,9 +148,52 @@ runs:
     - name: Set up Lean and Build
       uses: leanprover/lean-action@v1.5.0
       with:
-        build: true
+        # Toolchain/cache setup happens here; the explicit build below captures
+        # diagnostics for the review instead of leaving the output inside this
+        # action's log stream only.
+        build: false
         test: false
         lint: ${{ inputs.lint }}
+
+    - name: Build Lean project with captured diagnostics
+      id: lean_build
+      shell: bash
+      continue-on-error: true
+      run: |
+        set +e
+        build_log="$RUNNER_TEMP/lean-build.log"
+        lake build 2>&1 | tee "$build_log"
+        build_rc=${PIPESTATUS[0]}
+
+        # Keep the model-facing output bounded while retaining the complete log
+        # in the Actions log for debugging. A random delimiter avoids collisions
+        # with compiler output.
+        output_marker="EOF_LEAN_BUILD_$(openssl rand -hex 16)"
+        echo "build_output<<$output_marker" >> "$GITHUB_OUTPUT"
+        if [ -s "$build_log" ]; then
+          build_bytes=$(wc -c < "$build_log")
+          if [ "$build_bytes" -le 120000 ]; then
+            cat "$build_log" >> "$GITHUB_OUTPUT"
+          else
+            head -c 60000 "$build_log" >> "$GITHUB_OUTPUT"
+            printf '\n... [middle of compiler log omitted] ...\n' >> "$GITHUB_OUTPUT"
+            tail -c 60000 "$build_log" >> "$GITHUB_OUTPUT"
+          fi
+        fi
+        printf '\n%s\n' "$output_marker" >> "$GITHUB_OUTPUT"
+
+        if [ "$build_rc" -eq 0 ]; then
+          echo "BUILD_SUCCEEDED=true" >> "$GITHUB_ENV"
+          echo "BUILD_STATUS=success" >> "$GITHUB_ENV"
+          echo "build_succeeded=true" >> "$GITHUB_OUTPUT"
+          echo "build_status=success" >> "$GITHUB_OUTPUT"
+        else
+          echo "BUILD_SUCCEEDED=false" >> "$GITHUB_ENV"
+          echo "BUILD_STATUS=failure" >> "$GITHUB_ENV"
+          echo "build_succeeded=false" >> "$GITHUB_OUTPUT"
+          echo "build_status=failure" >> "$GITHUB_OUTPUT"
+        fi
+        exit "$build_rc"
 
 
     - name: Install dependencies
@@ -182,6 +225,17 @@ runs:
         SUMMARY_FILES: ${{ steps.discover_files.outputs.summary_files }}
       run: uv run --project "${{ github.action_path }}" --no-dev --frozen python "${{ github.action_path }}/lean_info_extractor.py"
 
+    - name: Build paper/Lean source index
+      id: paper_lean_evidence
+      shell: bash
+      continue-on-error: true
+      env:
+        CHANGED_FILES: ${{ steps.discover_files.outputs.changed_files }}
+        SPEC_REFS: ${{ inputs.spec_refs }}
+        ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
+        PAPER_LEAN_EVIDENCE_OUT: ${{ runner.temp }}/paper-lean-evidence.json
+      run: uv run --project "${{ github.action_path }}" --no-dev --frozen python "${{ github.action_path }}/paper_lean_evidence.py"
+
     - name: Run AI Review Script
       shell: bash
       id: run_review
@@ -196,12 +250,16 @@ runs:
         SPEC_REFS: ${{ inputs.spec_refs }}
         DISCOVERED_FILES: ${{ steps.discover_files.outputs.discovered_files }}
         SUMMARY_FILES: ${{ steps.discover_files.outputs.summary_files }}
-        LAKE_GRAPH: ${{ steps.discover_files.outputs.lake_graph }}
+        LAKE_GRAPH_PATH: ${{ steps.discover_files.outputs.lake_graph_path }}
         DEPENDENT_IMPACT_MAX: ${{ inputs.dependent_impact_max }}
         ESCAPE_HATCH_ALLOWLIST: ${{ inputs.escape_hatch_allowlist }}
         ENABLE_WEB_SEARCH: ${{ inputs.enable_web_search }}
         LEAN_TOOLS: ${{ inputs.lean_tools }}
         LEAN_INFO: ${{ steps.lean_info.outputs.lean_info_formatted }}
+        BUILD_SUCCEEDED: ${{ steps.lean_build.outputs.build_succeeded }}
+        BUILD_STATUS: ${{ steps.lean_build.outputs.build_status }}
+        BUILD_OUTPUT: ${{ steps.lean_build.outputs.build_output }}
+        PAPER_LEAN_EVIDENCE: ${{ steps.paper_lean_evidence.outputs.paper_lean_evidence_formatted }}
         ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
         THINKING_BUDGET: ${{ inputs.thinking_budget }}
         SPEC_MODEL: ${{ inputs.spec_model }}
@@ -284,6 +342,13 @@ runs:
           const body = reviewText.startsWith('### 🤖 ') ? reviewText : header + reviewText;
           const { owner, repo } = context.repo;
           const pr_number = parseInt(process.env.PR_NUMBER);
+          let commit_id = process.env.REVIEW_HEAD_SHA;
+          if (!commit_id) {
+            const pr = await github.rest.pulls.get({ owner, repo, pull_number: pr_number });
+            commit_id = pr.data.head.sha;
+          }
+          const reviewMarker = '<!-- lean-ai-review:' + commit_id + ' -->';
+          const markedBody = reviewMarker + '\n' + body;
 
           // Post any overflow parts (a large review split across the comment
           // size limit) as follow-up comments, so nothing is lost to truncation.
@@ -299,21 +364,25 @@ runs:
             } catch (e) {
               console.log('No overflow comments file.');
             }
-            if (!extra.length) return;
             try {
-              const existing = await github.rest.issues.listComments({
+              const existing = await github.paginate(github.rest.issues.listComments, {
                 owner, repo, issue_number: pr_number, per_page: 100,
               });
-              for (const c of existing.data) {
-                if (c.user.type === 'Bot' && c.body && c.body.includes(OVERFLOW_MARKER)) {
+              for (const c of existing) {
+                if (c.user.type === 'Bot' && c.body &&
+                    c.body.includes(reviewMarker) && c.body.includes(OVERFLOW_MARKER)) {
                   await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
                 }
               }
             } catch (e) {
               console.log(`Could not prune old overflow comments: ${e.message}`);
             }
+            if (!extra.length) return;
             for (const part of extra) {
-              await github.rest.issues.createComment({ owner, repo, issue_number: pr_number, body: part });
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr_number,
+                body: reviewMarker + '\n' + part,
+              });
             }
             console.log(`Posted ${extra.length} overflow comment(s).`);
           }
@@ -328,17 +397,53 @@ runs:
             console.log('No annotations file found, posting as comment only.');
           }
 
+          // A GitHub Review cannot be updated in place. Before creating a new
+          // annotated review, dismiss an earlier bot review for this same head
+          // that carries our marker. This keeps reruns on one commit idempotent
+          // while leaving reviews for other commits in the PR history intact.
+          async function supersedeSameHeadReview() {
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number: pr_number, per_page: 100,
+            });
+            for (const review of reviews) {
+              const isBot = review.user && review.user.type === 'Bot';
+              // Only dismiss reviews emitted by this workflow. The generic AI
+              // header is intentionally not enough: another bot may use it.
+              const isOurReview = review.body && review.body.includes(reviewMarker);
+              if (isBot && isOurReview && review.commit_id === commit_id &&
+                  review.state !== 'DISMISSED' && review.id) {
+                await github.rest.pulls.dismissReview({
+                  owner, repo, pull_number: pr_number, review_id: review.id,
+                  message: 'Superseded by a rerun for the same reviewed commit.',
+                });
+              }
+            }
+          }
+
+          async function removeSameHeadRegularComments() {
+            const existing = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pr_number, per_page: 100,
+            });
+            for (const c of existing) {
+              if (c.user.type === 'Bot' && c.body && c.body.includes(reviewMarker) &&
+                  !c.body.includes(OVERFLOW_MARKER)) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
+              }
+            }
+          }
+
+          // A rerun can switch between the annotated-review and regular-comment
+          // paths (for example, when findings cross the inline-comment limit).
+          // Supersede same-head review objects before either path so both modes
+          // remain idempotent for the reviewed commit.
+          try {
+            await supersedeSameHeadReview();
+          } catch (e) {
+            console.log(`Could not supersede an earlier review: ${e.message}`);
+          }
+
           if (annotations.length > 0) {
             try {
-              // Anchor to the SHA the review was actually performed against (threaded
-              // from the resolve_head step). Fall back to a live re-resolve only if it
-              // is somehow absent, so a stale/edited env can't silently mis-anchor.
-              let commit_id = process.env.REVIEW_HEAD_SHA;
-              if (!commit_id) {
-                const pr = await github.rest.pulls.get({ owner, repo, pull_number: pr_number });
-                commit_id = pr.data.head.sha;
-              }
-
               // GitHub limits to 50 comments per review
               const comments = annotations.slice(0, 50).map(a => ({
                 path: a.path,
@@ -352,12 +457,21 @@ runs:
                 repo,
                 pull_number: pr_number,
                 commit_id,
-                body: body,
+                body: markedBody,
                 event: 'COMMENT',
                 comments
               });
               console.log(`Posted review with ${comments.length} line annotations.`);
-              await postOverflow();
+              try {
+                await removeSameHeadRegularComments();
+              } catch (e) {
+                console.log(`Annotated review posted, but old regular comment cleanup failed: ${e.message}`);
+              }
+              try {
+                await postOverflow();
+              } catch (e) {
+                console.log(`Annotated review posted, but overflow comments failed: ${e.message}`);
+              }
               return;
             } catch (e) {
               console.log(`Failed to post review with annotations: ${e.message}. Falling back to comment.`);
@@ -366,26 +480,30 @@ runs:
 
           // Fallback: post/update a regular PR comment
           const issue_number = pr_number;
-          const existingComments = await github.rest.issues.listComments({
-            owner, repo, issue_number,
+          const existingComments = await github.paginate(github.rest.issues.listComments, {
+            owner, repo, issue_number, per_page: 100,
           });
 
-          const botComment = existingComments.data.find(comment =>
-            comment.user.type === 'Bot' && (comment.body.includes('### 🤖 AI Review') || comment.body.includes('### 🤖 Initial AI review'))
+          const botComment = existingComments.find(comment =>
+            comment.user.type === 'Bot' && comment.body && comment.body.includes(reviewMarker)
           );
 
           if (botComment) {
             await github.rest.issues.updateComment({
               owner, repo,
               comment_id: botComment.id,
-              body
+              body: markedBody
             });
           } else {
             await github.rest.issues.createComment({
-              owner, repo, issue_number, body
+              owner, repo, issue_number, body: markedBody
             });
           }
-          await postOverflow();
+          try {
+            await postOverflow();
+          } catch (e) {
+            console.log(`Review comment posted, but overflow comments failed: ${e.message}`);
+          }
 
     - name: Clean up artifacts
       if: always()

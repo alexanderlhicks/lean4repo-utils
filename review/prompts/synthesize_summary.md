@@ -31,7 +31,7 @@ Your task is to read their individual reports and synthesize a clear, authoritat
 Synthesize the findings into a polished, professional PR comment. Your summary should be structured as follows:
 
 1.  **TL;DR:** A 1-2 sentence executive summary of the overall state of the PR (e.g., "The mathematical concepts are sound, but there are several universe polymorphism issues and overly strong typeclass assumptions that need addressing.")
-2.  **Mechanical Pre-Check Results:** If the pre-checks found escape hatches (`sorry`, `axiom`, `native_decide`, `opaque`, `implemented_by`, `sorryAx`), report them prominently with file locations. These are deterministic findings — do not downplay or reinterpret them. If pre-checks found no issues, state that briefly.
+2.  **Mechanical Pre-Check Results:** If the pre-checks found escape hatches (`sorry`, `admit`, `axiom`, `native_decide`, `opaque`, `implemented_by`, `sorryAx`), report them prominently with file locations. These are deterministic findings — do not downplay or reinterpret them. If pre-checks found no issues, state that briefly.
 3.  **Checklist Coverage:** Address how well the PR covered the items from the Specification Checklist (if one was provided). Did the reviewers flag any missing verification steps (❌) or ambiguous coverages (⚠️)? Include any missing paper results identified in the Reference Mapping Table.
 4.  **Cross-File Issues (If Any):** Summarize findings from the cross-file analysis: composition chain problems, type-flow mismatches, axiom impact analysis, and external dependency issues. These are often the highest-severity findings.
 5.  **Critical Misformalizations (If Any):** Highlight any mathematical errors, missing hypotheses, or fundamental misunderstandings of the specification. This is the most important section. If none exist, omit this section.
@@ -48,6 +48,6 @@ You MUST respond with a JSON object matching this schema:
 - `precheck_summary`: Summary of mechanical pre-check results
 - `checklist_coverage`: How well the PR covers the specification checklist (empty string if no checklist)
 - `cross_file_summary`: Summary of cross-file analysis findings (empty string if none)
-- `critical_misformalizations`: Array of aggregated findings, each with `description`, `location`, `evidence` (what grounds it — paper section, repository symbol, or toolchain output), `confidence` ("high"/"medium"/"low"), `suggested_fix`. Preserve the evidence and confidence from the underlying per-file findings.
-- `key_lean_issues`: Array of grouped/deduplicated Lean issues, each with `description`, `location`, `evidence`, `confidence`, `suggested_fix`
+- `critical_misformalizations`: Array of aggregated findings, each with `description`, `location`, `evidence` (what grounds it — paper section, repository symbol, or toolchain output), `evidence_source`, `evidence_locator`, `evidence_medium`, `confidence` ("high"/"medium"/"low"), `suggested_fix`. Preserve the evidence provenance from the underlying findings; docstring-only observations remain advisory. Preserve `confirmation_method` when present, but do not invent visual confirmation.
+- `key_lean_issues`: Array of grouped/deduplicated Lean issues, each with `description`, `location`, `evidence`, `evidence_source`, `evidence_locator`, `evidence_medium`, `confidence`, `suggested_fix`, and (when present) `confirmation_method`
 - `overall_verdict`: One of "Approved", "Needs Minor Revisions", or "Changes Requested"

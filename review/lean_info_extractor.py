@@ -17,7 +17,7 @@ import sys
 import time as _time
 from typing import Dict, List, Optional
 
-from leanrepo_common.lean_utils import file_path_to_module_name, strip_comments
+from leanrepo_common.lean_utils import file_path_to_module_name, scrub_line
 
 
 def get_lean_declarations(file_path: str) -> List[str]:
@@ -33,12 +33,15 @@ def get_lean_declarations(file_path: str) -> List[str]:
 
     declarations = []
     try:
+        comment_depth = 0
+        in_string = False
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
-                m = decl_pattern.match(line)
+                code, comment_depth, in_string = scrub_line(line, comment_depth, in_string)
+                m = decl_pattern.match(code)
                 if m:
                     declarations.append(m.group(1))
-    except Exception:
+    except (OSError, UnicodeError):
         pass
     return declarations
 
@@ -58,12 +61,13 @@ def run_lean_command(module_name: str, command: str, timeout: int = 30) -> Optio
             input=lean_code,
             capture_output=True,
             text=True,
+            errors='replace',
             timeout=timeout
         )
         # Combine stdout and stderr — Lean puts #check/#print output on stdout,
         # warnings on stderr
         return (result.stdout + result.stderr).strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, UnicodeError):
         return None
 
 
@@ -104,13 +108,14 @@ def extract_sorry_warnings(file_path: str) -> List[str]:
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             comment_depth = 0
+            in_string = False
             for i, line in enumerate(f, 1):
-                code, comment_depth = strip_comments(line, comment_depth)
+                code, comment_depth, in_string = scrub_line(line, comment_depth, in_string)
                 if re.search(r'\bsorry\b', code):
                     sorry_locations.append(f"{file_path}:{i}")
                 if re.search(r'\badmit\b', code):
                     sorry_locations.append(f"{file_path}:{i}")
-    except Exception:
+    except (OSError, UnicodeError):
         pass
     return sorry_locations
 
@@ -123,6 +128,7 @@ def extract_diagnostics(file_path: str, timeout: int = 60) -> List[str]:
             ['lake', 'env', 'lean', file_path],
             capture_output=True,
             text=True,
+            errors='replace',
             timeout=timeout
         )
         diagnostics = []
@@ -131,7 +137,7 @@ def extract_diagnostics(file_path: str, timeout: int = 60) -> List[str]:
             if line and ('warning' in line.lower() or 'error' in line.lower()):
                 diagnostics.append(line)
         return diagnostics
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, UnicodeError):
         return []
 
 

@@ -20,6 +20,6 @@ Check specifically whether a changed public definition, type, structure field, s
 - Does a changed *statement* (e.g. a weakened lemma, an added or dropped hypothesis) make this file's proofs or definitions unsound or vacuous, even if they still compile?
 - Is an instance/typeclass this file relies on no longer provided?
 
-Report **only problems caused by the PR's changes** — never pre-existing issues in this unchanged file, and never restyle it.
+Report **only problems caused by the PR's changes** — never pre-existing issues in this unchanged file, and never restyle it. For every finding, identify `evidence_medium` (use `pdf` only for paper evidence read from a PDF) and leave `confirmation_method` as `unconfirmed`; PDF evidence is verdict-driving only after the independent verifier visually checks the original PDF using a semantic section/theorem/lemma/definition locator.
 
-**Output** the JSON schema you are given. Put consumer breakages in `composition_issues` (set `location` like `ChangedSymbol -> {{DEPENDENT_PATH}}:line`); put newly-broken external/library API usage in `external_dependency_issues`. Leave the other lists empty. Populate `evidence` (cite the changed symbol and the consuming line) and `confidence` for every finding.
+**Output** the JSON schema you are given. Put consumer breakages in `composition_issues` (set `location` like `ChangedSymbol -> {{DEPENDENT_PATH}}:line`); put newly-broken external/library API usage in `external_dependency_issues`. Leave the other lists empty. Populate `evidence` (cite the changed symbol and the consuming line), `evidence_source` (normally `downstream_contract` or `lean_source`), `evidence_locator`, and `confidence` for every finding. Do not use a docstring as the sole evidence of a consumer breakage.
