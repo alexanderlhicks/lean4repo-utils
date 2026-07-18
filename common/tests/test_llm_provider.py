@@ -278,6 +278,20 @@ class ResponseEnvelopeTests(unittest.TestCase):
         with self.assertRaises(llm_provider.LLMResponseEnvelopeError):
             p.generate_structured("m", [ContentPart("text", "hi")], _Schema)
 
+    def test_envelope_error_carries_call_usage(self):
+        # C7: a billed-but-unusable envelope must expose its per-call usage on the
+        # exception so an advisory caller can record the spend before re-raising.
+        completion = types.SimpleNamespace(
+            choices=[],
+            usage=_FakeUsage({"prompt_tokens": 100, "completion_tokens": 20, "cost": 0.001}),
+        )
+        p = self._provider_with_create(completion)
+        with self.assertRaises(llm_provider.LLMResponseEnvelopeError) as ctx:
+            p.generate_text("m", [ContentPart("text", "hi")])
+        self.assertIsNotNone(ctx.exception.call_usage)
+        self.assertEqual(ctx.exception.call_usage.input_tokens, 100)
+        self.assertEqual(ctx.exception.call_usage.output_tokens, 20)
+
 
 class GenerateTextLengthTests(unittest.TestCase):
     """finish_reason parity for the free-form path: a "length" finish escalates
@@ -878,13 +892,24 @@ class LiveC3Tests(unittest.TestCase):
 # ================= C2 — timeout + configurable concurrency ===================
 class TimeoutTests(unittest.TestCase):
     def test_default_timeout_wired_to_client(self):
+        # C7: the client gets an httpx.Timeout with a short connect phase and the
+        # full request timeout on read/write/pool — not a single scalar.
         _, captured = _construct_with_fake_openai()
-        self.assertEqual(captured["timeout"], llm_provider.DEFAULT_REQUEST_TIMEOUT)
+        t = captured["timeout"]
+        self.assertEqual(t.read, llm_provider.DEFAULT_REQUEST_TIMEOUT)
+        self.assertEqual(t.connect, llm_provider.CONNECT_TIMEOUT)
 
     def test_timeout_override(self):
         provider, captured = _construct_with_fake_openai(timeout=42.0)
-        self.assertEqual(captured["timeout"], 42.0)
+        self.assertEqual(captured["timeout"].read, 42.0)
         self.assertEqual(provider.timeout, 42.0)
+
+    def test_connect_timeout_clamped_below_read(self):
+        # A short overall timeout must not leave connect > read.
+        _, captured = _construct_with_fake_openai(timeout=3.0)
+        t = captured["timeout"]
+        self.assertEqual(t.read, 3.0)
+        self.assertLessEqual(t.connect, t.read)
 
     def test_default_max_retries_is_two(self):
         # The retry budget is load-bearing: worst-case slot-hold is
@@ -913,7 +938,7 @@ class TimeoutTests(unittest.TestCase):
         for bad in (0, -5, float("inf"), float("nan"), True, "abc"):
             provider, captured = _construct_with_fake_openai(timeout=bad)
             self.assertEqual(provider.timeout, llm_provider.DEFAULT_REQUEST_TIMEOUT)
-            self.assertEqual(captured["timeout"], llm_provider.DEFAULT_REQUEST_TIMEOUT)
+            self.assertEqual(captured["timeout"].read, llm_provider.DEFAULT_REQUEST_TIMEOUT)
 
 
 class ConcurrencyConfigTests(unittest.TestCase):

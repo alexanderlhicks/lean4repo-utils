@@ -34,6 +34,7 @@ import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Type, Union
 
+import httpx
 from pydantic import BaseModel
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -74,6 +75,14 @@ def _env_int(name: str, default: int) -> int:
 # (180 * (2 + 1)) that is ~9 min — bounded, yet generous enough for the slowest
 # legitimate call (large escalated structured outputs, web-search grounding).
 DEFAULT_REQUEST_TIMEOUT = 180.0
+
+# Connect-phase timeout, split out from the (long) read timeout. A blackholed
+# TCP connect would otherwise hold a concurrency slot for the FULL request
+# timeout (~180s) before failing — starving the pool on a dead upstream — even
+# though establishing a connection should take under a second (C7). Bounded well
+# under the read timeout so a genuine connect failure recycles the slot fast,
+# while a legitimately slow model response still gets the full read window.
+CONNECT_TIMEOUT = 10.0
 
 # Ceiling on the SDK retry budget. max_retries is the co-equal factor in the
 # worst-case slot-hold (timeout * (max_retries + 1)), so an oversized value would
@@ -217,6 +226,16 @@ class LLMResponseEnvelopeError(RuntimeError):
     def __init__(self, message: str, *, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code  # _status_code_of ignores a None
+        self.call_usage: Optional["TokenUsage"] = None  # per-call billed usage (C7)
+
+
+def _with_call_usage(exc: Exception, usage: "TokenUsage") -> Exception:
+    """Attach the per-call billed usage to a raising exception so a caller's
+    advisory accounting can record spend the failed call still incurred (C7).
+    Distinct from BudgetExceededError.usage (run totals): call_usage is the delta
+    for this single call, safe to record exactly once with no double-count."""
+    exc.call_usage = usage
+    return exc
 
 
 # 403 disambiguation. OpenRouter returns 403 for BOTH an auth/permission failure
@@ -594,11 +613,21 @@ class OpenRouterProvider:
             or os.environ.get("OPENROUTER_HTTP_REFERER", "https://github.com/lean-workflows"),
             "X-Title": x_title or os.environ.get("OPENROUTER_X_TITLE", "lean-workflow"),
         }
+        # Split the per-attempt timeout into a short connect phase and the full
+        # read/write/pool window (C7): a dead/blackholed upstream fails the
+        # connect in CONNECT_TIMEOUT instead of holding a slot for the whole
+        # read timeout, while a slow-but-live model still gets self.timeout to
+        # respond. The connect bound is clamped below self.timeout so an operator
+        # who lowers the overall timeout never ends up with connect > read.
+        request_timeout = httpx.Timeout(
+            self.timeout,  # default for read/write/pool
+            connect=min(CONNECT_TIMEOUT, self.timeout),
+        )
         self.client = OpenAI(
             base_url=OPENROUTER_BASE_URL,
             api_key=api_key,
             max_retries=self.max_retries,  # clamped; SDK retries 429/5xx/timeout, honoring Retry-After
-            timeout=self.timeout,     # per-attempt; bounds a stuck upstream (C2)
+            timeout=request_timeout,  # per-attempt; bounds a stuck upstream (C2/C7)
             default_headers=default_headers,
         )
 
@@ -782,12 +811,12 @@ class OpenRouterProvider:
                     if (attempt >= self.length_retry_attempts
                             or max_tokens >= self.length_retry_max_tokens
                             or self.budget.exceeded):
-                        raise ValueError(
+                        raise _with_call_usage(ValueError(
                             f"Model '{model}' hit the output token cap ({max_tokens}) before "
                             f"producing complete structured output, even after "
                             f"{self.length_retry_attempts} escalation(s); lower the thinking "
                             f"budget or split the input."
-                        ) from e
+                        ), usage_total) from e
                     new_max = min(max_tokens * 2, self.length_retry_max_tokens)
                     logging.warning(
                         f"Model '{model}' output truncated at max_tokens={max_tokens}; "
@@ -809,10 +838,13 @@ class OpenRouterProvider:
             # healing the SDK didn't apply) — validate the raw content ourselves.
             content = message.content
             if not content:
-                raise ValueError(
+                # Billed but unusable: record this completion's usage (once) and
+                # attach it so the caller's advisory accounting sees the spend (C7).
+                u = _sum_usage(usage_total, self._record_usage(completion))
+                raise _with_call_usage(ValueError(
                     f"Model '{model}' returned no parseable structured output "
                     f"(finish_reason={completion.choices[0].finish_reason})"
-                )
+                ), u)
             parsed = schema.model_validate_json(content)
 
         return parsed, _sum_usage(usage_total, self._record_usage(completion))
@@ -957,19 +989,19 @@ class OpenRouterProvider:
             else:
                 code = getattr(err, "code", None)
                 message = str(getattr(err, "message", "") or err)
-            self._record_usage(completion)
+            u = self._record_usage(completion)
             code_int = code if isinstance(code, int) and not isinstance(code, bool) else None
-            raise LLMResponseEnvelopeError(
+            raise _with_call_usage(LLMResponseEnvelopeError(
                 f"Model '{model}' returned an in-body error"
                 + (f" (code {code})" if code is not None else "")
                 + (f": {message[:200]}" if message else "."),
                 status_code=code_int,
-            )
+            ), u)
         if not getattr(completion, "choices", None):
-            self._record_usage(completion)
-            raise LLMResponseEnvelopeError(
+            u = self._record_usage(completion)
+            raise _with_call_usage(LLMResponseEnvelopeError(
                 f"Model '{model}' returned a response with no choices."
-            )
+            ), u)
         return completion
 
     def _record_usage(self, completion) -> TokenUsage:
