@@ -7,6 +7,12 @@ import sys
 from leanrepo_common.lean_utils import file_path_to_module_name
 
 
+class DiscoveryError(Exception):
+    """The changed-file query could not be executed. Distinct from a genuinely
+    empty change set: on this error discovery must fail closed (non-zero exit),
+    never proceed on an empty set that would silently review nothing (R9)."""
+
+
 def get_changed_lean_files(pr_number):
     # S1: pin to the base/head SHAs the worktree was checked out at (PR_BASE_SHA/
     # PR_HEAD_SHA) so the changed-file set matches the reviewed tree even under a
@@ -19,12 +25,12 @@ def get_changed_lean_files(pr_number):
         cmd = ["gh", "pr", "diff", str(pr_number), "--name-only"]
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
-        changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip().endswith('.lean')]
-        return changed_files
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
         # Do not echo raw stderr (may carry token-adjacent detail on a public log).
-        print(f"::error::Failed to get changed files for PR #{pr_number}.")
-        return []
+        # Fail closed: raise rather than return [] — an empty set here would make
+        # the whole pipeline review nothing while reporting success (R9).
+        raise DiscoveryError(f"Failed to get changed files for PR #{pr_number}.") from e
+    return [f.strip() for f in result.stdout.splitlines() if f.strip().endswith('.lean')]
 
 
 def get_lean_module_name(file_path):
@@ -150,11 +156,15 @@ def build_import_graph(index):
 
 
 def convert_module_to_file_path(module_name, index):
-    expected_suffix = module_name.replace('.', os.sep) + '.lean'
+    rel_path = module_name.replace('.', os.sep) + '.lean'
+    # Require a path-component boundary: module `Foo.Bar` (suffix `Foo/Bar.lean`)
+    # must not match `MyFoo/Bar.lean`. `endswith(sep + suffix)` anchors on a
+    # directory separator; the exact-equality arm covers a top-level module.
+    boundary = os.sep + rel_path
     for path in index:
-        if path.endswith(expected_suffix) or path == expected_suffix:
+        if path == rel_path or path.endswith(boundary):
             return path
-    return module_name.replace('.', os.sep) + ".lean"
+    return rel_path
 
 def main():
     pr_number = os.environ.get('PR_NUMBER')
@@ -162,7 +172,13 @@ def main():
          print("::error::PR_NUMBER environment variable is required.")
          sys.exit(1)
 
-    changed_files = get_changed_lean_files(pr_number)
+    try:
+        changed_files = get_changed_lean_files(pr_number)
+    except DiscoveryError as e:
+        # Fail closed: a failed changed-file query must stop the pipeline, not
+        # let the downstream steps run on an empty (silently-reviews-nothing) set.
+        print(f"::error::{e}")
+        sys.exit(1)
     changed_modules = {get_lean_module_name(f) for f in changed_files}
 
     all_relevant_files = set(changed_files)

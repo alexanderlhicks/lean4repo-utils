@@ -88,6 +88,21 @@ class TestConvertModuleToFilePath:
         result = convert_module_to_file_path("Foo.Bar", index)
         assert result.endswith("Foo" + os.sep + "Bar.lean")
 
+    def test_requires_path_component_boundary(self):
+        # R9: module Foo.Bar (suffix Foo/Bar.lean) must NOT match MyFoo/Bar.lean;
+        # only a real path-component boundary counts.
+        index = ["src/MyFoo/Bar.lean", "src/Foo/Bar.lean"]
+        assert convert_module_to_file_path("Foo.Bar", index) == "src/Foo/Bar.lean"
+
+    def test_no_spurious_prefix_match_falls_back(self):
+        index = ["src/MyFoo/Bar.lean"]  # only a non-boundary near-match exists
+        result = convert_module_to_file_path("Foo.Bar", index)
+        assert result == "Foo" + os.sep + "Bar.lean"  # heuristic, not the wrong file
+
+    def test_top_level_module_exact_match(self):
+        index = ["Baz.lean"]
+        assert convert_module_to_file_path("Baz", index) == "Baz.lean"
+
 
 class TestTransitiveDependencies:
     GRAPH = [

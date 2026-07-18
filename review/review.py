@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -149,6 +150,8 @@ class TokenTracker:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_thinking_tokens = 0
+        self.total_cost = 0.0
+        self.cost_reliable = True  # cleared once any call reports cost_missing/byok
         self.call_count = 0
 
     def record(self, usage: TokenUsage):
@@ -158,6 +161,9 @@ class TokenTracker:
             self.total_input_tokens += usage.input_tokens
             self.total_output_tokens += usage.output_tokens
             self.total_thinking_tokens += usage.thinking_tokens
+            self.total_cost += usage.cost
+            if usage.cost_missing or usage.byok:
+                self.cost_reliable = False
 
     def summary(self) -> str:
         with self._lock:
@@ -166,10 +172,36 @@ class TokenTracker:
             if self.total_thinking_tokens > 0:
                 parts.append(f" + {self.total_thinking_tokens:,} thinking")
             parts.append(f" = {total:,} total across {self.call_count} API calls")
+            # Accumulated cost (C7). Flag when the figure is a lower bound — a
+            # call reported no cost, or BYOK fee-only cost — so it isn't read as exact.
+            if self.cost_reliable:
+                parts.append(f"; cost ${self.total_cost:.6f}")
+            else:
+                parts.append(f"; cost ${self.total_cost:.6f}+ (partial — some calls reported no/BYOK cost)")
             return "".join(parts)
 
 token_tracker = TokenTracker()
 file_cache = FileCache()
+
+# --- S3: per-run nonce fencing of untrusted spans ---------------------------
+# A fork PR author controls diffs, file contents, spec/URL reference text and
+# signatures. The old `--- {file} ---` delimiters are forgeable from inside that
+# content: a diff body line like `--- a/x.lean ---`, or a Lean comment `--- End
+# ---`, spoofs the boundary and lets injected text pose as trusted framing. A
+# per-run random nonce the author cannot predict removes that trivial forgery.
+# Defense-in-depth ONLY — the real isolation is S2's secret-free build split;
+# spotlighting collapses under adaptive attack and is not a security boundary.
+_RUN_NONCE = secrets.token_hex(8)
+
+
+def _fence(content: str, label: str, *, nonce: Optional[str] = None) -> str:
+    """Wrap untrusted `content` in per-run nonce markers (S3). Any literal
+    occurrence of the nonce inside the content is stripped first, so the data
+    cannot forge the boundary token and close the fence early."""
+    n = nonce if nonce is not None else _RUN_NONCE
+    body = content.replace(n, "") if n else content
+    return f"[UNTRUSTED-DATA {label} · {n}]\n{body}\n[/UNTRUSTED-DATA · {n}]"
+
 
 # Thinking budgets (set by main() from CLI args)
 THINKING_BUDGET_HIGH = 10240   # deep analysis agents (Agent A, B, Cross-File)
@@ -766,11 +798,11 @@ def get_document_content(urls_str: str, records: "Optional[List[ContextRecord]]"
                 text = soup.get_text()
                 lines = (line.strip() for line in text.splitlines())
                 content = "\n".join(chunk for line in lines for chunk in line.split("  ") if chunk)
-                parts.append(ContentPart(type="text", data=f"--- Content from {url} ---\n{content}\n"))
+                parts.append(ContentPart(type="text", data=_fence(content, f"content from {url}") + "\n"))
                 logging.info(f"Added parsed HTML part from: {url}")
             else:
                 content = response.text
-                parts.append(ContentPart(type="text", data=f"--- Content from {url} ---\n{content}\n"))
+                parts.append(ContentPart(type="text", data=_fence(content, f"content from {url}") + "\n"))
                 logging.info(f"Added plain text part from: {url}")
             if records is not None:
                 records.append(ContextRecord(url, "external", True))
@@ -833,7 +865,7 @@ def get_local_reference_parts(paths_str: str, records: "Optional[List[ContextRec
                     if records is not None:
                         records.append(ContextRecord(fp, "spec", False))
                     continue
-                parts.append(ContentPart(type="text", data=f"--- Specification reference: {fp} ---\n{content}\n"))
+                parts.append(ContentPart(type="text", data=_fence(content, f"specification reference: {fp}") + "\n"))
             logging.info(f"Added local spec reference: {fp}")
             if records is not None:
                 records.append(ContextRecord(fp, "spec", True))
@@ -1150,7 +1182,7 @@ def get_summary_context(paths_str: str) -> str:
                 pending_attr = None
 
         if sig_lines:
-            summary_parts.append(f"--- Signatures from {file_path} ---\n" + "\n".join(sig_lines) + "\n--- End ---\n")
+            summary_parts.append(_fence("\n".join(sig_lines), f"signatures from {file_path}") + "\n")
 
     return "\n".join(summary_parts)
 
@@ -1159,22 +1191,40 @@ def _call_provider(provider: LLMProvider, model: str, contents: List[ContentPart
                    schema, thinking_budget=None, toolbox: Optional[LeanToolbox] = None):
     """Wrapper: calls provider, records token usage, returns parsed object.
     When `toolbox` is given, the model may call its Lean tools before answering."""
-    if toolbox is not None:
-        parsed, usage = provider.generate_structured(
-            model=model, contents=contents, schema=schema,
-            thinking_budget=thinking_budget,
-            tools=toolbox.specs() or None, tool_runner=toolbox.run,
-        )
-    else:
-        parsed, usage = provider.generate_structured(
-            model=model, contents=contents, schema=schema, thinking_budget=thinking_budget,
-        )
+    try:
+        if toolbox is not None:
+            parsed, usage = provider.generate_structured(
+                model=model, contents=contents, schema=schema,
+                thinking_budget=thinking_budget,
+                tools=toolbox.specs() or None, tool_runner=toolbox.run,
+            )
+        else:
+            parsed, usage = provider.generate_structured(
+                model=model, contents=contents, schema=schema, thinking_budget=thinking_budget,
+            )
+    except Exception as e:
+        # C7: a billed call that raises after generation (in-body envelope error,
+        # length-cap exhaustion, unparseable output) still spent tokens. Record
+        # that per-call spend into the advisory budget + tracker before re-raising
+        # so cost accounting and later prompt-sizing reflect it. `call_usage` is
+        # the per-call delta (not BudgetExceededError's run-totals), so recording
+        # it exactly once here cannot double-count.
+        call_usage = getattr(e, "call_usage", None)
+        if call_usage is not None:
+            _record_advisory_usage(provider, call_usage)
+        raise
+    _record_advisory_usage(provider, usage)
+    return parsed
+
+
+def _record_advisory_usage(provider: LLMProvider, usage) -> None:
+    """Record a call's usage into review's advisory budget (when distinct from the
+    hard budget the provider already feeds) and the run token tracker."""
     advisory_budget = getattr(provider, "prompt_budget", None)
     hard_budget = getattr(provider, "budget", None)
     if advisory_budget is not None and advisory_budget is not hard_budget:
         advisory_budget.record_and_check(usage)
     token_tracker.record(usage)
-    return parsed
 
 
 # Marker in the per-file review templates separating the stable, per-run-constant
@@ -1235,7 +1285,7 @@ def get_lake_graph_str() -> str:
 
 def run_triage(provider: LLMProvider, diff_by_file: Dict[str, str], spec_checklist: str, additional_comments: str, model_name: str) -> List[ReviewCluster]:
     """Triage Agent: Groups changed files into review clusters based on dependencies and coupling."""
-    all_diffs = "\n".join([f"--- {f} ---\n{d}" for f, d in diff_by_file.items()])
+    all_diffs = "\n".join([_fence(d, f"diff of {f}") for f, d in diff_by_file.items()])
 
     # Use the import graph from the discover step (avoids rebuilding it)
     dep_graph = get_lake_graph_str() or "Dependency graph not available."
@@ -1427,7 +1477,7 @@ def _format_repo_files(files_by_path: Dict[str, str], exclude: Optional[set] = N
     separately)."""
     exclude = exclude or set()
     emitted = [
-        f"--- Start of content from {path} ---\n{content}\n--- End of content from {path} ---\n\n"
+        _fence(content, f"content from {path}") + "\n\n"
         for path, content in files_by_path.items() if path not in exclude
     ]
     if not emitted:
@@ -1678,6 +1728,38 @@ def _finding_location(location: str) -> Tuple[str, Optional[int]]:
     if not match:
         return location.strip().lower(), None
     return match.group(1).strip().lower(), int(match.group(2))
+
+
+def _compute_thinking_budgets(high: int) -> Tuple[int, int]:
+    """Return (high, low) thinking budgets. LOW (triage/synthesis) must never
+    exceed HIGH (deep-analysis agents): a small HIGH — e.g. `--thinking-budget 0`
+    or any value below 1280 — would otherwise give triage a LARGER budget than
+    deep analysis, inverting the intended hierarchy (R9)."""
+    return high, min(high, max(1024, high // 5))
+
+
+_LEAN_PATH_RE = re.compile(r'([\w./\-]+\.lean)')
+
+
+def _lean_path_in(text: str) -> Optional[str]:
+    """First `.lean` path token in a model-supplied string, case-preserving
+    (unlike _finding_location, which lowercases for matching). Used to locate
+    the file a cross-file/dependent-impact finding is about so it can be read."""
+    m = _LEAN_PATH_RE.search(text or "")
+    return m.group(1) if m else None
+
+
+def _within_repo(path: str) -> bool:
+    """Whether a model-supplied path resolves inside the checked-out repo tree.
+    The path comes from a finding's (LLM-generated, PR-influenced) location, so a
+    prompt-injected `../…/x.lean` must not escape the workspace to read arbitrary
+    `.lean`-suffixed files into a verifier prompt (defense-in-depth beneath S2/S7)."""
+    try:
+        root = os.path.realpath(os.getcwd())
+        resolved = os.path.realpath(path)
+        return resolved == root or resolved.startswith(root + os.sep)
+    except OSError:
+        return False
 
 
 def _finding_text(finding: Finding) -> str:
@@ -2034,6 +2116,18 @@ def analyze_file_changes_with_context(provider: LLMProvider, review_context: dic
     logging.info(f"Chunked review of {file_path}: {reviewed_sections} changed section(s), "
                  f"{len(reviews)} succeeded, {len(errors)} failed.")
 
+    # No section carried a textual hunk: the diff is a pure rename / mode change
+    # / metadata-only change of a large file. That is a benign no-op review, not
+    # a failure — returning an error here would strand the whole run in a
+    # permanent `review_incomplete` state (R9). Emit an empty Approved review.
+    if reviewed_sections == 0 and not errors:
+        noop = FileReview(
+            analysis=f"No textual changes to review in `{file_path}` "
+                     f"(rename, mode change, or metadata-only diff).",
+            verdict="Approved",
+        )
+        return noop, _format_file_review(noop, file_path)
+
     merged = _merge_file_reviews(reviews)
     if merged is None:
         return None, (f"An error occurred while analyzing `{file_path}` (chunked): "
@@ -2086,9 +2180,9 @@ def analyze_cross_file(provider: LLMProvider, diff_by_file: Dict[str, str], spec
             continue
         content = file_cache.read(file_path)
         if content is not None:
-            all_changed_contents += f"--- Start of {file_path} ---\n{content}\n--- End of {file_path} ---\n\n"
+            all_changed_contents += _fence(content, f"content of {file_path}") + "\n\n"
 
-    all_diffs = "\n".join([f"--- {f} ---\n{d}" for f, d in diff_by_file.items()])
+    all_diffs = "\n".join([_fence(d, f"diff of {f}") for f, d in diff_by_file.items()])
 
     additional_comments_section = ""
     if additional_comments and additional_comments.strip():
@@ -2416,12 +2510,30 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
                 if fp.endswith('.lean'):
                     content = file_cache.read(fp)
                     if content is not None:
-                        chunks.append(f"--- {fp} ---\n{content}")
+                        chunks.append(_fence(content, f"content of {fp}"))
             cross_ctx_cache[0] = f"Specification checklist:\n{spec}\n\nChanged files:\n" + "\n\n".join(chunks)
         return cross_ctx_cache[0]
 
+    def ctx_and_module_for_cross(f: Finding) -> Tuple[str, Optional[str]]:
+        """Cross-file findings verify against the changed-file context. But a
+        dependent-impact finding is ABOUT an unchanged consumer file that is not
+        in the changed set — so it is absent from ctx_for_cross(), and the
+        verifier would see nothing of the file the finding concerns, making
+        verification a no-op for that whole class (R9). Pull the referenced file
+        in (and scope the Lean toolbox to it) when it is not already present."""
+        base = ctx_for_cross()
+        path = _lean_path_in(f.location) or _lean_path_in(f.evidence_locator)
+        if path and path not in diff_by_file and _within_repo(path):
+            content = file_cache.read(path)
+            if content is not None:
+                return (
+                    base + "\n\n" + _fence(content, f"{path} (dependent file, unchanged)"),
+                    file_path_to_module_name(path),
+                )
+        return base, None
+
     # Collect (finding, context, module) jobs. `module` scopes the Lean toolbox
-    # to the finding's file (None for cross-file findings, which span files).
+    # to the finding's file (None for cross-file findings that span files).
     jobs: List[Tuple[Finding, str, Optional[str]]] = []
     for fp, review in per_file_structured.items():
         if review is None:
@@ -2432,7 +2544,8 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
     if cross_file_structured is not None:
         for cat in _CROSS_FILE_CATEGORIES:
             for f in getattr(cross_file_structured, cat):
-                jobs.append((f, ctx_for_cross(), None))
+                ctx, module = ctx_and_module_for_cross(f)
+                jobs.append((f, ctx, module))
 
     if not jobs:
         return []
@@ -2805,10 +2918,9 @@ def main():
         and os.environ.get("VERIFY_FINDINGS", "true").lower() not in ("false", "0", "no")
     )
 
-    # Configure thinking budgets
+    # Configure thinking budgets.
     global THINKING_BUDGET_HIGH, THINKING_BUDGET_LOW
-    THINKING_BUDGET_HIGH = args.thinking_budget
-    THINKING_BUDGET_LOW = max(1024, args.thinking_budget // 5)
+    THINKING_BUDGET_HIGH, THINKING_BUDGET_LOW = _compute_thinking_budgets(args.thinking_budget)
 
     # Delete any stale output files before we run — and before EVERY early
     # exit below. The Lean build step executes PR-branch lakefile code in this
@@ -3017,7 +3129,7 @@ def main():
             logging.error(f"Error: verdict_rules.md not found at {verdict_rules_path}")
             sys.exit(1)
 
-        all_diffs = "\n".join([f"--- {f} ---\n{d}" for f, d in diff_by_file.items()])
+        all_diffs = "\n".join([_fence(d, f"diff of {f}") for f, d in diff_by_file.items()])
 
         # --- Multi-Agent Orchestration Step 0: Mechanical Pre-Checks ---
         precheck_scan = scan_escape_hatches(diff_by_file)

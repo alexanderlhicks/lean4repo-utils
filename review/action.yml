@@ -144,6 +144,10 @@ runs:
       uses: astral-sh/setup-uv@v8.2.0
       with:
         enable-cache: true
+        # Key the uv cache on THIS action's lockfile (deps come from
+        # github.action_path via `uv sync --frozen`), not the target repo's —
+        # otherwise the cache is scoped to unrelated workspace lockfiles.
+        cache-dependency-glob: "${{ github.action_path }}/uv.lock"
 
     - name: Set up Lean and Build
       uses: leanprover/lean-action@v1.5.0
@@ -295,7 +299,7 @@ runs:
           --repo-context-refs "$REPO_CONTEXT_REFS" \
           --additional-comments "$ADDITIONAL_COMMENTS" \
           --model "$MODEL" \
-          --thinking-budget "$THINKING_BUDGET" \
+          ${THINKING_BUDGET:+--thinking-budget "$THINKING_BUDGET"} \
           ${SPEC_MODEL:+--spec-model "$SPEC_MODEL"} \
           ${TRIAGE_MODEL:+--triage-model "$TRIAGE_MODEL"} \
           ${REVIEW_MODEL:+--review-model "$REVIEW_MODEL"} \
@@ -322,6 +326,10 @@ runs:
         # (S1), not a fresh re-resolve that a mid-run force-push could have moved.
         REVIEW_HEAD_SHA: ${{ steps.resolve_head.outputs.head_sha }}
       with:
+        # Use the action's configured token for all review-posting/dismiss API
+        # calls, so a deployment passing a PAT/App token isn't silently ignored
+        # in favor of the ambient GITHUB_TOKEN (every other step uses this token).
+        github-token: ${{ inputs.github_token }}
         retries: 3
         script: |
           const fs = require('fs');
