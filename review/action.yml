@@ -68,7 +68,7 @@ inputs:
     required: false
     default: 'deepseek/deepseek-v4-pro'
   verify_findings:
-    description: 'Run the adversarial verification pass that filters likely-false-positive findings. "false" to disable.'
+    description: 'Run the adversarial verification pass. Refuted findings are removed; only confirmed findings may block or become inline annotations; uncertain/unavailable findings remain advisory. "false" to disable and use grounded initial-reviewer findings directly.'
     required: false
     default: 'true'
   llm_max_run_tokens:
@@ -144,10 +144,12 @@ runs:
       uses: astral-sh/setup-uv@v8.2.0
       with:
         enable-cache: true
-        # Key the uv cache on THIS action's lockfile (deps come from
-        # github.action_path via `uv sync --frozen`), not the target repo's —
-        # otherwise the cache is scoped to unrelated workspace lockfiles.
-        cache-dependency-glob: "${{ github.action_path }}/uv.lock"
+        # This is a uv workspace: the sole lockfile is one directory above this
+        # subdirectory action. setup-uv resolves dependency globs relative to
+        # working-directory, so hash the action repository's real lock—not a
+        # nonexistent review/uv.lock or the caller repository's dependencies.
+        working-directory: "${{ github.action_path }}/.."
+        cache-dependency-glob: "uv.lock"
 
     - name: Set up Lean and Build
       uses: leanprover/lean-action@v1.5.0
@@ -163,9 +165,11 @@ runs:
       id: lean_build
       shell: bash
       continue-on-error: true
+      env:
+        BUILD_LOG_PATH: ${{ runner.temp }}/lean-review-build-${{ github.run_id }}-${{ github.run_attempt }}.log
       run: |
         set +e
-        build_log="$RUNNER_TEMP/lean-build.log"
+        build_log="$BUILD_LOG_PATH"
         lake build 2>&1 | tee "$build_log"
         build_rc=${PIPESTATUS[0]}
 
@@ -215,6 +219,7 @@ runs:
         # (S1), so a mid-run force-push can't skew changed-files vs. the reviewed tree.
         PR_HEAD_SHA: ${{ steps.resolve_head.outputs.head_sha }}
         PR_BASE_SHA: ${{ steps.resolve_head.outputs.base_sha }}
+        LAKE_GRAPH_OUT: ${{ runner.temp }}/lean-review-graph-${{ github.run_id }}-${{ github.run_attempt }}.json
       run: uv run --project "${{ github.action_path }}" --no-dev --frozen python "${{ github.action_path }}/discover_files.py"
 
 
@@ -237,7 +242,7 @@ runs:
         CHANGED_FILES: ${{ steps.discover_files.outputs.changed_files }}
         SPEC_REFS: ${{ inputs.spec_refs }}
         ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
-        PAPER_LEAN_EVIDENCE_OUT: ${{ runner.temp }}/paper-lean-evidence.json
+        PAPER_LEAN_EVIDENCE_OUT: ${{ runner.temp }}/lean-review-evidence-${{ github.run_id }}-${{ github.run_attempt }}.json
       run: uv run --project "${{ github.action_path }}" --no-dev --frozen python "${{ github.action_path }}/paper_lean_evidence.py"
 
     - name: Run AI Review Script
@@ -405,27 +410,26 @@ runs:
             console.log('No annotations file found, posting as comment only.');
           }
 
-          // A GitHub Review cannot be updated in place. Before creating a new
-          // annotated review, dismiss an earlier bot review for this same head
-          // that carries our marker. This keeps reruns on one commit idempotent
-          // while leaving reviews for other commits in the PR history intact.
-          async function supersedeSameHeadReview() {
+          // Inline review comments cannot be replaced, but the submitted
+          // review's summary body CAN be updated. Reuse that review on a
+          // same-head rerun instead of relying on the dismissal API, which on
+          // protected branches requires special repository authority and its
+          // failure previously created duplicate review objects.
+          async function findSameHeadReview() {
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
               owner, repo, pull_number: pr_number, per_page: 100,
             });
-            for (const review of reviews) {
+            for (const review of reviews.slice().reverse()) {
               const isBot = review.user && review.user.type === 'Bot';
-              // Only dismiss reviews emitted by this workflow. The generic AI
+              // Only reuse reviews emitted by this workflow. The generic AI
               // header is intentionally not enough: another bot may use it.
               const isOurReview = review.body && review.body.includes(reviewMarker);
               if (isBot && isOurReview && review.commit_id === commit_id &&
                   review.state !== 'DISMISSED' && review.id) {
-                await github.rest.pulls.dismissReview({
-                  owner, repo, pull_number: pr_number, review_id: review.id,
-                  message: 'Superseded by a rerun for the same reviewed commit.',
-                });
+                return review;
               }
             }
+            return null;
           }
 
           async function removeSameHeadRegularComments() {
@@ -442,12 +446,40 @@ runs:
 
           // A rerun can switch between the annotated-review and regular-comment
           // paths (for example, when findings cross the inline-comment limit).
-          // Supersede same-head review objects before either path so both modes
-          // remain idempotent for the reviewed commit.
+          // If an annotated review already exists for this exact head, update
+          // its body and retain its original inline comments. This is the only
+          // same-head path that does not require elevated dismissal authority.
+          let sameHeadReview = null;
           try {
-            await supersedeSameHeadReview();
+            sameHeadReview = await findSameHeadReview();
           } catch (e) {
-            console.log(`Could not supersede an earlier review: ${e.message}`);
+            console.log(`Could not inspect earlier reviews: ${e.message}`);
+          }
+          if (sameHeadReview) {
+            try {
+              const retainedInlineNote = '\n\n> [!NOTE]\n> Same-commit rerun: this summary is current; inline comments are retained from the first annotated run for this commit.';
+              await github.rest.pulls.updateReview({
+                owner, repo, pull_number: pr_number,
+                review_id: sameHeadReview.id, body: markedBody + retainedInlineNote,
+              });
+              console.log('Updated existing same-head review body; retained its inline comments.');
+              try {
+                await removeSameHeadRegularComments();
+              } catch (e) {
+                console.log(`Review updated, but old regular comment cleanup failed: ${e.message}`);
+              }
+              try {
+                await postOverflow();
+              } catch (e) {
+                console.log(`Review updated, but overflow comments failed: ${e.message}`);
+              }
+              return;
+            } catch (e) {
+              // Do not create another annotated review after an update failure;
+              // fall through to the one-per-head regular-comment path instead.
+              console.log(`Could not update existing same-head review: ${e.message}. Falling back to comment.`);
+              annotations = [];
+            }
           }
 
           if (annotations.length > 0) {
@@ -516,5 +548,10 @@ runs:
     - name: Clean up artifacts
       if: always()
       shell: bash
+      env:
+        BUILD_LOG_PATH: ${{ runner.temp }}/lean-review-build-${{ github.run_id }}-${{ github.run_attempt }}.log
+        LAKE_GRAPH_OUT: ${{ runner.temp }}/lean-review-graph-${{ github.run_id }}-${{ github.run_attempt }}.json
+        PAPER_LEAN_EVIDENCE_OUT: ${{ runner.temp }}/lean-review-evidence-${{ github.run_id }}-${{ github.run_attempt }}.json
       run: |
+        rm -f "$BUILD_LOG_PATH" "$LAKE_GRAPH_OUT" "$PAPER_LEAN_EVIDENCE_OUT"
         rm -f ./review_annotations.json ./review_comments.json ./review_health.json

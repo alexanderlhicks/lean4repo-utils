@@ -8,7 +8,51 @@ Used by the summary and review actions and the sorry-tracker CLI.
 
 import os
 import re
+import stat
 from typing import Dict, List, Optional, Tuple
+
+
+def resolve_confined_path(
+    file_path: str,
+    root: Optional[str] = None,
+    expect: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve an existing path only when it stays inside ``root``.
+
+    Repository paths can come from a checked-out PR.  A lexical ``..`` check is
+    not enough there: a committed symlink such as ``Leak.lean`` can point at
+    ``/proc/self/environ`` and make a later ordinary ``open`` read runner
+    secrets.  This helper rejects a symlink in the final path component, checks
+    the fully resolved path against the repository root, and optionally
+    requires a regular file (``expect="file"``) or directory
+    (``expect="dir"``).
+
+    Absolute paths are accepted only when they resolve inside ``root``.  The
+    returned value is absolute, so callers do not accidentally validate one
+    path and open another after changing working directory.
+    """
+    if not file_path or expect not in (None, "file", "dir"):
+        return None
+    root_real = os.path.realpath(root or os.getcwd())
+    candidate = os.path.abspath(file_path)
+    try:
+        # Reject a PR-controlled final-component symlink even when it happens to
+        # point elsewhere inside the checkout.  Git symlinks are data, not files
+        # whose targets the review pipeline should dereference.
+        metadata = os.lstat(candidate)
+        if stat.S_ISLNK(metadata.st_mode):
+            return None
+        resolved = os.path.realpath(candidate)
+        if os.path.commonpath((root_real, resolved)) != root_real:
+            return None
+    except (OSError, ValueError):
+        return None
+
+    if expect == "file" and not stat.S_ISREG(metadata.st_mode):
+        return None
+    if expect == "dir" and not stat.S_ISDIR(metadata.st_mode):
+        return None
+    return resolved
 
 
 def is_in_comment(line: str, nesting_depth: int) -> Tuple[bool, int]:
@@ -19,32 +63,10 @@ def is_in_comment(line: str, nesting_depth: int) -> Tuple[bool, int]:
 
     Returns (line_has_no_code_outside_comments, new_nesting_depth).
     """
-    stripped = line.strip()
-
-    if nesting_depth == 0 and stripped.startswith('--'):
-        return True, 0
-
-    has_code = False
-    i = 0
-    while i < len(stripped):
-        if i + 1 < len(stripped):
-            pair = stripped[i:i + 2]
-            if pair == '/-':
-                nesting_depth += 1
-                i += 2
-                continue
-            if pair == '-/' and nesting_depth > 0:
-                nesting_depth -= 1
-                i += 2
-                continue
-            if pair == '--' and nesting_depth == 0:
-                break  # rest of line is a single-line comment
-
-        if nesting_depth == 0 and not stripped[i].isspace():
-            has_code = True
-        i += 1
-
-    return not has_code, nesting_depth
+    # Reuse the string-aware comment stripper so `/-` and `--` inside a Lean
+    # string cannot poison the nesting state used by summary's fallback scan.
+    code, nesting_depth = strip_comments(line, nesting_depth)
+    return not code.strip(), nesting_depth
 
 
 def strip_comments(line: str, nesting_depth: int) -> Tuple[str, int]:
@@ -70,7 +92,15 @@ def strip_comments(line: str, nesting_depth: int) -> Tuple[str, int]:
         ch = line[i]
         if in_string:
             out.append(ch)
-            if ch == '"' and (i == 0 or line[i - 1] != '\\'):
+            # Consume an escaped character as a pair. This correctly handles an
+            # even backslash run before a quote: the first slash escapes the
+            # second, then the quote closes the string. Looking only at the
+            # immediately previous character incorrectly kept that quote open.
+            if ch == '\\' and i + 1 < n:
+                out.append(line[i + 1])
+                i += 2
+                continue
+            if ch == '"':
                 in_string = False
             i += 1
             continue
@@ -257,7 +287,7 @@ def file_path_to_module_name(file_path: str, src_dir: Optional[str] = None) -> s
                 file_path = file_path[len(prefix):]
                 break
 
-    return file_path.replace('/', '.').replace('.lean', '')
+    return file_path.removesuffix('.lean').replace('/', '.')
 
 
 def import_search_dirs(repo_root: str) -> List[str]:
@@ -331,7 +361,12 @@ class FileCache:
                 self._cache[file_path] = None
             else:
                 try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
+                    with open(
+                        file_path,
+                        'r',
+                        encoding='utf-8-sig',
+                        errors='replace',
+                    ) as f:
                         self._cache[file_path] = f.read()
                 except Exception:
                     self._cache[file_path] = None

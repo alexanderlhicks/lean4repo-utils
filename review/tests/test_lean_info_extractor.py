@@ -3,6 +3,8 @@
 import sys
 import os
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lean_info_extractor import (
@@ -114,6 +116,19 @@ noncomputable def myNonComp := Classical.choice ⟨0⟩
         )
         assert get_lean_declarations(str(lean_file)) == ["Ns.Sub.item", "Nat.mine"]
 
+    def test_inline_attributes_do_not_hide_declarations(self, tmp_path):
+        lean_file = tmp_path / "Attrs.lean"
+        lean_file.write_text(
+            "namespace Ns\n"
+            "@[simp] theorem coeff_add : True := trivial\n"
+            "@[inline, aesop safe apply] protected def helper := 1\n"
+            "end Ns\n"
+        )
+
+        assert get_lean_declarations(str(lean_file)) == [
+            "Ns.coeff_add", "Ns.helper",
+        ]
+
     def test_private_and_anonymous_instance_skipped(self, tmp_path):
         lean_file = tmp_path / "Priv.lean"
         lean_file.write_text(
@@ -162,6 +177,20 @@ class TestExtractSorryWarnings:
         lean_file.write_text("-- sorry\ndef foo := 1\n")
         locs = extract_sorry_warnings(str(lean_file))
         assert len(locs) == 0
+
+
+class TestConfinedChangedFiles:
+    def test_full_extractor_rejects_symlinked_changed_file(self, tmp_path, monkeypatch):
+        outside = tmp_path.parent / "outside-lean-info.lean"
+        outside.write_text("theorem leaked : True := sorry\n")
+        (tmp_path / "Leak.lean").symlink_to(outside)
+        monkeypatch.chdir(tmp_path)
+
+        info = extract_info_for_files(["Leak.lean"])
+
+        assert info["files"] == {}
+        assert info["sorry_locations"] == []
+        assert info["errors"] and "unsafe changed path" in info["errors"][0]
 
     def test_ignores_nested_block_comments(self, tmp_path):
         lean_file = tmp_path / "Foo.lean"
@@ -335,6 +364,10 @@ class TestExtractDiagnostics:
 
 
 class TestExtractInfoForFiles:
+    @pytest.fixture(autouse=True)
+    def _checkout_root(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
     def test_skips_non_lean(self, tmp_path):
         md_file = tmp_path / "README.md"
         md_file.write_text("hello")
@@ -410,6 +443,10 @@ class TestExtractInfoForFiles:
 
 
 class TestExtractLightInfo:
+    @pytest.fixture(autouse=True)
+    def _checkout_root(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
     def test_finds_sorry_in_summary_files(self, tmp_path):
         lean_file = tmp_path / "Summary.lean"
         lean_file.write_text("theorem foo : True := sorry\n")

@@ -22,7 +22,8 @@ from pydantic import BaseModel, Field
 
 from leanrepo_common.diff_utils import parse_git_diff_header
 from leanrepo_common.lean_utils import (
-    is_in_comment, scrub_line, strip_comments_preserve_strings,
+    is_in_comment, resolve_confined_path, scrub_line,
+    strip_comments_preserve_strings,
 )
 from leanrepo_common.llm_provider import (
     ContentPart, LLMProvider, TokenUsage, create_provider,
@@ -185,10 +186,13 @@ class TokenTracker:
 
     def summary(self) -> str:
         with self._lock:
-            total = self.total_input + self.total_output + self.total_thinking
+            # OpenRouter reasoning/thinking tokens are already included in
+            # output_tokens; display the subset for visibility, but never add it
+            # to the authoritative input+output total.
+            total = self.total_input + self.total_output
             parts = [f"Token usage: {self.total_input:,} input + {self.total_output:,} output"]
             if self.total_thinking > 0:
-                parts.append(f" + {self.total_thinking:,} thinking")
+                parts.append(f" ({self.total_thinking:,} thinking included in output)")
             parts.append(f" = {total:,} total across {self.call_count} API calls")
             # Accumulated cost (C7); flagged as a lower bound when any call had
             # no/BYOK cost so the number isn't mistaken for exact.
@@ -231,9 +235,19 @@ def _call_llm(prompt, model_name, schema):
     Returns the parsed schema instance. Raises on provider failure after retries.
     """
     parts = [ContentPart(type="text", data=prompt)]
-    parsed, usage = _provider.generate_structured(
-        model=model_name, contents=parts, schema=schema,
-    )
+    try:
+        parsed, usage = _provider.generate_structured(
+            model=model_name, contents=parts, schema=schema,
+        )
+    except Exception as e:
+        # A provider can finish—and bill—a generation before discovering that
+        # its structured response is unusable. The hard RunBudget is recorded
+        # inside the provider; this separate tracker powers the PR-visible run
+        # summary and must receive the same per-call delta on raising paths.
+        call_usage = getattr(e, "call_usage", None)
+        if call_usage is not None:
+            token_tracker.record(call_usage)
+        raise
     token_tracker.record(usage)
     return parsed
 
@@ -424,13 +438,18 @@ _PROOF_RELEVANT_PATTERNS = re.compile(r'\b(sorry|admit|native_decide)\b')
 _SORRY_RE = re.compile(r'\bsorry\b')
 
 def _detect_proof_signals(file_diff):
-    """Check if a file diff contains proof-relevant keywords in added/removed lines."""
+    """Find proof keywords in changed Lean code, excluding strings/comments."""
     signals = set()
     for line in file_diff.splitlines():
         if not line.startswith(('+', '-')) or line.startswith(('+++', '---')):
             continue
-        if _PROOF_RELEVANT_PATTERNS.search(line):
-            signals.update(m.group() for m in _PROOF_RELEVANT_PATTERNS.finditer(line))
+        # Diff lines are discontinuous views of two source revisions, so use a
+        # fresh scanner state per line (the same conservative U6 policy as the
+        # deterministic trackers). This removes common false priority signals
+        # such as `-- mention sorry` and `IO.println "sorry"`.
+        code, _, _ = scrub_line(line[1:], 0, False)
+        if _PROOF_RELEVANT_PATTERNS.search(code):
+            signals.update(m.group() for m in _PROOF_RELEVANT_PATTERNS.finditer(code))
     return signals
 
 # Unambiguously non-reviewable files: lockfiles, binaries/media, compiled
@@ -658,10 +677,16 @@ def _load_lean_source(path, revision=None):
             check=False,
         )
         return result.stdout if result.returncode == 0 else ""
+    # The current checkout may be fork-controlled under pull_request_target.
+    # Never follow a changed-path symlink (or lexical escape) while preparing
+    # declaration context for a secret-bearing LLM call.
+    safe_path = resolve_confined_path(path, expect="file")
+    if not safe_path:
+        return ""
     try:
-        with open(path, "r", errors="replace") as f:
+        with open(safe_path, "r", errors="replace") as f:
             return f.read()
-    except FileNotFoundError:
+    except OSError:
         return ""
 
 def synthesize_summary_staged(per_file_summaries, model_name, pr_title, pr_body, pr_type_hint=""):
@@ -1898,10 +1923,11 @@ def main():
         # any diffed text file (e.g. a Latin-1 comment in vendored C sources)
         # must degrade to a replacement char, not crash the whole run. Matches
         # every other untrusted read in this file.
-        with open("pr.diff", "r", errors="replace") as f:
+        diff_path = os.environ.get("PR_DIFF_PATH", "pr.diff")
+        with open(diff_path, "r", errors="replace") as f:
             diff = f.read()
     except FileNotFoundError:
-        sys.exit("Error: pr.diff not found.")
+        sys.exit("Error: PR diff artifact not found.")
 
     analyzer = DiffAnalyzer(keywords, base_revision=os.environ.get("MERGE_BASE"))
     analyzer.analyze(diff)

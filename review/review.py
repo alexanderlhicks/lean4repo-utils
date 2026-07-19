@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 from leanrepo_common.diff_utils import parse_git_diff_header, unquote_git_path
 from leanrepo_common.lean_utils import (
     scrub_line, strip_comments_preserve_strings,
-    FileCache, file_path_to_module_name,
+    FileCache, file_path_to_module_name, resolve_confined_path,
 )
 from leanrepo_common.llm_provider import (
     LLMProvider, ContentPart, TokenUsage, create_provider,
@@ -167,10 +167,14 @@ class TokenTracker:
 
     def summary(self) -> str:
         with self._lock:
-            total = self.total_input_tokens + self.total_output_tokens + self.total_thinking_tokens
+            # reasoning_tokens are a subset of output_tokens in OpenRouter's
+            # usage schema. Keep the breakdown, but do not count them twice.
+            total = self.total_input_tokens + self.total_output_tokens
             parts = [f"Token usage: {self.total_input_tokens:,} input + {self.total_output_tokens:,} output"]
             if self.total_thinking_tokens > 0:
-                parts.append(f" + {self.total_thinking_tokens:,} thinking")
+                parts.append(
+                    f" ({self.total_thinking_tokens:,} thinking included in output)"
+                )
             parts.append(f" = {total:,} total across {self.call_count} API calls")
             # Accumulated cost (C7). Flag when the figure is a lower bound — a
             # call reported no cost, or BYOK fee-only cost — so it isn't read as exact.
@@ -182,6 +186,19 @@ class TokenTracker:
 
 token_tracker = TokenTracker()
 file_cache = FileCache()
+
+
+def _resolve_repo_path(path: str, expect: Optional[str] = None) -> Optional[str]:
+    """Resolve a repository path without following a PR-controlled escape."""
+    return resolve_confined_path(path, os.getcwd(), expect)
+
+
+def _read_repo_text(path: str) -> Optional[str]:
+    """Read a regular checkout file only when it is confined to the repo."""
+    resolved = _resolve_repo_path(path, "file")
+    if resolved is None:
+        return None
+    return file_cache.read(resolved)
 
 # --- S3: per-run nonce fencing of untrusted spans ---------------------------
 # A fork PR author controls diffs, file contents, spec/URL reference text and
@@ -843,23 +860,29 @@ def get_local_reference_parts(paths_str: str, records: "Optional[List[ContextRec
     raw = [p.strip() for p in paths_str.split(',') if p.strip()]
     files: List[str] = []
     for path in raw:
-        if os.path.isdir(path):
+        if _resolve_repo_path(path, "dir") is not None:
             for root, _, names in os.walk(path):
-                files.extend(os.path.join(root, n) for n in names
-                             if n.endswith(('.pdf', '.md', '.txt', '.tex', '.lean')))
-        elif os.path.isfile(path):
+                files.extend(
+                    fp for n in names
+                    if n.endswith(('.pdf', '.md', '.txt', '.tex', '.lean'))
+                    and _resolve_repo_path(fp := os.path.join(root, n), "file") is not None
+                )
+        elif _resolve_repo_path(path, "file") is not None:
             files.append(path)
         else:
-            errors.append(f"Could not find spec reference: {path}")
+            errors.append(f"Could not find safe in-repository spec reference: {path}")
             if records is not None:
                 records.append(ContextRecord(path, "spec", False))
     for fp in sorted(set(files)):
         try:
+            resolved = _resolve_repo_path(fp, "file")
+            if resolved is None:
+                raise OSError("reference is not a confined regular file")
             if fp.lower().endswith('.pdf'):
-                with open(fp, 'rb') as f:
+                with open(resolved, 'rb') as f:
                     parts.append(ContentPart(type="pdf", data=f.read(), mime_type="application/pdf"))
             else:
-                content = file_cache.read(fp)
+                content = file_cache.read(resolved)
                 if content is None:
                     errors.append(f"Error reading spec reference {fp}")
                     if records is not None:
@@ -925,7 +948,8 @@ def extract_refs_from_instructions(text: str) -> Tuple[List[str], List[str], Lis
             continue
         if '/' not in token and not os.path.splitext(token)[1]:
             continue
-        if not os.path.exists(token):
+        if (_resolve_repo_path(token, "file") is None
+                and _resolve_repo_path(token, "dir") is None):
             continue
         target = spec_paths if token.lower().endswith(('.pdf', '.tex')) else repo_paths
         if token not in target:
@@ -1038,7 +1062,7 @@ def scan_escape_hatches(diff_by_file: Dict[str, str]) -> Dict[str, list]:
             continue
 
         added = _added_line_numbers(diff)
-        full_content = file_cache.read(file_path)
+        full_content = _read_repo_text(file_path)
 
         if full_content is None:
             # File content unavailable (e.g. deleted in this PR). Best-effort:
@@ -1135,7 +1159,7 @@ def get_summary_context(paths_str: str) -> str:
     for file_path in paths:
         if not file_path.endswith('.lean'):
             continue
-        content = file_cache.read(file_path)
+        content = _read_repo_text(file_path)
         if content is None:
             continue
         all_lines = content.splitlines(keepends=True)
@@ -1448,18 +1472,22 @@ def get_repo_files_by_path(paths_str: str, records: "Optional[List[ContextRecord
     logging.info(f"Fetching content from {len(paths)} repository paths...")
     expanded_files: List[str] = []
     for path in paths:
-        if os.path.isdir(path):
+        if _resolve_repo_path(path, "dir") is not None:
             for root, _, files in os.walk(path):
-                expanded_files.extend([os.path.join(root, name) for name in files if name.endswith(('.lean', '.md'))])
-        elif os.path.isfile(path):
+                expanded_files.extend(
+                    fp for name in files
+                    if name.endswith(('.lean', '.md'))
+                    and _resolve_repo_path(fp := os.path.join(root, name), "file") is not None
+                )
+        elif _resolve_repo_path(path, "file") is not None:
             expanded_files.append(path)
         else:
-            errors.append(f"Could not find file or directory: {path}")
+            errors.append(f"Could not find safe in-repository file or directory: {path}")
             if records is not None:
                 records.append(ContextRecord(path, "repo", False))
     result: Dict[str, str] = {}
     for file_path in sorted(set(expanded_files)):
-        content = file_cache.read(file_path)
+        content = _read_repo_text(file_path)
         if content is None:
             errors.append(f"Error reading file {file_path}")
             if records is not None:
@@ -1549,28 +1577,47 @@ def _finding_lines(f: Finding, include_fix: bool = True) -> List[str]:
     return lines
 
 
-def _format_file_review(review: FileReview, file_path: str) -> str:
+def _format_file_review(
+    review: FileReview,
+    file_path: str,
+    verification_required: bool = False,
+) -> str:
     """Formats a structured FileReview into markdown.
 
-    The per-file model verdict is explicitly labeled as an agent assessment;
-    the overall deterministic policy is rendered separately. Findings that do
-    not meet the blocking grounding contract remain visible in an advisory
-    details block instead of looking like ordinary blocking issues.
+    With verification disabled, the per-file model verdict is explicitly
+    labeled as an agent assessment. With verification enabled, the displayed
+    file assessment is re-derived from confirmed findings so an uncertain
+    verifier cannot leave contradictory "Changes Requested" prose behind.
+    The overall deterministic policy is rendered separately.
     """
     parts = []
 
     if review.analysis:
         parts.append(f"**Analysis:**\n{review.analysis}\n")
 
-    parts.append(f"**Agent assessment:** {review.verdict}\n")
-
-    critical = [f for f in review.critical_misformalizations if _has_blocking_grounding(f)]
-    lean_issues = [f for f in review.lean_issues if _has_blocking_grounding(f)]
+    critical = [
+        f for f in review.critical_misformalizations
+        if _has_blocking_grounding(f, verification_required)
+    ]
+    lean_issues = [
+        f for f in review.lean_issues
+        if _has_blocking_grounding(f, verification_required)
+    ]
     advisory = [
-        *[f for f in review.critical_misformalizations if not _has_blocking_grounding(f)],
-        *[f for f in review.lean_issues if not _has_blocking_grounding(f)],
+        *[f for f in review.critical_misformalizations
+          if not _has_blocking_grounding(f, verification_required)],
+        *[f for f in review.lean_issues
+          if not _has_blocking_grounding(f, verification_required)],
         *review.nitpicks,
     ]
+
+    if verification_required:
+        parts.append(
+            f"**Evidence-gated assessment:** "
+            f"{_evidence_gated_file_verdict(review, verification_required=True)}\n"
+        )
+    else:
+        parts.append(f"**Agent assessment:** {review.verdict}\n")
 
     if review.checklist_results:
         parts.append("**Checklist Verification:**")
@@ -1754,12 +1801,7 @@ def _within_repo(path: str) -> bool:
     The path comes from a finding's (LLM-generated, PR-influenced) location, so a
     prompt-injected `../…/x.lean` must not escape the workspace to read arbitrary
     `.lean`-suffixed files into a verifier prompt (defense-in-depth beneath S2/S7)."""
-    try:
-        root = os.path.realpath(os.getcwd())
-        resolved = os.path.realpath(path)
-        return resolved == root or resolved.startswith(root + os.sep)
-    except OSError:
-        return False
+    return _resolve_repo_path(path, "file") is not None
 
 
 def _finding_text(finding: Finding) -> str:
@@ -1780,16 +1822,17 @@ def _has_blocking_grounding(finding: Finding, require_verification: bool = False
     This is intentionally a conservative gate. The evidence text is still
     shown to reviewers, but a model assertion without an exact source locator,
     or a claim based only on a docstring/model reasoning, cannot block a PR.
-    this gate. Only critical/high-severity findings can drive a blocking
+    Only critical/high-severity findings can drive a blocking
     verdict; medium/low findings remain advisory even when well located.
     """
-    # Verification is precision metadata: an explicit refutation removes a
-    # finding and confirmation is displayed, but an unavailable or uncertain
-    # verifier must not silently erase a grounded issue from the issue path.
-    # ``require_verification`` remains accepted for compatibility with callers
-    # using the earlier policy. PDF evidence remains special because visual
-    # confirmation is required.
+    # When the verification pass is enabled, its status is authoritative for
+    # the blocking path: uncertain/unavailable findings remain visible as
+    # advisory feedback but cannot drive Changes Requested or inline comments.
+    # With verification disabled, well-grounded initial findings retain the
+    # issue path. PDF evidence additionally requires visual confirmation.
     return (
+        (not require_verification or finding.verification_status == "confirmed")
+        and
         finding.confidence in ("high", "medium")
         and finding.severity in ("critical", "high")
         and finding.category not in _ADVISORY_CATEGORIES
@@ -1802,6 +1845,19 @@ def _has_blocking_grounding(finding: Finding, require_verification: bool = False
         )
         and (not _is_pdf_evidence(finding) or finding.confirmation_method == "visual")
     )
+
+
+def _evidence_gated_file_verdict(
+    file_review: FileReview,
+    verification_required: bool,
+) -> str:
+    """Derive one file's narrative assessment from the authoritative gate."""
+    substantive = file_review.critical_misformalizations + file_review.lean_issues
+    if any(_has_blocking_grounding(f, verification_required) for f in substantive):
+        return "Changes Requested"
+    if substantive or file_review.nitpicks or file_review.coverage_incomplete:
+        return "Needs Minor Revisions"
+    return "Approved"
 
 
 def _finding_fingerprint(finding: Finding) -> Tuple[str, str, str]:
@@ -2141,7 +2197,10 @@ def analyze_file_changes_with_context(provider: LLMProvider, review_context: dic
         merged.analysis = (merged.analysis + "\n\n" + note) if merged.analysis else note
     return merged, _format_file_review(merged, file_path)
 
-def _format_cross_file(analysis: CrossFileAnalysis) -> str:
+def _format_cross_file(
+    analysis: CrossFileAnalysis,
+    verification_required: bool = False,
+) -> str:
     """Formats a structured CrossFileAnalysis into markdown."""
     sections = []
 
@@ -2149,8 +2208,12 @@ def _format_cross_file(analysis: CrossFileAnalysis) -> str:
         sections.append(f"**Cross-File Analysis:**\n{analysis.analysis}\n")
 
     def _fmt_findings(title: str, findings: list[Finding]) -> str:
-        blocking = [f for f in findings if _has_blocking_grounding(f)]
-        advisory = [f for f in findings if not _has_blocking_grounding(f)]
+        blocking = [
+            f for f in findings if _has_blocking_grounding(f, verification_required)
+        ]
+        advisory = [
+            f for f in findings if not _has_blocking_grounding(f, verification_required)
+        ]
         if not blocking and not advisory:
             return f"**{title}:** None"
         lines = [f"**{title}:**"] if blocking else []
@@ -2178,7 +2241,7 @@ def analyze_cross_file(provider: LLMProvider, diff_by_file: Dict[str, str], spec
     for file_path in diff_by_file:
         if not file_path.endswith('.lean'):
             continue
-        content = file_cache.read(file_path)
+        content = _read_repo_text(file_path)
         if content is not None:
             all_changed_contents += _fence(content, f"content of {file_path}") + "\n\n"
 
@@ -2342,9 +2405,10 @@ def _format_synthesis(summary: SynthesisSummary, precheck_summary: Optional[str]
     """Formats a structured SynthesisSummary into markdown.
 
     Synthesis is a narrative aggregation step, not an additional source of
-    verdict facts. Its findings are therefore labeled as context and use the
-    same grounding/advisory split as per-file reviews; the deterministic
-    verdict and basis rendered above remain authoritative.
+    verdict facts. Its findings are therefore always labeled advisory: this
+    model-generated restatement does not itself pass through the independent
+    verifier, even when the underlying per-file finding did. The deterministic
+    verdict and the verified per-file/cross-file evidence remain authoritative.
     """
     parts = [f"**TL;DR:** {summary.tldr}\n"]
     # Mechanical facts are authoritative and must not be paraphrased by the
@@ -2364,16 +2428,9 @@ def _format_synthesis(summary: SynthesisSummary, precheck_summary: Optional[str]
         ("Key Lean 4 / Mathlib Issues", summary.key_lean_issues),
     ]
     for title, findings in synthesized:
-        blocking = [f for f in findings if _has_blocking_grounding(f)]
-        advisory = [f for f in findings if not _has_blocking_grounding(f)]
-        if blocking:
-            parts.append(f"**{title} (synthesis context; not verdict basis):**")
-            for f in blocking:
-                parts.extend(_finding_lines(f))
-            parts.append("")
-        if advisory:
+        if findings:
             parts.append(f"<details><summary>💡 <b>{title} (advisory synthesis context)</b></summary>\n")
-            for f in advisory:
+            for f in findings:
                 parts.extend(_finding_lines(f, include_fix=False))
             parts.append("\n</details>\n")
 
@@ -2382,7 +2439,20 @@ def _format_synthesis(summary: SynthesisSummary, precheck_summary: Optional[str]
     return "\n".join(parts)
 
 
-def synthesize_overall_summary(provider: LLMProvider, per_file_reviews: Dict[str, str], per_file_structured: Dict[str, 'FileReview'], spec_checklist: str, pre_check_findings: str, cross_file_analysis: str, verdict_rules: str, model_name: str) -> Tuple[SynthesisSummary, str]:
+def synthesize_overall_summary(
+    provider: LLMProvider,
+    per_file_reviews: Dict[str, str],
+    per_file_structured: Dict[str, 'FileReview'],
+    spec_checklist: str,
+    pre_check_findings: str,
+    cross_file_analysis: str,
+    verdict_rules: str,
+    model_name: str,
+    *,
+    verification_required: bool = False,
+    authoritative_verdict: str = "",
+    authoritative_reasons: Optional[List[str]] = None,
+) -> Tuple[SynthesisSummary, str]:
     """Generates a structured high-level summary. Returns (SynthesisSummary, formatted markdown).
     On error returns (None, error_message)."""
     if not per_file_reviews:
@@ -2395,10 +2465,21 @@ def synthesize_overall_summary(provider: LLMProvider, per_file_reviews: Dict[str
     for file_path, review in per_file_structured.items():
         if review is None:
             continue
+        substantive = review.critical_misformalizations + review.lean_issues
         structured_data[file_path] = {
-            "verdict": review.verdict,
-            "critical_count": len(review.critical_misformalizations),
-            "issue_count": len(review.lean_issues),
+            "verdict": _evidence_gated_file_verdict(review, verification_required),
+            "blocking_critical_count": sum(
+                _has_blocking_grounding(f, verification_required)
+                for f in review.critical_misformalizations
+            ),
+            "blocking_issue_count": sum(
+                _has_blocking_grounding(f, verification_required)
+                for f in review.lean_issues
+            ),
+            "advisory_substantive_count": sum(
+                not _has_blocking_grounding(f, verification_required)
+                for f in substantive
+            ),
             "nitpick_count": len(review.nitpicks),
             "violated_checklist": [cr.item for cr in review.checklist_results if cr.status == "violated"],
             "unclear_checklist": [cr.item for cr in review.checklist_results if cr.status == "unclear"],
@@ -2412,6 +2493,10 @@ def synthesize_overall_summary(provider: LLMProvider, per_file_reviews: Dict[str
         "PRE_CHECK_FINDINGS": pre_check_findings or "No issues detected.",
         "CROSS_FILE_ANALYSIS": cross_file_analysis or "No cross-file analysis performed.",
         "VERDICT_RULES": verdict_rules,
+        "AUTHORITATIVE_VERDICT": authoritative_verdict or "Not supplied",
+        "AUTHORITATIVE_BASIS": "\n".join(
+            f"- {reason}" for reason in (authoritative_reasons or [])
+        ) or "- No separate basis supplied.",
     }
     try:
         # The verbose per-file reviews are the trimmable bulk; the compact
@@ -2480,9 +2565,10 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
     cross-file findings. Findings the verifier can *refute* are removed from the
     structured reviews in place; everything else is kept.
 
-    Fail-open by design: any verifier error, or any verdict other than an
-    explicit "refuted", keeps the finding — verification only ever *removes*
-    false positives, never suppresses a finding it could not disprove.
+    Fail-open for visibility: any verifier error, or any verdict other than an
+    explicit "refuted", keeps the finding in the structured results. When the
+    verification pass is enabled, the caller treats every kept-but-unconfirmed
+    finding as advisory, so verifier uncertainty cannot hard-block the PR.
 
     Returns the list of (finding, verdict) pairs that were dropped, for a
     transparency section in the review comment.
@@ -2493,7 +2579,7 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
 
     def ctx_for_file(fp: str) -> str:
         if fp not in file_context:
-            content = file_cache.read(fp) or "(file content unavailable)"
+            content = _read_repo_text(fp) or "(file content unavailable)"
             diff = diff_by_file.get(fp, "(no diff)")
             file_context[fp] = (
                 f"Specification checklist:\n{spec}\n\n"
@@ -2508,7 +2594,7 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
             chunks = []
             for fp in diff_by_file:
                 if fp.endswith('.lean'):
-                    content = file_cache.read(fp)
+                    content = _read_repo_text(fp)
                     if content is not None:
                         chunks.append(_fence(content, f"content of {fp}"))
             cross_ctx_cache[0] = f"Specification checklist:\n{spec}\n\nChanged files:\n" + "\n\n".join(chunks)
@@ -2524,7 +2610,7 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
         base = ctx_for_cross()
         path = _lean_path_in(f.location) or _lean_path_in(f.evidence_locator)
         if path and path not in diff_by_file and _within_repo(path):
-            content = file_cache.read(path)
+            content = _read_repo_text(path)
             if content is not None:
                 return (
                     base + "\n\n" + _fence(content, f"{path} (dependent file, unchanged)"),
@@ -2567,8 +2653,11 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
                 verdicts[id(finding)] = future.result()
             except Exception as e:
                 _reraise_if_fatal(e)  # budget/hard → re-raised to the recording handler
-                logging.warning(f"Verification errored for a finding (keeping it): {describe_exc(e)}")
-                verdicts[id(finding)] = None  # fail-open
+                logging.warning(
+                    "Verification errored for a finding (keeping it as advisory): %s",
+                    describe_exc(e),
+                )
+                verdicts[id(finding)] = None
 
     refuted: List[Tuple[Finding, FindingVerdict]] = []
 
@@ -2652,7 +2741,11 @@ def _get_diff_lines(diff_text: str) -> set:
     return diff_lines
 
 
-def _build_line_annotations(per_file_structured: Dict[str, FileReview], diff_by_file: Dict[str, str]) -> List[Dict]:
+def _build_line_annotations(
+    per_file_structured: Dict[str, FileReview],
+    diff_by_file: Dict[str, str],
+    verification_required: bool = False,
+) -> List[Dict]:
     """Builds GitHub Review API comment annotations from structured reviews.
     Returns a list of {path, line, side, body} dicts using the modern API."""
     annotations = []
@@ -2674,7 +2767,7 @@ def _build_line_annotations(per_file_structured: Dict[str, FileReview], diff_by_
         # of the main review comment; they are not silently discarded.
 
         for severity, finding in all_findings:
-            if not _has_blocking_grounding(finding):
+            if not _has_blocking_grounding(finding, verification_required):
                 continue
             if not finding.location:
                 continue
@@ -2747,8 +2840,8 @@ def compute_deterministic_verdict(
         critical/Lean issue -> Changes Requested
       * Any critical/high-severity, medium/high-confidence, source-grounded
         cross-file issue   -> Changes Requested
-      * Verification may refute and remove findings, but uncertainty does not
-        erase a grounded issue; unconfirmed findings remain visible and can block
+      * With verification enabled, only confirmed findings can block; refuted
+        findings are removed and uncertain/unavailable findings remain advisory
       * Docstring-only, low-confidence, or otherwise ungrounded findings remain advisory
       * Only nitpicks/advisory findings                -> Needs Minor Revisions
       * A file that could not be fully reviewed     -> at least Needs Minor
@@ -3178,7 +3271,7 @@ def main():
                 logging.info(f"Skipping non-Lean file: {file_path}")
                 return None, None, None
 
-            full_content = file_cache.read(file_path) or ""
+            full_content = _read_repo_text(file_path) or ""
 
             augmented_ctx = dict(review_ctx)
             if cluster_context:
@@ -3341,6 +3434,14 @@ def main():
         # rendered. Runs on a (preferably different) model to avoid self-agreement.
         refuted_findings = []
         if verification_enabled:
+            verification_candidates = any(
+                r and (r.critical_misformalizations or r.lean_issues)
+                for r in per_file_structured.values()
+            ) or any(
+                getattr(cross_file_structured, cat)
+                for cat in _CROSS_FILE_CATEGORIES
+                if cross_file_structured is not None
+            )
             try:
                 refuted_findings = verify_findings(
                     provider, per_file_structured, cross_file_structured,
@@ -3350,30 +3451,34 @@ def main():
                 )
             except BudgetExceededError:
                 # Verification runs BEFORE the verdict, so recording the trip here flips
-                # review_incomplete (via run_health.degraded) before the verdict computes —
-                # findings go out UNFILTERED but the run can no longer render Approved.
+                # review_incomplete (via run_health.degraded) before the verdict computes.
+                # Candidate findings remain visible but are re-rendered advisory below.
                 run_health.record_budget_trip()
-                logging.warning("Verification pass skipped: per-run budget exhausted; reporting unfiltered findings.")
+                logging.warning(
+                    "Verification pass skipped: per-run budget exhausted; "
+                    "reporting unconfirmed findings as advisory."
+                )
             except Exception as e:
                 if is_hard_llm_failure(e):
                     raise  # hard failure → top-level containment records + contains it
-                logging.warning(f"Verification pass failed; reporting unfiltered findings: {describe_exc(e)}")
-            verifier_confirmed = any(
-                f.verification_status == "confirmed"
-                for r in per_file_structured.values() if r
-                for f in r.critical_misformalizations + r.lean_issues
-            ) or any(
-                f.verification_status == "confirmed"
-                for cat in _CROSS_FILE_CATEGORIES
-                for f in (getattr(cross_file_structured, cat) if cross_file_structured else [])
-            )
-            if refuted_findings or verifier_confirmed:
-                # Re-render the affected outputs from the filtered structured data.
+                logging.warning(
+                    "Verification pass failed; reporting unconfirmed findings as advisory: %s",
+                    describe_exc(e),
+                )
+            if verification_candidates:
+                # Re-render every candidate under the verified-only blocking
+                # policy. This matters when every verifier result is uncertain
+                # or the pass fails: findings stay visible, but advisory rather
+                # than contradicting the deterministic non-blocking verdict.
                 for fp, r in per_file_structured.items():
                     if r is not None:
-                        per_file_reviews[fp] = _format_file_review(r, fp)
+                        per_file_reviews[fp] = _format_file_review(
+                            r, fp, verification_required=True,
+                        )
                 if cross_file_structured is not None:
-                    cross_file_text = _format_cross_file(cross_file_structured)
+                    cross_file_text = _format_cross_file(
+                        cross_file_structured, verification_required=True,
+                    )
 
         # --- Deterministic verdict (authoritative) ---
         # A file is only "covered" if its structured review came back; a missing
@@ -3412,7 +3517,10 @@ def main():
             try:
                 summary_structured, summary_text = synthesize_overall_summary(
                     provider, per_file_reviews, per_file_structured, spec_checklist,
-                    pre_check_findings, cross_file_text, verdict_rules, args.synthesis_model
+                    pre_check_findings, cross_file_text, verdict_rules, args.synthesis_model,
+                    verification_required=verification_enabled,
+                    authoritative_verdict=det_verdict,
+                    authoritative_reasons=det_reasons,
                 )
                 # The LLM writes the narrative, but the verdict is authoritative and
                 # computed deterministically — override whatever the model chose.
@@ -3532,7 +3640,11 @@ def main():
                 logging.warning(f"Failed to write overflow comments: {describe_exc(e)}")
 
         # Generate line-level annotations for GitHub Review API
-        annotations = _build_line_annotations(per_file_structured, diff_by_file)
+        annotations = _build_line_annotations(
+            per_file_structured,
+            diff_by_file,
+            verification_required=verification_enabled,
+        )
         if annotations:
             try:
                 with open('review_annotations.json', 'w') as f:

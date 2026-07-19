@@ -7,6 +7,7 @@ The final PR verdict is computed **deterministically by the pipeline**, not by y
     - `confidence` is `high` or `medium`;
     - a substantive `category` (`correctness`, `build`, `specification`, `source_fidelity`, `contract`, `dependency`, `trust`) — advisory categories never block;
     - grounded evidence: a non-empty `evidence` AND an exact `evidence_locator`, from a source other than `docstring_only` or `model_reasoning`. (PDF-derived paper evidence additionally becomes blocking only after the verifier's visual confirmation — until then treat it as advisory.)
+    - when the independent verification pass is enabled, the pipeline additionally requires `verification_status=confirmed`; uncertain/unavailable findings stay advisory. Your initial assessment may precede that pass, but the pipeline re-derives the displayed assessment and authoritative verdict afterward.
 *   **Needs Minor Revisions:** Findings exist but none meets the full blocking bar — advisory findings, medium/low-severity substantive findings, low-confidence findings, or substantive claims lacking grounded evidence.
 *   **Approved:** No substantive findings and no coverage gap.
 *   **Hard Rule — Escape Hatches:** A deterministic scanner (not you) forces "Changes Requested" for any PR introducing these in changed code, except identifiers on the deployment's `escape_hatch_allowlist`:

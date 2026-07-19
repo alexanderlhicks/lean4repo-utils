@@ -82,7 +82,7 @@ jobs:
 ## How it Works
 
 1.  **Checkout & Setup:** Checks out the PR code with full Git history and installs [uv](https://docs.astral.sh/uv/) (which provisions Python and the dependencies).
-2.  **Generate Diff:** Computes the merge base between the PR head and base branches, then generates `pr.diff`. The merge base SHA is exported for source-level lookups.
+2.  **Generate Diff:** Computes the merge base between the PR head and base branches, then generates the diff in a runner-temp artifact outside the PR checkout. The merge base SHA is exported for source-level lookups.
 3.  **Analyze Diff:** The `DiffAnalyzer` parses the full diff to extract statistics, sorry tracking (with source-level declaration attribution), declaration changes, and quality signal warnings. Nested block comments are correctly handled.
 4.  **Triage Files:** A Triage Agent reviews the file list and filters out noise. For large PRs (more than 50 files), files are classified into high/low priority tiers. Files containing proof-relevant signals are always promoted to high priority.
 5.  **Parallel Summarization:** Each high-priority file's diff is summarized concurrently by a Summarizer Agent. Cached summaries from previous runs are reused when the diff hash matches. Large individual file diffs are truncated at hunk boundaries.
@@ -96,9 +96,9 @@ jobs:
 *   **Multi-Agent Pipeline:** Employs a pipeline of specialized AI agents (Triage, Summarizer, Synthesizer) that produce a reviewer-oriented overview. The summary is intended as an entry point: it describes the PR's scope, structure, and contents so a reviewer can orient before opening the diff (deep, suggestion-level review is a separate concern). Prompts favor breadth and a self-contained overview over terseness.
 *   **Workflow boundary:** Use the summary action for orientation and deployment-supplied style/documentation/proof-progress reporting (via `additional_instructions_path`). The dedicated review action owns semantic correctness, paper fidelity, cross-file contracts, and actionable blocking findings; summary observations should not be treated as correctness verdicts.
 *   **Parallel Execution:** Summarizes multiple files concurrently (up to 10 workers), with per-file diff caching to avoid re-summarizing unchanged files across PR updates.
-*   **Smart Triage:** Automatically filters out noise (lockfiles, binaries, generated code) to focus the summary on meaningful changes. Files with proof-relevant signals (`sorry`, `admit`, `native_decide`) are always included regardless of triage decisions.
+*   **Smart Triage:** Automatically filters out noise (lockfiles, binaries, generated code) to focus the summary on meaningful changes. Files with proof-relevant Lean code signals (`sorry`, `admit`, `native_decide`) are always included regardless of triage decisions; occurrences only inside strings or line comments do not trigger promotion.
 *   **Lean-Aware Analysis:**
-    *   **Source-level declaration lookup:** Loads full source files (new from disk, old via `git show`) to build declaration indices. Sorry/admit occurrences are attributed to their enclosing declaration even when only the proof body changed — not just when the declaration header appears in the diff.
+    *   **Source-level declaration lookup:** Loads full source files (new from disk, old via `git show`) to build declaration indices. New-source paths must resolve to non-symlink regular files inside the checkout, so a PR-created Lean symlink cannot pull runner files into declaration context. Sorry/admit occurrences are attributed to their enclosing declaration even when only the proof body changed — not just when the declaration header appears in the diff.
     *   **Nested block comment awareness:** Uses Lean 4's `/- /- ... -/ -/` nested block comment parser to avoid false positives in sorry/quality signal detection.
     *   **Enclosing-declaration context for the summarizer:** each per-file summarize prompt includes the (multi-line, size-bounded) signatures of the declarations enclosing the changed regions, taken from the post-change source — so a body-only change is described against the right theorem or definition even when its header is nowhere in the diff. The context is treated as untrusted data (fenced, fence-escape-neutralized) and is part of the summary cache key.
     *   **Sorry delta:** Top-level summary shows net proof progress (sorries added vs. removed).
@@ -113,7 +113,7 @@ jobs:
 *   **Deterministic PR labels (opt-in):** With `apply_labels: true`, reconciles `sorry-added` / `native_decide` / `axiom-added` labels straight from the deterministic diff signals (no LLM) — cheaper and more trustworthy than prose, and correct across pushes (a label is removed when its signal goes away). The action touches only these three labels and creates them if missing.
 *   **Per-run call cap (opt-in):** `max_summary_files` bounds how many files the LLM summarizes individually on one PR; the overflow is listed and still fully covered by the deterministic tracking.
 *   **Upstream Path Reminders:** Flags when changed files fall under a configurable path prefix (e.g., `ToMathlib/`) and reminds about upstream PRs.
-*   **Token Usage Tracking:** Logs cumulative input, output, and thinking token usage across all API calls.
+*   **Token Usage Tracking:** Logs cumulative input and output usage across all API calls, including billed calls that return unusable structured output. Thinking/reasoning tokens are displayed as a subset of output, not added twice to the total.
 
 ## Project Structure
 

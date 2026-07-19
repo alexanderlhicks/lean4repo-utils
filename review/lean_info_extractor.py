@@ -17,11 +17,19 @@ import sys
 import time as _time
 from typing import Dict, List, Optional
 
-from leanrepo_common.lean_utils import file_path_to_module_name, scrub_line
+from leanrepo_common.lean_utils import (
+    file_path_to_module_name,
+    resolve_confined_path,
+    scrub_line,
+)
 
 
 _DECL_RE = re.compile(
-    r'^\s*(?P<mods>(?:private\s+|protected\s+|noncomputable\s+|partial\s+|unsafe\s+)*)'
+    # Attributes commonly share the declaration line (`@[simp] theorem ...`).
+    # The previous expression only recognized attributes on their own line and
+    # silently dropped the declaration—and therefore its axiom query.
+    r'^\s*(?:@\[[^\]\n]*\]\s*)*'
+    r'(?P<mods>(?:private\s+|protected\s+|noncomputable\s+|partial\s+|unsafe\s+)*)'
     r'(?:def|theorem|lemma|abbrev|instance|structure|class|inductive|opaque|axiom)\s+'
     # Declaration name: must not start with a binder/type delimiter (rejects
     # anonymous `instance : Foo`, whose next token is `:`).
@@ -236,7 +244,12 @@ def extract_info_for_files(changed_files: List[str], time_budget: int = 300) -> 
     for file_path in changed_files:
         if not file_path.endswith('.lean'):
             continue
-        if not os.path.exists(file_path):
+        if not os.path.lexists(file_path):
+            continue
+        if resolve_confined_path(file_path, os.getcwd(), "file") is None:
+            results["errors"].append(
+                f"Skipped unsafe changed path {file_path}: expected a regular file inside the checkout."
+            )
             continue
 
         elapsed = _time.monotonic() - start
@@ -351,7 +364,8 @@ def extract_light_info(summary_files: List[str]) -> Dict:
     """Light scanning for summary-context files: sorry/admit detection only (no subprocess calls)."""
     results = {"sorry_locations": [], "files_scanned": 0}
     for file_path in summary_files:
-        if not file_path.endswith('.lean') or not os.path.exists(file_path):
+        if (not file_path.endswith('.lean')
+                or resolve_confined_path(file_path, os.getcwd(), "file") is None):
             continue
         sorry_locs = extract_sorry_warnings(file_path)
         if sorry_locs:

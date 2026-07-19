@@ -786,6 +786,51 @@ class SummaryTests(unittest.TestCase):
         diff = "+++ b/sorry.lean\n--- a/sorry.lean\n def real := 1\n"
         self.assertEqual(summary._detect_proof_signals(diff), set())
 
+    def test_detect_proof_signals_ignores_strings_and_comments(self):
+        diff = "\n".join([
+            "diff --git a/X.lean b/X.lean",
+            '+  IO.println "sorry admit native_decide"',
+            "+  exact trivial -- sorry",
+            "-  -- admit",
+        ])
+        self.assertEqual(summary._detect_proof_signals(diff), set())
+
+    def test_detect_proof_signals_keeps_code_before_comment(self):
+        diff = "+  exact native_decide -- sorry is not used\n"
+        self.assertEqual(summary._detect_proof_signals(diff), {"native_decide"})
+
+    def test_token_total_does_not_double_count_thinking_subset(self):
+        tracker = summary.TokenTracker()
+        tracker.record(summary.TokenUsage(
+            input_tokens=100, output_tokens=50, thinking_tokens=20, cost=0.001,
+        ))
+
+        text = tracker.summary()
+
+        self.assertIn("= 150 total", text)
+        self.assertIn("20 thinking included in output", text)
+
+    def test_call_llm_tracks_billed_usage_when_provider_raises(self):
+        tracker = summary.TokenTracker()
+
+        def fail(**kwargs):
+            error = ValueError("malformed structured output")
+            error.call_usage = summary.TokenUsage(
+                input_tokens=11, output_tokens=7, cost=0.003,
+            )
+            raise error
+
+        provider = types.SimpleNamespace(generate_structured=fail)
+        with mock.patch.object(summary, "_provider", provider, create=True), \
+             mock.patch.object(summary, "token_tracker", tracker):
+            with self.assertRaises(ValueError):
+                summary._call_llm("prompt", "model", summary._ProseSummary)
+
+        self.assertEqual(tracker.call_count, 1)
+        self.assertEqual(tracker.total_input, 11)
+        self.assertEqual(tracker.total_output, 7)
+        self.assertAlmostEqual(tracker.total_cost, 0.003)
+
     # ------------------------------------------------------------------
     # Cache corruption regression + truncation fallback
     # ------------------------------------------------------------------
@@ -1681,6 +1726,25 @@ class S4InstructionsLoadTests(unittest.TestCase):
         content, _ = summary._load_instructions("NOPE.md", None, pr_context=False)
         self.assertEqual(content, "")
 
+    def test_current_lean_source_rejects_symlink_escape(self):
+        repo, _ = self._make_pr_checkout()
+        outside_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(outside_dir.cleanup)
+        outside = os.path.join(outside_dir.name, "environment.lean")
+        with open(outside, "w") as f:
+            f.write("secret-token-material\n")
+        os.symlink(outside, os.path.join(repo, "Leak.lean"))
+
+        self.assertEqual(summary._load_lean_source("Leak.lean"), "")
+        self.assertNotIn("secret", summary._load_lean_source("Leak.lean"))
+
+    def test_current_lean_source_reads_regular_repo_file(self):
+        repo, _ = self._make_pr_checkout()
+        with open(os.path.join(repo, "Safe.lean"), "w") as f:
+            f.write("theorem safe : True := by trivial\n")
+
+        self.assertIn("theorem safe", summary._load_lean_source("Safe.lean"))
+
     def test_empty_path_returns_empty_without_git(self):
         with mock.patch.object(summary.subprocess, "run") as m_run:
             self.assertEqual(summary._load_instructions("", "sha", pr_context=True), ("", ""))
@@ -1742,8 +1806,11 @@ class TestC3SummaryActionWiring(unittest.TestCase):
     def test_setup_uv_cache_scoped_to_action_lockfile(self):
         doc = self._action()
         uv = next(s for s in doc["runs"]["steps"] if "setup-uv" in str(s.get("uses", "")))
-        self.assertEqual(uv["with"]["cache-dependency-glob"],
-                         "${{ github.action_path }}/uv.lock")
+        self.assertEqual(uv["with"]["working-directory"], "${{ github.action_path }}/..")
+        self.assertEqual(uv["with"]["cache-dependency-glob"], "uv.lock")
+        self.assertTrue(os.path.isfile(os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "..", "uv.lock",
+        )))
 
     def test_env_names_match_python_constants(self):
         env = self._gen_step(self._action())["env"]
@@ -1762,6 +1829,18 @@ class TestC3SummaryActionWiring(unittest.TestCase):
             env[summary.ENV_INSTRUCTIONS_BASE_REF],
             "${{ github.event.pull_request.base.sha }}",
         )
+
+    def test_diff_artifact_lives_in_runner_temp_not_pr_checkout(self):
+        doc = self._action()
+        generate = next(s for s in doc["runs"]["steps"] if s.get("name") == "Generate diff")
+        cleanup = next(s for s in doc["runs"]["steps"] if s.get("name") == "Clean up artifacts")
+        expected = "${{ runner.temp }}/lean-summary-${{ github.run_id }}-${{ github.run_attempt }}.diff"
+
+        self.assertEqual(generate["env"]["PR_DIFF_PATH"], expected)
+        self.assertEqual(self._gen_step(doc)["env"]["PR_DIFF_PATH"], expected)
+        self.assertEqual(cleanup["env"]["PR_DIFF_PATH"], expected)
+        self.assertIn('> "$PR_DIFF_PATH"', generate["run"])
+        self.assertNotIn("> pr.diff", generate["run"])
 
     def test_model_input_has_nonempty_default(self):
         # GitHub does NOT enforce `required:` for composite-action inputs — a

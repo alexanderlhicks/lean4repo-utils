@@ -91,6 +91,17 @@ def test_paths_and_instruction_references_accept_lean_files(tmp_path, monkeypatc
     assert local_paths == ["Reference.lean"]
 
 
+def test_paths_and_instruction_references_reject_symlinks(tmp_path, monkeypatch):
+    outside = tmp_path.parent / "outside-paper-evidence.md"
+    outside.write_text("Theorem leaked: runner data")
+    (tmp_path / "leak.md").symlink_to(outside)
+    monkeypatch.chdir(tmp_path)
+
+    assert evidence._paths("leak.md") == []
+    local_paths, _ = evidence._instruction_references("Please compare leak.md")
+    assert local_paths == []
+
+
 def test_plain_statement_without_explicit_label_keeps_first_word(tmp_path):
     paper = tmp_path / "paper.md"
     paper.write_text("Theorem Every valid transcript is accepted.\n")

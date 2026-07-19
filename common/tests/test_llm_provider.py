@@ -382,6 +382,25 @@ class GenerateStructuredTests(unittest.TestCase):
         parsed, _ = p.generate_structured("m", [ContentPart("text", "hi")], _Schema)
         self.assertEqual(parsed.x, 9)
 
+    def test_malformed_fallback_json_records_and_attaches_usage(self):
+        completion = _FakeCompletion(
+            _FakeMessage(parsed=None, content="{not-json"),
+            usage=_FakeUsage({"prompt_tokens": 17, "completion_tokens": 5, "cost": 0.002}),
+        )
+        p, _ = self._provider_with_parse(completion)
+
+        with self.assertRaises(ValueError) as ctx:
+            p.generate_structured("m", [ContentPart("text", "hi")], _Schema)
+
+        self.assertNotIn("not-json", str(ctx.exception))
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertIsNotNone(ctx.exception.call_usage)
+        self.assertEqual(ctx.exception.call_usage.input_tokens, 17)
+        self.assertEqual(ctx.exception.call_usage.output_tokens, 5)
+        self.assertAlmostEqual(ctx.exception.call_usage.cost, 0.002)
+        self.assertEqual(p.budget._usage.input_tokens, 17)
+        self.assertEqual(p.budget._usage.output_tokens, 5)
+
     def test_raises_when_no_output(self):
         completion = _FakeCompletion(_FakeMessage(parsed=None, content=None), finish_reason="length")
         p, _ = self._provider_with_parse(completion)

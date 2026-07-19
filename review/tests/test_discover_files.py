@@ -203,6 +203,14 @@ class TestBuildLeanFileIndex:
         index = build_lean_file_index()
         assert index == []
 
+    def test_skips_symlinked_lean_file(self, tmp_path, monkeypatch):
+        outside = tmp_path.parent / "outside-discovery.lean"
+        outside.write_text("def outside := 1\n")
+        (tmp_path / "Leak.lean").symlink_to(outside)
+        monkeypatch.chdir(tmp_path)
+
+        assert build_lean_file_index() == []
+
 
 class TestPartitionContextTiers:
     def test_changed_preferred_then_deps(self):
@@ -343,3 +351,19 @@ class TestMainOutputs:
         # Fallback still writes the (empty) graph file: a lake_graph.json
         # planted by PR-controlled build code must never survive to review.
         assert (tmp_path / "lake_graph.json").read_text() == "[]"
+
+    def test_changed_symlink_is_not_handed_to_review(self, tmp_path, monkeypatch):
+        outside = tmp_path.parent / "outside-changed.lean"
+        outside.write_text("def secret := 1\n")
+        (tmp_path / "Changed.lean").symlink_to(outside)
+        github_output = tmp_path / "out.txt"
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("PR_NUMBER", "1")
+        monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+        monkeypatch.setattr(discover_files, "get_changed_lean_files", lambda pr: ["Changed.lean"])
+
+        discover_files.main()
+
+        out = github_output.read_text()
+        assert "changed_files=Changed.lean\n" in out
+        assert "discovered_files=\n" in out

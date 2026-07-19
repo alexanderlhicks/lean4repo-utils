@@ -4,13 +4,28 @@ import os
 import re
 import sys
 
-from leanrepo_common.lean_utils import file_path_to_module_name
+from leanrepo_common.lean_utils import file_path_to_module_name, resolve_confined_path
 
 
 class DiscoveryError(Exception):
     """The changed-file query could not be executed. Distinct from a genuinely
     empty change set: on this error discovery must fail closed (non-zero exit),
     never proceed on an empty set that would silently review nothing (R9)."""
+
+
+def _require_output_safe_paths(paths):
+    """Reject names the current comma/GITHUB_OUTPUT transport cannot encode.
+
+    Git itself permits commas and newlines in filenames. Passing either through
+    comma-separated action outputs would split one file into several paths; a
+    newline can additionally inject a forged output record. Fail closed instead
+    of silently reviewing a different set of files.
+    """
+    if any(any(char in path for char in ",\r\n") for path in paths):
+        raise DiscoveryError(
+            "A changed Lean filename contains a comma or newline, which the "
+            "review action cannot transport safely."
+        )
 
 
 def get_changed_lean_files(pr_number):
@@ -20,17 +35,28 @@ def get_changed_lean_files(pr_number):
     base_sha = (os.environ.get("PR_BASE_SHA") or "").strip()
     head_sha = (os.environ.get("PR_HEAD_SHA") or "").strip()
     if base_sha and head_sha:
-        cmd = ["git", "diff", "--name-only", f"{base_sha}...{head_sha}"]
+        # NUL delimiters are the only lossless filename transport. Textual
+        # `--name-only` C-quotes non-ASCII paths under Git's default
+        # core.quotePath=true, which made e.g. `naïve.lean` end in `.lean"` and
+        # silently disappear from discovery.
+        cmd = ["git", "diff", "--name-only", "-z", f"{base_sha}...{head_sha}"]
+        delimiter = "\0"
     else:
         cmd = ["gh", "pr", "diff", str(pr_number), "--name-only"]
+        delimiter = "\n"
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, UnicodeError) as e:
         # Do not echo raw stderr (may carry token-adjacent detail on a public log).
         # Fail closed: raise rather than return [] — an empty set here would make
         # the whole pipeline review nothing while reporting success (R9).
+        # UnicodeError: with `-z` (core.quotePath disabled) git can emit raw
+        # non-UTF-8 filename bytes that text=True fails to decode — fail closed
+        # with the clean R9 message rather than crash on an uncaught exception.
         raise DiscoveryError(f"Failed to get changed files for PR #{pr_number}.") from e
-    return [f.strip() for f in result.stdout.splitlines() if f.strip().endswith('.lean')]
+    files = [f for f in result.stdout.split(delimiter) if f.endswith('.lean')]
+    _require_output_safe_paths(files)
+    return files
 
 
 def get_lean_module_name(file_path):
@@ -113,7 +139,8 @@ def build_lean_file_index():
                 path = os.path.normpath(os.path.join(root, f))
                 if path.startswith(f".{os.sep}"):
                     path = path[2:]
-                index.append(path)
+                if resolve_confined_path(path, os.getcwd(), "file") is not None:
+                    index.append(path)
     return index
 
 # Anchored at column 0: Lean import statements are never indented. Tolerates
@@ -212,7 +239,14 @@ def main():
         print(f"::warning::Could not build the import graph for full dependency analysis: {e}")
         print("::warning::Falling back to only changed files for context.")
 
-    final_file_list = sorted([f for f in all_relevant_files if os.path.exists(f)])
+    # Module-name fallbacks can produce paths that were not present in the
+    # trusted index. Filter the final hand-off too so a PR-created symlink can
+    # never enter either the full- or summary-context lists.
+    final_file_list = sorted(
+        f for f in all_relevant_files
+        if resolve_confined_path(f, expect="file") is not None
+    )
+    _require_output_safe_paths(final_file_list)
 
     # Limit the number of full-context files
     try:
@@ -241,7 +275,9 @@ def main():
     # per-env-string cap, either of which would fail the step. Written
     # unconditionally (empty graph -> "[]") so a file planted by PR-controlled
     # build code earlier in the job never survives to the review step.
-    lake_graph_path = "lake_graph.json"
+    # Keep the cross-step artifact outside the PR checkout in production. A
+    # committed `lake_graph.json` symlink must not redirect this write.
+    lake_graph_path = os.environ.get("LAKE_GRAPH_OUT") or "lake_graph.json"
     try:
         with open(lake_graph_path, 'w') as f:
             json.dump(lake_graph_json, f)

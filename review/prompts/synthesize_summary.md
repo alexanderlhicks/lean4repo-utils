@@ -27,6 +27,17 @@ Your task is to read their individual reports and synthesize a clear, authoritat
 {{STRUCTURED_REVIEWS}}
 ---
 
+**Authoritative Pipeline Verdict:** {{AUTHORITATIVE_VERDICT}}
+
+**Authoritative Basis:**
+{{AUTHORITATIVE_BASIS}}
+
+Your TL;DR, coverage discussion, and severity language must agree with that
+verdict and basis. Findings rendered as advisory in the per-file/cross-file
+text are not blockers. The finding arrays you emit below are synthesis context
+and will themselves be rendered advisory; do not use them to invent or promote
+a blocking claim.
+
 **Your Task:**
 Synthesize the findings into a polished, professional PR comment. Your summary should be structured as follows:
 

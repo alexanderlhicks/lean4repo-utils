@@ -220,6 +220,10 @@ class TestMechanicalPrechecks:
     # Diffs use realistic `@@` hunk headers (as `gh pr diff` emits): the scan
     # classifies hatches by matching full-file line numbers against the diff's
     # added lines.
+    @pytest.fixture(autouse=True)
+    def _checkout_root(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
     def test_no_findings(self, tmp_path):
         lean_file = tmp_path / "Foo.lean"
         lean_file.write_text("def foo := 1\n")
@@ -853,29 +857,91 @@ class TestStructuredSynthesisInput:
             ),
         }
 
-        # Build structured data the same way synthesize_overall_summary does
+        # Build the evidence-gated compact data used by synthesis.
         structured = {}
         for fp, fr in reviews.items():
+            substantive = fr.critical_misformalizations + fr.lean_issues
             structured[fp] = {
-                "verdict": fr.verdict,
-                "critical_count": len(fr.critical_misformalizations),
-                "issue_count": len(fr.lean_issues),
+                "verdict": review._evidence_gated_file_verdict(fr, True),
+                "blocking_critical_count": sum(
+                    review._has_blocking_grounding(f, True)
+                    for f in fr.critical_misformalizations
+                ),
+                "blocking_issue_count": sum(
+                    review._has_blocking_grounding(f, True)
+                    for f in fr.lean_issues
+                ),
+                "advisory_substantive_count": sum(
+                    not review._has_blocking_grounding(f, True)
+                    for f in substantive
+                ),
                 "nitpick_count": len(fr.nitpicks),
                 "violated_checklist": [cr.item for cr in fr.checklist_results if cr.status == "violated"],
                 "unclear_checklist": [cr.item for cr in fr.checklist_results if cr.status == "unclear"],
             }
 
-        assert structured["Foo.lean"]["verdict"] == "Changes Requested"
-        assert structured["Foo.lean"]["critical_count"] == 1
-        assert structured["Foo.lean"]["issue_count"] == 2
+        assert structured["Foo.lean"]["verdict"] == "Needs Minor Revisions"
+        assert structured["Foo.lean"]["blocking_critical_count"] == 0
+        assert structured["Foo.lean"]["blocking_issue_count"] == 0
+        assert structured["Foo.lean"]["advisory_substantive_count"] == 3
         assert structured["Foo.lean"]["violated_checklist"] == ["Completeness"]
-        assert structured["Bar.lean"]["verdict"] == "Approved"
+        assert structured["Bar.lean"]["verdict"] == "Needs Minor Revisions"
         assert structured["Bar.lean"]["nitpick_count"] == 1
 
         # Verify it serializes to valid JSON
         json_str = json.dumps(structured, indent=2)
         parsed = json.loads(json_str)
-        assert parsed["Foo.lean"]["critical_count"] == 1
+        assert parsed["Foo.lean"]["blocking_critical_count"] == 0
+        assert parsed["Foo.lean"]["advisory_substantive_count"] == 3
+
+    def test_prompt_receives_authoritative_verdict_and_evidence_gated_counts(self):
+        captured = {}
+        finding = review.Finding(
+            description="plausible but unconfirmed",
+            evidence="source text",
+            evidence_source="lean_source",
+            evidence_locator="Foo.lean:3",
+            evidence_medium="lean",
+            severity="high",
+        )
+        file_review = review.FileReview(
+            verdict="Changes Requested",
+            critical_misformalizations=[finding],
+        )
+
+        def generate_structured(**kwargs):
+            captured["prompt"] = "\n".join(
+                part.data for part in kwargs["contents"]
+                if isinstance(part.data, str)
+            )
+            return (
+                review.SynthesisSummary(
+                    tldr="Advisory issue only.",
+                    precheck_summary="clean",
+                    overall_verdict="Needs Minor Revisions",
+                ),
+                review.TokenUsage(),
+            )
+
+        provider = SimpleNamespace(generate_structured=generate_structured)
+        review.synthesize_overall_summary(
+            provider,
+            {"Foo.lean": "advisory rendering"},
+            {"Foo.lean": file_review},
+            "",
+            "clean",
+            "",
+            "rules",
+            "model",
+            verification_required=True,
+            authoritative_verdict="Needs Minor Revisions",
+            authoritative_reasons=["1 unconfirmed substantive finding."],
+        )
+
+        assert "Authoritative Pipeline Verdict:** Needs Minor Revisions" in captured["prompt"]
+        assert '"verdict": "Needs Minor Revisions"' in captured["prompt"]
+        assert '"blocking_critical_count": 0' in captured["prompt"]
+        assert '"advisory_substantive_count": 1' in captured["prompt"]
 
 
 class TestMainFlow:
@@ -1063,7 +1129,7 @@ class TestFindingRendering:
         )
         assert doc.evidence_source == "docstring_only"
 
-    def test_synthesis_findings_are_labeled_context_and_grounded_advisories_collapsed(self):
+    def test_synthesis_findings_are_always_labeled_advisory_context(self):
         grounded = review.Finding(
             description="The changed declaration omits a required hypothesis.",
             evidence="The paper's Theorem 2 requires h : x ≠ 0.",
@@ -1084,8 +1150,9 @@ class TestFindingRendering:
             ),
             precheck_summary="exact p",
         )
-        assert "Critical Misformalizations (synthesis context; not verdict basis)" in rendered
+        assert "Critical Misformalizations (advisory synthesis context)" in rendered
         assert "Key Lean 4 / Mathlib Issues (advisory synthesis context)" in rendered
+        assert "synthesis context; not verdict basis" not in rendered
         assert "deterministic verdict and basis above are authoritative" in rendered
         assert "**Overall Verdict:**" not in rendered
 
@@ -1323,7 +1390,7 @@ class TestFindingHygiene:
         assert review._is_pdf_evidence(finding)
         assert not review._has_blocking_grounding(finding)
 
-    def test_verifier_uncertainty_does_not_suppress_grounded_finding(self):
+    def test_verification_required_demotes_unconfirmed_finding(self):
         finding = review.Finding(
             description="Lean omits a hypothesis required by the paper.",
             evidence="Paper §4, Theorem 7 requires h : x ≠ 0.",
@@ -1333,9 +1400,38 @@ class TestFindingHygiene:
             confidence="high",
             severity="high",
         )
-        assert review._has_blocking_grounding(finding, require_verification=True)
+        assert not review._has_blocking_grounding(finding, require_verification=True)
+        # It remains eligible when the verifier is deliberately disabled.
+        assert review._has_blocking_grounding(finding, require_verification=False)
         finding.verification_status = "confirmed"
         assert review._has_blocking_grounding(finding, require_verification=True)
+
+    def test_verified_renderer_rederives_file_assessment(self):
+        finding = review.Finding(
+            description="Lean omits a required hypothesis.",
+            evidence="The trusted specification requires h : x ≠ 0.",
+            evidence_source="paper_or_spec",
+            evidence_locator="Spec §4; Foo.lean:10",
+            evidence_medium="markdown",
+            confidence="high",
+            severity="high",
+        )
+        file_review = review.FileReview(
+            verdict="Changes Requested",
+            critical_misformalizations=[finding],
+        )
+
+        uncertain = review._format_file_review(
+            file_review, "Foo.lean", verification_required=True,
+        )
+        assert "Evidence-gated assessment:** Needs Minor Revisions" in uncertain
+        assert "**Agent assessment:** Changes Requested" not in uncertain
+
+        finding.verification_status = "confirmed"
+        confirmed = review._format_file_review(
+            file_review, "Foo.lean", verification_required=True,
+        )
+        assert "Evidence-gated assessment:** Changes Requested" in confirmed
 
     def test_provenance_requires_a_nonempty_locator_but_does_not_guess_its_validity(self):
         finding = review.Finding(
@@ -1387,18 +1483,20 @@ class TestFindingHygiene:
 
 
 class TestLocalReferenceParts:
-    def test_text_file_becomes_text_part(self, tmp_path):
+    def test_text_file_becomes_text_part(self, tmp_path, monkeypatch):
         p = tmp_path / "spec.md"
         p.write_text("# Spec\nThe ring must be commutative.\n")
+        monkeypatch.chdir(tmp_path)
         parts, errors = get_local_reference_parts(str(p))
         assert errors == []
         assert len(parts) == 1
         assert parts[0].type == "text"
         assert "commutative" in parts[0].data
 
-    def test_pdf_file_becomes_pdf_part(self, tmp_path):
+    def test_pdf_file_becomes_pdf_part(self, tmp_path, monkeypatch):
         p = tmp_path / "paper.pdf"
         p.write_bytes(b"%PDF-1.4 fake")
+        monkeypatch.chdir(tmp_path)
         parts, errors = get_local_reference_parts(str(p))
         assert len(parts) == 1
         assert parts[0].type == "pdf"
@@ -1455,11 +1553,12 @@ class TestLocalReferenceParts:
         assert parts == []
         assert errors and "Could not find" in errors[0]
 
-    def test_directory_expanded(self, tmp_path):
+    def test_directory_expanded(self, tmp_path, monkeypatch):
         (tmp_path / "a.md").write_text("alpha")
         (tmp_path / "b.txt").write_text("beta")
         (tmp_path / "blueprint.tex").write_text("gamma-blueprint")  # LaTeX blueprint
         (tmp_path / "ignore.py").write_text("nope")
+        monkeypatch.chdir(tmp_path)
         parts, errors = get_local_reference_parts(str(tmp_path))
         datas = " ".join(p.data for p in parts if p.type == "text")
         assert "alpha" in datas and "beta" in datas
@@ -1468,6 +1567,28 @@ class TestLocalReferenceParts:
 
     def test_empty_returns_nothing(self):
         assert get_local_reference_parts("") == ([], [])
+
+    def test_symlink_reference_is_rejected(self, tmp_path, monkeypatch):
+        outside = tmp_path.parent / "outside-review-spec.md"
+        outside.write_text("must not be read")
+        (tmp_path / "leak.md").symlink_to(outside)
+        monkeypatch.chdir(tmp_path)
+
+        parts, errors = get_local_reference_parts("leak.md")
+
+        assert parts == []
+        assert errors and "safe in-repository" in errors[0]
+
+    def test_repo_loader_rejects_symlink_escape(self, tmp_path, monkeypatch):
+        outside = tmp_path.parent / "outside-review-context.md"
+        outside.write_text("must not be read")
+        (tmp_path / "leak.md").symlink_to(outside)
+        monkeypatch.chdir(tmp_path)
+
+        files, errors = review.get_repo_files_by_path("leak.md")
+
+        assert files == {}
+        assert errors and "safe in-repository" in errors[0]
 
 
 # --- chunked map-reduce review ---
@@ -1650,7 +1771,10 @@ class TestLeanPathIn:
         assert review._lean_path_in("no path here") is None
         assert review._lean_path_in("") is None
 
-    def test_within_repo_accepts_relative_rejects_traversal(self):
+    def test_within_repo_accepts_relative_rejects_traversal(self, tmp_path, monkeypatch):
+        (tmp_path / "Foo").mkdir()
+        (tmp_path / "Foo" / "Bar.lean").write_text("def bar := 1\n")
+        monkeypatch.chdir(tmp_path)
         assert review._within_repo("Foo/Bar.lean") is True
         assert review._within_repo("../../etc/evil.lean") is False
         assert review._within_repo("/etc/evil.lean") is False
@@ -1737,7 +1861,7 @@ class TestLeanToolWiring:
 
     def test_verifier_uses_tools_when_enabled(self, monkeypatch):
         monkeypatch.setattr(review, "LEAN_TOOLS_ENABLED", True)
-        monkeypatch.setattr(review.file_cache, "read", lambda p: "content")
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "content")
         captured = {}
         provider = self._capturing_provider(captured, review.FindingVerdict(verdict="confirmed", reasoning="r"))
         r = review.FileReview(verdict="Changes Requested",
@@ -1788,6 +1912,17 @@ class TestTokenTrackerCost:
         t.record(review.TokenUsage(input_tokens=200, output_tokens=80, cost_missing=True))
         s = t.summary()
         assert "partial" in s and "+" in s
+
+    def test_total_does_not_double_count_thinking_subset(self):
+        t = review.TokenTracker()
+        t.record(review.TokenUsage(
+            input_tokens=100, output_tokens=50, thinking_tokens=20, cost=0.001,
+        ))
+
+        s = t.summary()
+
+        assert "= 150 total" in s
+        assert "20 thinking included in output" in s
 
 
 # --- triage robustness ---
@@ -1971,7 +2106,7 @@ class TestVerifyFindings:
         return SimpleNamespace(generate_structured=gen, name="fake")
 
     def test_refuted_dropped_others_kept(self, monkeypatch):
-        monkeypatch.setattr(review.file_cache, "read", lambda p: "content")
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "content")
         r = self._review(
             critical_misformalizations=[review.Finding(description="bad hyp")],
             lean_issues=[review.Finding(description="ok issue")],
@@ -1994,7 +2129,7 @@ class TestVerifyFindings:
         return SimpleNamespace(generate_structured=gen, name="fake")
 
     def test_confirmed_correction_lowers_severity(self, monkeypatch):
-        monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "c")
         r = self._review(critical_misformalizations=[
             review.Finding(description="real but over-escalated", severity="critical",
                            confidence="high")])
@@ -2008,7 +2143,7 @@ class TestVerifyFindings:
 
     def test_correction_never_raises_severity(self, monkeypatch):
         # A verifier must not be able to push a finding over the blocking bar.
-        monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "c")
         r = self._review(lean_issues=[
             review.Finding(description="minor nit", severity="low")])
         v = review.FindingVerdict(verdict="confirmed", reasoning="actually terrible",
@@ -2018,7 +2153,7 @@ class TestVerifyFindings:
         assert r.lean_issues[0].severity == "low"
 
     def test_correction_ignored_unless_confirmed(self, monkeypatch):
-        monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "c")
         r = self._review(lean_issues=[
             review.Finding(description="unsettled", severity="high")])
         v = review.FindingVerdict(verdict="uncertain", reasoning="cannot tell",
@@ -2028,7 +2163,7 @@ class TestVerifyFindings:
         assert r.lean_issues[0].severity == "high"       # untouched
 
     def test_verifier_error_keeps_finding(self, monkeypatch):
-        monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "c")
         r = self._review(critical_misformalizations=[review.Finding(description="bad")])
 
         def gen(*a, **k):
@@ -2039,7 +2174,7 @@ class TestVerifyFindings:
         assert len(r.critical_misformalizations) == 1
 
     def test_uncertain_keeps_finding(self, monkeypatch):
-        monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "c")
         r = self._review(lean_issues=[review.Finding(description="maybe")])
         provider = self._provider({"maybe": "uncertain"})
         refuted = review.verify_findings(provider, {"A.lean": r}, None, {"A.lean": "d"}, "", "m")
@@ -2047,7 +2182,7 @@ class TestVerifyFindings:
         assert len(r.lean_issues) == 1
 
     def test_cross_file_finding_refuted(self, monkeypatch):
-        monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "c")
         cf = review.CrossFileAnalysis(composition_issues=[review.Finding(description="mismatch")])
         provider = self._provider({"mismatch": "refuted"})
         refuted = review.verify_findings(provider, {}, cf, {"A.lean": "d"}, "", "m")
@@ -2055,7 +2190,7 @@ class TestVerifyFindings:
         assert cf.composition_issues == []
 
     def test_nitpicks_not_verified(self, monkeypatch):
-        monkeypatch.setattr(review.file_cache, "read", lambda p: "c")
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "c")
         r = self._review(nitpicks=[review.Finding(description="nit")])
         called = {"n": 0}
 
@@ -2080,7 +2215,7 @@ class TestVerifyFindings:
         assert called["n"] == 0
 
     def test_pdf_verifier_receives_original_part_and_requires_visual_confirmation(self, monkeypatch):
-        monkeypatch.setattr(review.file_cache, "read", lambda p: "content")
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "content")
         finding = review.Finding(
             description="The Lean statement is weaker than the paper theorem.",
             location="A.lean:12",
@@ -2656,8 +2791,9 @@ class TestDependentImpactVerificationContext:
             return review.FindingVerdict(verdict="confirmed", reasoning="ok")
 
         monkeypatch.setattr(review, "_verify_one_finding", fake_verify_one)
+        monkeypatch.setattr(review, "_within_repo", lambda p: p == "Consumer.lean")
         # The changed file (in diff_by_file) and an unchanged dependent consumer.
-        monkeypatch.setattr(review.file_cache, "read", lambda p: {
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: {
             "Changed.lean": "def changed := 1",
             "Consumer.lean": "-- consumer body\nimport Changed\ndef uses := changed",
         }.get(p))
@@ -2763,7 +2899,9 @@ class TestC3ActionWiring:
     def test_setup_uv_cache_scoped_to_action_lockfile(self):
         doc, _ = self._action()
         uv = next(s for s in doc["runs"]["steps"] if "setup-uv" in str(s.get("uses", "")))
-        assert uv["with"]["cache-dependency-glob"] == "${{ github.action_path }}/uv.lock"
+        assert uv["with"]["working-directory"] == "${{ github.action_path }}/.."
+        assert uv["with"]["cache-dependency-glob"] == "uv.lock"
+        assert os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "uv.lock"))
 
     def test_thinking_budget_flag_is_empty_guarded(self):
         # An empty thinking_budget input must NOT pass `--thinking-budget ""`
@@ -2794,6 +2932,36 @@ class TestC3ActionWiring:
         assert run_env.get("PR_BASE_SHA") == "${{ steps.resolve_head.outputs.base_sha }}"
         discover = next(s for s in doc["runs"]["steps"] if s.get("id") == "discover_files")
         assert discover["env"].get("PR_HEAD_SHA") == "${{ steps.resolve_head.outputs.head_sha }}"
+
+    def test_discovery_graph_artifact_lives_in_runner_temp(self):
+        doc, _ = self._action()
+        discover = next(s for s in doc["runs"]["steps"] if s.get("id") == "discover_files")
+        graph_path = discover["env"]["LAKE_GRAPH_OUT"]
+        assert graph_path.startswith("${{ runner.temp }}/")
+        assert "github.run_id" in graph_path and "github.run_attempt" in graph_path
+
+    def test_runner_temp_artifacts_are_unique_and_cleaned(self):
+        doc, _ = self._action()
+        build = next(s for s in doc["runs"]["steps"] if s.get("id") == "lean_build")
+        evidence = next(
+            s for s in doc["runs"]["steps"] if s.get("id") == "paper_lean_evidence"
+        )
+        cleanup = next(
+            s for s in doc["runs"]["steps"] if s.get("name") == "Clean up artifacts"
+        )
+        paths = {
+            "BUILD_LOG_PATH": build["env"]["BUILD_LOG_PATH"],
+            "LAKE_GRAPH_OUT": next(
+                s for s in doc["runs"]["steps"] if s.get("id") == "discover_files"
+            )["env"]["LAKE_GRAPH_OUT"],
+            "PAPER_LEAN_EVIDENCE_OUT": evidence["env"]["PAPER_LEAN_EVIDENCE_OUT"],
+        }
+
+        assert cleanup["env"] == paths
+        for name, path in paths.items():
+            assert path.startswith("${{ runner.temp }}/")
+            assert "github.run_id" in path and "github.run_attempt" in path
+            assert f'"${name}"' in cleanup["run"]
 
     def test_lean_info_receives_changed_files_not_context_files(self):
         doc, _ = self._action()
@@ -2828,9 +2996,14 @@ class TestC3ActionWiring:
         script = post["with"]["script"]
         assert "lean-ai-review:" in script
         assert "listReviews" in script
-        assert "dismissReview" in script
+        assert "updateReview" in script
+        assert "dismissReview" not in script
         assert "github.paginate" in script
-        assert "Could not supersede an earlier review" in script
+        assert "Could not inspect earlier reviews" in script
+        assert "Updated existing same-head review body" in script
+        assert "Same-commit rerun: this summary is current" in script
+        assert "body: markedBody + retainedInlineNote" in script
+        assert "annotations = []" in script
         assert "review.body.includes('### 🤖 AI Review')" not in script
         assert "Annotated review posted, but overflow comments failed" in script
         assert "Review comment posted, but overflow comments failed" in script
@@ -3052,14 +3225,45 @@ class TestPinnedDiff:
         seen = {}
         def fake_run(cmd, **kw):
             seen["cmd"] = cmd
-            return SimpleNamespace(stdout="ArkLib/A.lean\nREADME.md\n", returncode=0)
+            return SimpleNamespace(stdout="ArkLib/A.lean\0README.md\0", returncode=0)
         monkeypatch.setattr(discover_files.subprocess, "run", fake_run)
         monkeypatch.setenv("PR_BASE_SHA", "b1")
         monkeypatch.setenv("PR_HEAD_SHA", "h1")
         files = discover_files.get_changed_lean_files("42")
         assert seen["cmd"][:3] == ["git", "diff", "--name-only"]
-        assert "b1...h1" in seen["cmd"][3]
+        assert seen["cmd"][3] == "-z"
+        assert "b1...h1" in seen["cmd"][4]
         assert files == ["ArkLib/A.lean"]          # only .lean kept
+
+    def test_discover_changed_files_preserves_unicode_name(self, monkeypatch):
+        import discover_files
+        monkeypatch.setenv("PR_BASE_SHA", "b1")
+        monkeypatch.setenv("PR_HEAD_SHA", "h1")
+        monkeypatch.setattr(
+            discover_files.subprocess,
+            "run",
+            lambda cmd, **kw: SimpleNamespace(
+                stdout="Lib/naïve.lean\0Lib/普通.lean\0README.md\0", returncode=0
+            ),
+        )
+
+        assert discover_files.get_changed_lean_files("42") == [
+            "Lib/naïve.lean", "Lib/普通.lean",
+        ]
+
+    @pytest.mark.parametrize("unsafe", ["Lib/a,b.lean", "Lib/a\nforged=x.lean"])
+    def test_discover_changed_files_rejects_unencodable_name(self, monkeypatch, unsafe):
+        import discover_files
+        monkeypatch.setenv("PR_BASE_SHA", "b1")
+        monkeypatch.setenv("PR_HEAD_SHA", "h1")
+        monkeypatch.setattr(
+            discover_files.subprocess,
+            "run",
+            lambda cmd, **kw: SimpleNamespace(stdout=unsafe + "\0", returncode=0),
+        )
+
+        with pytest.raises(discover_files.DiscoveryError, match="cannot transport safely"):
+            discover_files.get_changed_lean_files("42")
 
     def test_discover_changed_files_falls_back_when_unpinned(self, monkeypatch):
         import discover_files
@@ -3094,6 +3298,19 @@ class TestPinnedDiff:
         with pytest.raises(SystemExit) as exc:
             discover_files.main()
         assert exc.value.code == 1
+
+    def test_discover_changed_files_fails_closed_on_undecodable_output(self, monkeypatch):
+        # With `-z` (core.quotePath disabled) git can emit raw non-UTF-8 filename
+        # bytes; text=True decoding raises UnicodeDecodeError. Fail closed with the
+        # clean R9 DiscoveryError, not an uncaught crash.
+        import discover_files
+        def boom(cmd, **kw):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        monkeypatch.setattr(discover_files.subprocess, "run", boom)
+        monkeypatch.setenv("PR_BASE_SHA", "b1")
+        monkeypatch.setenv("PR_HEAD_SHA", "h1")
+        with pytest.raises(discover_files.DiscoveryError):
+            discover_files.get_changed_lean_files("42")
 
 
 # --- extract_refs_from_instructions (freeform /review parsing) ---
@@ -3173,6 +3390,16 @@ class TestExtractRefsFromInstructions:
         _, spec, repo = extract_refs_from_instructions(
             f"Look at {tmp_path}/secret.md and ../secret.md and /etc/hostname"
         )
+        assert spec == [] and repo == []
+
+    def test_symlink_path_rejected_even_when_lexically_relative(self, tmp_path, monkeypatch):
+        outside = tmp_path.parent / "outside-instruction-context.md"
+        outside.write_text("secret-bearing target")
+        (tmp_path / "leak.md").symlink_to(outside)
+        monkeypatch.chdir(tmp_path)
+
+        _, spec, repo = extract_refs_from_instructions("Please inspect leak.md")
+
         assert spec == [] and repo == []
 
     def test_punctuation_around_paths(self, tmp_path, monkeypatch):

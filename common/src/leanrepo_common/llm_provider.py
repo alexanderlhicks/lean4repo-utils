@@ -845,7 +845,19 @@ class OpenRouterProvider:
                     f"Model '{model}' returned no parseable structured output "
                     f"(finish_reason={completion.choices[0].finish_reason})"
                 ), u)
-            parsed = schema.model_validate_json(content)
+            try:
+                parsed = schema.model_validate_json(content)
+            except Exception:
+                # A non-empty but malformed fallback body is just as billed and
+                # unusable as an empty one. Record it in the authoritative hard
+                # budget, and expose the per-call delta so advisory callers and
+                # their token/cost summaries account for it too. Do not include
+                # raw model output or Pydantic's content-bearing error in the
+                # public exception message.
+                u = _sum_usage(usage_total, self._record_usage(completion))
+                raise _with_call_usage(ValueError(
+                    f"Model '{model}' returned malformed structured output."
+                ), u) from None
 
         return parsed, _sum_usage(usage_total, self._record_usage(completion))
 

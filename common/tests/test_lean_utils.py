@@ -5,7 +5,14 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from leanrepo_common.lean_utils import file_path_to_module_name, is_in_comment, strip_comments, FileCache, detect_src_dir
+from leanrepo_common.lean_utils import (
+    FileCache,
+    detect_src_dir,
+    file_path_to_module_name,
+    is_in_comment,
+    resolve_confined_path,
+    strip_comments,
+)
 
 
 # --- file_path_to_module_name ---
@@ -32,6 +39,9 @@ class TestFilePathToModuleName:
     def test_explicit_src_dir_no_match(self):
         # src_dir doesn't match the path prefix — falls through to heuristics
         assert file_path_to_module_name("src/Foo/Bar.lean", src_dir="ArkLib") == "Foo.Bar"
+
+    def test_only_removes_the_final_lean_suffix(self):
+        assert file_path_to_module_name("src/Foo.lean/Helper.lean") == "Foo.lean.Helper"
 
 
 # --- is_in_comment ---
@@ -125,6 +135,11 @@ class TestIsInComment:
         assert is_comment is False
         assert depth == 0
 
+    def test_comment_markers_inside_string_do_not_change_depth(self):
+        is_comment, depth = is_in_comment('def message := "/- not a comment --"', 0)
+        assert is_comment is False
+        assert depth == 0
+
 
 # --- strip_comments ---
 
@@ -184,6 +199,12 @@ class TestStripComments:
         assert code.strip() == 'def f := "x"'
         assert depth == 0
 
+    def test_even_backslashes_before_quote_close_string(self):
+        code, depth = strip_comments(r'def f := "x\\" -- sorry', 0)
+        assert code.strip() == r'def f := "x\\"'
+        assert "sorry" not in code
+        assert depth == 0
+
 
 # --- FileCache ---
 
@@ -211,6 +232,36 @@ class TestFileCache:
     def test_readlines_nonexistent(self):
         cache = FileCache()
         assert cache.readlines("/nonexistent/path.lean") is None
+
+    def test_invalid_utf8_is_replaced_and_bom_is_stripped(self, tmp_path):
+        f = tmp_path / "encoded.lean"
+        f.write_bytes(b"\xef\xbb\xbfdef caf\xe9 := 1\n")
+
+        content = FileCache().read(str(f))
+
+        assert content == "def caf\ufffd := 1\n"
+
+
+class TestResolveConfinedPath:
+    def test_accepts_regular_file_inside_root(self, tmp_path):
+        f = tmp_path / "A.lean"
+        f.write_text("def a := 1\n")
+        assert resolve_confined_path(str(f), str(tmp_path), "file") == str(f)
+
+    def test_rejects_absolute_path_outside_root(self, tmp_path):
+        assert resolve_confined_path("/etc/hostname", str(tmp_path), "file") is None
+
+    def test_rejects_final_component_symlink(self, tmp_path):
+        target = tmp_path / "target.lean"
+        target.write_text("def target := 1\n")
+        link = tmp_path / "Leak.lean"
+        link.symlink_to(target)
+        assert resolve_confined_path(str(link), str(tmp_path), "file") is None
+
+    def test_rejects_symlinked_directory_escape(self, tmp_path):
+        link = tmp_path / "outside"
+        link.symlink_to("/etc", target_is_directory=True)
+        assert resolve_confined_path(str(link / "hostname"), str(tmp_path), "file") is None
 
 
 # --- detect_src_dir ---

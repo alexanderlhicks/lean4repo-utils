@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import urlparse
 
+from leanrepo_common.lean_utils import resolve_confined_path
+
 
 DECL_RE = re.compile(
     r"^\s*(?:@\[[^\n]*\]\s*)*"
@@ -480,12 +482,15 @@ def _paths(value: str) -> list[Path]:
         if not item.strip():
             continue
         path = Path(item.strip())
-        if path.is_dir():
+        resolved_dir = resolve_confined_path(str(path), os.getcwd(), "dir")
+        resolved_file = resolve_confined_path(str(path), os.getcwd(), "file")
+        if resolved_dir is not None:
             paths.extend(sorted(
                 p for p in path.rglob("*")
                 if p.suffix.lower() in {".lean", ".pdf", ".tex", ".md", ".markdown", ".txt"}
+                and resolve_confined_path(str(p), os.getcwd(), "file") is not None
             ))
-        else:
+        elif resolved_file is not None:
             paths.append(path)
     return paths
 
@@ -507,7 +512,7 @@ def _instruction_references(text: str) -> tuple[list[str], list[str]]:
             not token
             or path.is_absolute()
             or ".." in path.parts
-            or not path.exists()
+            or resolve_confined_path(token, os.getcwd(), "file") is None
             or path.suffix.lower() not in {".lean", ".pdf", ".tex", ".md", ".markdown", ".txt"}
         ):
             continue
