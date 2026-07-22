@@ -44,6 +44,22 @@ inputs:
     description: 'Give the reviewer and verifier agents Lean toolchain tools (lean_check / lean_print / lean_print_axioms / lean_typecheck via `lake env lean`) so they can check claims against the real compiler instead of guessing. "false" to disable.'
     required: false
     default: 'true'
+  exhaustive:
+    description: 'Enable the heavier exhaustive-mode passes/artifacts (deterministic source ledger for admitted `sorry` declarations). Default "false" keeps per-PR runs cheap and byte-identical to today.'
+    required: false
+    default: 'false'
+  coverage_matrix_path:
+    description: >-
+      Repo-relative path to a coverage/audit matrix to deterministically check (empty disables the phase, the default).
+      Format contract: a markdown table with one row per claim; a symbol cell holding one backticked, fully-qualified Lean
+      identifier; a status cell using the words proven/complete/done (proved) or sorry/admitted/partial/wip/stated
+      (admitted) — word-boundary matched, case-insensitive; emoji or checkmark statuses are unsupported and warned; and a
+      repo-relative `.lean` file path cell. Each symbol is resolved with `#print axioms` in the PR checkout and its claimed
+      status compared against the kernel; rows are checked in matrix order and the phase is capped, so front-load critical
+      rows. Requires a successful workflow Lean build and `lake` on the runner (the phase runs Lean). The matrix is
+      PR-tree content: findings are labeled as derived from PR-supplied, unverified input.
+    required: false
+    default: ''
   thinking_budget:
     description: 'Thinking token budget for deep-analysis agents (spec, per-file review, cross-file). Triage and synthesis use 1/5 of this.'
     required: false
@@ -264,6 +280,8 @@ runs:
         ESCAPE_HATCH_ALLOWLIST: ${{ inputs.escape_hatch_allowlist }}
         ENABLE_WEB_SEARCH: ${{ inputs.enable_web_search }}
         LEAN_TOOLS: ${{ inputs.lean_tools }}
+        EXHAUSTIVE: ${{ inputs.exhaustive }}
+        COVERAGE_MATRIX_PATH: ${{ inputs.coverage_matrix_path }}
         LEAN_INFO: ${{ steps.lean_info.outputs.lean_info_formatted }}
         BUILD_SUCCEEDED: ${{ steps.lean_build.outputs.build_succeeded }}
         BUILD_STATUS: ${{ steps.lean_build.outputs.build_status }}
@@ -315,6 +333,11 @@ runs:
         # commands itself — it writes review_health.json and we emit the annotation here.
         if [ -f review_health.json ] && grep -qE '"degraded": *true' review_health.json; then
           echo "::error::AI review degraded: an LLM spend/quota/auth failure or per-run budget exhaustion left the review incomplete — results are partial (see the run log)."
+        fi
+        # Exhaustive-mode source ledger (Gap A): a fixed-format pointer only —
+        # never file content (untrusted repo text stays out of the step summary).
+        if [ -f review_source_ledger.md ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          echo "Source ledger emitted: review_source_ledger.md ($(grep -c '^|' review_source_ledger.md || true) table line(s))" >> "$GITHUB_STEP_SUMMARY"
         fi
         exit $rc
 

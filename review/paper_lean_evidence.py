@@ -59,6 +59,25 @@ _GENERIC_TOKENS = {
     "claim", "conjecture", "section", "subsection", "result",
     "main", "construction", "proof", "bound", "statement",
 }
+# Citation tag in a declaration docstring, e.g. `[BCHKS25 Thm 1.3]` or `[CS25]`.
+# The author run is letters-only and the two-digit year must be terminated by
+# `]`, whitespace, or a comma — this rejects code-reference lookalikes common in
+# this domain ([SHA256], [BN254 G1], [Curve25519], [GF256]) that a looser
+# `[A-Z][A-Za-z0-9]+\d\d...` pattern would swallow.
+CITATION_TOKEN_RE = re.compile(r"\[[A-Z][A-Za-z]+\d\d(?=[\s,\]])[^\]]*\]")
+# Name mnemonic, e.g. `sorry_bchks25` -> bchks25: at least three trailing
+# letters then exactly two digits at the end of the short name. The stoplist
+# rejects common code suffixes that end in two digits.
+MNEMONIC_RE = re.compile(r"_([a-z]{3,})(\d\d)$")
+_MNEMONIC_STOPLIST = {
+    "mod", "pow", "base", "uint", "int", "word", "utf", "sha", "dim", "deg",
+}
+# Hard cap on a rendered citation tag (audit-artifact hygiene for hostile input).
+_CITATION_TAG_MAX_CHARS = 120
+# How far above a declaration the docstring walk may look (attributes and
+# set_option lines are skipped; anything else halts the walk).
+_CITATION_WALK_MAX_LINES = 30
+_ATTR_LINE_RE = re.compile(r"^\s*(?:@\[|set_option\b)")
 MAX_NAVIGATION_HINTS = 5000
 MAX_NAVIGATION_HINTS_PER_PAPER = 20
 MAX_FORMATTED_DECLARATIONS = 200
@@ -121,6 +140,80 @@ def _signature(lines: list[str], start: int, stripped_lines: list[str]) -> str:
     return " ".join(part for part in collected if part)[:1600]
 
 
+def _decl_docstring_text(
+    lines: list[str], stripped: list[str], index: int
+) -> Optional[str]:
+    """Return the text of the `/-- ... -/` doc comment attached to the
+    declaration at ``lines[index]``, or None.
+
+    The walk is strictly contiguous: only `@[...]` attribute and `set_option`
+    lines may sit between the docstring and the declaration; any other line
+    (including a blank one, or a previous declaration's body) halts the walk,
+    so a citation can never be inherited across declarations. Module
+    docstrings (`/-!`) and plain block comments (`/-`) never qualify.
+
+    ``stripped`` (the comment/string-blanked view of the same lines) is the
+    authority on what is genuinely comment: every line of the candidate block
+    — closer included — must be code-free there. Without that check, any code
+    line that merely ENDS with ``-/`` (a trailing inline block comment, or
+    ``-/`` swallowed by a ``--`` line comment) forges a closer and the walk
+    would inherit an unrelated declaration's docstring across real code.
+    """
+    def comment_only(i: int) -> bool:
+        return not stripped[i].strip()
+
+    # Same-line form: `/-- doc -/ theorem foo ...`.
+    same_line = re.match(r"\s*/--(?P<doc>.*?)-/", lines[index])
+    if same_line:
+        return same_line.group("doc")
+
+    cursor = index - 1
+    floor = max(0, index - _CITATION_WALK_MAX_LINES)
+    while cursor >= floor and _ATTR_LINE_RE.match(lines[cursor]):
+        cursor -= 1
+    if (
+        cursor < floor
+        or not lines[cursor].rstrip().endswith("-/")
+        or not comment_only(cursor)
+    ):
+        return None
+    # Walk up to the opening marker of this comment block. Every intermediate
+    # line must be comment-only, or this is not one contiguous block.
+    start = cursor
+    while start >= floor and not lines[start].lstrip().startswith(("/--", "/-!", "/-")):
+        if not comment_only(start):
+            return None
+        start -= 1
+    opener = lines[start].lstrip() if start >= floor else ""
+    if not opener.startswith("/--") or opener.startswith("/-!"):
+        return None
+    return "\n".join(lines[start:cursor + 1])
+
+
+def _extract_citation_tag(
+    lines: list[str], stripped: list[str], index: int, short_name: str
+) -> Optional[str]:
+    """Best-effort citation tag for the declaration at ``lines[index]``.
+
+    Precedence: an explicit docstring token (`[BCHKS25 Thm 1.3]`) wins over a
+    name mnemonic (`_bchks25`), which is rendered distinctly as unverified.
+    The result is UNTRUSTED repo text — an audit-artifact data value, never an
+    instruction or a verified source link.
+    """
+    doc = _decl_docstring_text(lines, stripped, index)
+    if doc:
+        match = CITATION_TOKEN_RE.search(doc)
+        if match:
+            tag = re.sub(r"\s+", " ", match.group(0)).strip()
+            if len(tag) > _CITATION_TAG_MAX_CHARS:
+                tag = tag[:_CITATION_TAG_MAX_CHARS] + "…"
+            return tag
+    mnemonic = MNEMONIC_RE.search(short_name)
+    if mnemonic and mnemonic.group(1) not in _MNEMONIC_STOPLIST:
+        return f"name-mnemonic: {mnemonic.group(1)}{mnemonic.group(2)} (unverified)"
+    return None
+
+
 def extract_lean_declarations(path: Path) -> list[dict]:
     """Extract declaration records with source spans and signatures."""
     source = path.read_text(encoding="utf-8", errors="replace")
@@ -177,6 +270,10 @@ def extract_lean_declarations(path: Path) -> list[dict]:
             # docstrings as correctness evidence.
             "docstring_present": index > 0 and "/--" in lines[index - 1],
             "contains_sorry_or_admit": bool(re.search(r"\b(?:sorry|admit)\b", body)),
+            # UNTRUSTED repo text (docstring tag or name mnemonic). Data for
+            # the source ledger only — never an instruction, never a verified
+            # source link. Not rendered into LLM prompts by format_evidence.
+            "citation_tag": _extract_citation_tag(lines, stripped, index, short_name),
         })
     return declarations
 

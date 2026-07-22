@@ -239,6 +239,24 @@ ENV_BUDGET_MODE = "LLM_BUDGET_MODE"
 ENV_LOUD_EXIT = "LLM_LOUD_EXIT"
 ENV_BUILD_SUCCEEDED = "BUILD_SUCCEEDED"
 ENV_BUILD_STATUS = "BUILD_STATUS"
+# Exhaustive-mode switch + coverage-matrix path (R7 gaps C/A/B — deterministic
+# backstops for exhaustive-mode/scheduled-audit runs; see
+# review/BOOTSTRAP_toolkit-gaps.md). Same operator-config-only rule as above.
+ENV_EXHAUSTIVE = "EXHAUSTIVE"
+ENV_COVERAGE_MATRIX_PATH = "COVERAGE_MATRIX_PATH"
+
+
+def resolve_exhaustive(cli_flag: bool, environ) -> bool:
+    """Resolve the exhaustive-mode switch from the CLI flag or the env.
+
+    GitHub Actions forwards the input's literal string value — including the
+    default 'false' — so only explicit truthy spellings enable it; anything
+    else (empty, 'false', '0', garbage) resolves False and the run behaves
+    exactly like today's default.
+    """
+    if cli_flag:
+        return True
+    return environ.get(ENV_EXHAUSTIVE, "").strip().lower() in ("1", "true", "yes")
 # Process exit code when loud-exit is enabled AND the run degraded. Applied ONLY at
 # the entrypoint via sys.exit(main()) — never inside a finally, and only after the
 # comment has been written. Do NOT set this action as a required check with loud-exit
@@ -247,6 +265,11 @@ LOUD_EXIT_CODE = 2
 # The health flag file review.py writes for the action's shell step to read (its
 # stdout is the PR-comment channel, so it cannot print ::error:: itself).
 REVIEW_HEALTH_FILE = "review_health.json"
+# Deterministic source ledger (R7 Gap A, exhaustive mode only): one row per
+# admitted-`sorry` declaration with its parsed citation tag. Namespaced like the
+# review_*.json artifacts — a generic SOURCE_LEDGER.md would collide with real
+# review artifacts already present in target-repo checkouts.
+SOURCE_LEDGER_FILE = "review_source_ledger.md"
 # Per-run health tracker; a fresh one is installed at the top of main(). Module-global
 # so the ThreadPool worker functions can record into it (thread-safe).
 run_health = RunHealth()
@@ -364,7 +387,11 @@ def _render_reference_manifest(records: "Optional[List[ContextRecord]]") -> str:
     return "\n".join(out)
 
 
-def _emit_degraded_review(per_file_reviews: dict, records: "Optional[List[ContextRecord]]" = None) -> None:
+def _emit_degraded_review(
+    per_file_reviews: dict,
+    records: "Optional[List[ContextRecord]]" = None,
+    coverage_section: Optional[str] = None,
+) -> None:
     """Render + print a degraded review comment after a fatal aborted the run
     mid-flight (C3, STEP 5a). Leads with the CAUTION banner and a NOT-approved basis,
     then whatever per-file reviews completed before the abort, plus the budget
@@ -385,6 +412,10 @@ def _emit_degraded_review(per_file_reviews: dict, records: "Optional[List[Contex
         comment += "\n**Partial results — reviews that completed before the run stopped:**\n"
         for fp, text in completed.items():
             comment += f"\n<details><summary>📄 **Review for `{_safe_md_path(fp)}`**</summary>\n\n{text}\n</details>\n"
+    # The coverage-matrix phase is deterministic and runs before any LLM call,
+    # so its results are intact on the degraded path — keep them visible.
+    if coverage_section is not None:
+        comment += f"\n<details><summary>🧮 **Coverage matrix check**</summary>\n\n{coverage_section}\n</details>\n"
     # The manifest belongs on the degraded path too — it is most diagnostic exactly when
     # the run aborted (what context HAD been loaded before it stopped).
     comment += _render_reference_manifest(records)
@@ -2829,6 +2860,7 @@ def compute_deterministic_verdict(
     cross_file_structured: Optional["CrossFileAnalysis"],
     review_incomplete: bool,
     verification_required: bool = False,
+    coverage_matrix_findings: Optional[list] = None,
 ) -> Tuple[str, List[str]]:
     """Compute the authoritative overall verdict from mechanical facts and
     structured findings, rather than trusting the synthesis LLM to apply the
@@ -2861,6 +2893,24 @@ def compute_deterministic_verdict(
         kws = ", ".join(sorted({f"`{kw}`" for _f, kw, _s in triggering}))
         bump("Changes Requested")
         reasons.append(f"Escape hatch(es) introduced in this PR ({kws}) — hard verdict rule.")
+
+    # Coverage-matrix status mismatches (R7 Gap B) marked blocking are
+    # machine-verified kernel facts (`sorryAx` present where the matrix claims
+    # proven, on a file this PR touches) — same class as the escape-hatch hard
+    # rule. They block even under verification_required: the 15de859
+    # verification gate demotes unconfirmed LLM findings, not compiler output.
+    # Non-blocking coverage findings (pre-existing rot, unresolved symbols)
+    # are rendered in their own section and never move the verdict.
+    blocking_coverage = [
+        f for f in (coverage_matrix_findings or []) if getattr(f, "blocking", False)
+    ]
+    if blocking_coverage:
+        bump("Changes Requested")
+        reasons.append(
+            f"{len(blocking_coverage)} machine-verified coverage-matrix status "
+            "mismatch(es): `#print axioms` reports `sorryAx` where the matrix "
+            "claims proven, on a file (or the matrix itself) this PR touches."
+        )
 
     # Low-confidence model reports remain visible in the comment, but do not
     # independently block a PR. This is the first R1 step toward separating
@@ -2966,6 +3016,230 @@ def split_into_comments(body: str, max_size: int = MAX_GITHUB_COMMENT_SIZE) -> L
     return parts
 
 
+def _ledger_cell(value: str) -> str:
+    """Render untrusted repo text as one safe markdown table cell.
+
+    Newlines collapse to spaces, pipes are escaped so a cell cannot break the
+    table row, and backticks are replaced (a code-span fence inside the cell
+    could otherwise swallow the rest of the row). The result is wrapped in a
+    code span so markdown inside the value stays inert.
+    """
+    flat = re.sub(r"\s+", " ", str(value)).strip()
+    flat = flat.replace("|", "\\|").replace("`", "'")
+    return f"`{flat}`" if flat else "``"
+
+
+def build_source_ledger(lean_file_paths) -> str:
+    """Deterministic source ledger (R7 Gap A; see review/BOOTSTRAP_toolkit-gaps.md).
+
+    One markdown table row per admitted-`sorry`/`admit` declaration in the
+    changed Lean files: {decl, cited_source, disposition}. `disposition` starts
+    `unadjudicated` — a later adjudicating pass may upgrade it to
+    `shape-pass | fail | translation-gap`. Purely deterministic (no LLM) and
+    verdict-neutral: a missing citation renders the literal
+    'no cited source found' and is never a finding. All cell content is
+    untrusted repo text and is sanitized by _ledger_cell.
+    """
+    from pathlib import Path
+
+    from paper_lean_evidence import extract_lean_declarations
+
+    rows = []
+    seen = set()
+    skipped_files = []
+    for file_path in sorted(set(lean_file_paths)):
+        resolved = _resolve_repo_path(file_path, "file")
+        if resolved is None:
+            # Deleted in the PR, or not a confined regular file — either way
+            # there is nothing to scan, but say so rather than staying silent.
+            skipped_files.append(file_path)
+            continue
+        try:
+            declarations = extract_lean_declarations(Path(resolved))
+        except (OSError, UnicodeError) as e:
+            logging.warning(f"Source ledger: could not scan {file_path}: {describe_exc(e)}")
+            skipped_files.append(file_path)
+            continue
+        for decl in declarations:
+            if not decl.get("contains_sorry_or_admit"):
+                continue
+            key = (file_path, decl["fqn"], decl["line_start"])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((file_path, decl["line_start"], decl["fqn"], decl.get("citation_tag")))
+    rows.sort(key=lambda r: (r[0], r[1]))
+
+    lines = [
+        "# Source ledger (deterministic, exhaustive mode)",
+        "",
+        "One row per admitted (`sorry`/`admit`) declaration in the changed Lean "
+        "files, with the citation tag parsed from its docstring or name "
+        "mnemonic. Schema per `review/BOOTSTRAP_toolkit-gaps.md` Gap A "
+        "(table schema v1: decl | cited_source | disposition). Citation tags "
+        "are untrusted repo text; a missing citation is informational, never a "
+        "defect. `disposition` starts `unadjudicated` and may be upgraded to "
+        "`shape-pass | fail | translation-gap` by a later adjudicating pass.",
+        "",
+    ]
+    if not rows:
+        lines.append("**No admitted declarations in the changed Lean files of this PR.**")
+    else:
+        lines.append("| decl | cited_source | disposition |")
+        lines.append("| --- | --- | --- |")
+        for file_path, line_start, fqn, citation in rows:
+            decl_cell = _ledger_cell(f"{file_path}:{line_start} {fqn}")
+            cite_cell = _ledger_cell(citation) if citation else "no cited source found"
+            lines.append(f"| {decl_cell} | {cite_cell} | unadjudicated |")
+    if skipped_files:
+        lines.append("")
+        lines.append(
+            f"Skipped {len(skipped_files)} changed file(s) that could not be scanned "
+            "(deleted in this PR, unreadable, or not a confined regular file)."
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def run_coverage_matrix_phase(
+    matrix_path: str,
+    repo_root: str,
+    changed_files: set,
+    build_succeeded: bool,
+    lean_enabled: bool,
+) -> Tuple[list, List[str], List[str]]:
+    """Deterministic coverage-matrix resolution (R7 Gap B).
+
+    Returns (findings, warnings, stale_notes). Gates, in order: path
+    confinement → size cap → Lean availability (respects the lean_tools
+    opt-out) → build success. Every failed gate degrades to a warning and the
+    phase is skipped — hostile matrix content must never abort the review.
+    Findings carry ``blocking`` per the causal-responsibility rule (gate-1
+    decision D1): a machine-verified status mismatch blocks only when the
+    PR's changed files include the declaration's file or the matrix itself;
+    pre-existing matrix rot renders loudly but never blocks unrelated PRs.
+    """
+    from coverage_matrix import (
+        MAX_MATRIX_BYTES,
+        PHASE_BUDGET_SECONDS,
+        check_coverage_matrix,
+        parse_coverage_matrix,
+    )
+    import time as _t
+
+    findings: list = []
+    warnings: List[str] = []
+    notes: List[str] = []
+    try:
+        import posixpath
+        rel = matrix_path[2:] if matrix_path.startswith("./") else matrix_path
+        # Normalize so the matrix's own changed-files membership check below
+        # compares the same spelling git diff uses (`a/./b` never matches).
+        rel = posixpath.normpath(rel)
+        resolved = resolve_confined_path(os.path.join(repo_root, rel), repo_root, "file")
+        if resolved is None:
+            warnings.append(
+                "coverage_matrix_path does not resolve to a regular file inside "
+                "the checkout — coverage matrix not checked."
+            )
+        elif os.path.getsize(resolved) > MAX_MATRIX_BYTES:
+            warnings.append(
+                f"coverage matrix exceeds {MAX_MATRIX_BYTES} bytes — coverage matrix not checked."
+            )
+        elif not lean_enabled:
+            warnings.append(
+                "Lean tools are unavailable or disabled — coverage matrix not checked."
+            )
+        elif not build_succeeded:
+            warnings.append(
+                "the workflow Lean build did not succeed — coverage matrix not "
+                "checked (an unbuilt module cannot be queried)."
+            )
+        else:
+            with open(resolved, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            rows, parse_warnings = parse_coverage_matrix(text, repo_root)
+            warnings.extend(parse_warnings)
+            findings, infra_warnings, notes = check_coverage_matrix(
+                rows, deadline=_t.monotonic() + PHASE_BUDGET_SECONDS
+            )
+            warnings.extend(infra_warnings)
+            for finding in findings:
+                finding.blocking = (
+                    finding.kind == "status-mismatch"
+                    and (finding.row.file_path in changed_files or rel in changed_files)
+                )
+    except Exception as e:
+        # Hostile matrix content (binary, undecodable, pathological) degrades
+        # to a warning; the review itself must proceed.
+        warnings.append(f"coverage-matrix phase failed and was skipped: {describe_exc(e)}")
+    for w in warnings:
+        logging.warning(f"Coverage matrix: {w}")
+    return findings, warnings, notes
+
+
+def _format_coverage_section(findings: list, warnings: List[str], notes: List[str]) -> str:
+    """Render the deterministic 'Coverage matrix check' comment section.
+
+    All row/evidence text derives from PR-supplied matrix input and compiler
+    output — flattened and fence-neutralized before rendering.
+    """
+    def safe(value: object) -> str:
+        # Flatten whitespace, neutralize fences AND HTML: warning text embeds
+        # truncated Lean subprocess output (PR-influenced), and an unescaped
+        # `</details>` would break out of the collapsible comment section.
+        flat = re.sub(r"\s+", " ", str(value)).strip()
+        flat = flat.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return re.sub(r"`{3,}", "``", flat)
+
+    lines = [
+        "_Deterministic check of the configured coverage matrix — derived from "
+        "PR-supplied, unverified matrix input. Symbols are resolved with "
+        "`#print axioms` against the PR checkout._",
+        "",
+    ]
+    blocking = [f for f in findings if getattr(f, "blocking", False)]
+    advisory = [f for f in findings if not getattr(f, "blocking", False)]
+    if blocking:
+        lines.append(
+            "**Machine-verified status mismatches (verdict-blocking — this PR "
+            "touches the declaration's file or the matrix itself):**"
+        )
+        lines.extend(f"- {safe(f.evidence)}" for f in blocking)
+        lines.append("")
+    if advisory:
+        lines.append(
+            "**Advisory findings (not verdict-affecting: pre-existing "
+            "mismatches and unresolved symbols):**"
+        )
+        lines.extend(f"- ({safe(f.kind)}) {safe(f.evidence)}" for f in advisory)
+        lines.append("")
+    if notes:
+        lines.append("**Stale-claim notes (rows possibly ready to flip to proven):**")
+        lines.extend(f"- {safe(n)}" for n in notes)
+        lines.append("")
+    if warnings:
+        lines.append("**Warnings:**")
+        lines.extend(f"- {safe(w)}" for w in warnings)
+        lines.append("")
+    if not (findings or notes or warnings):
+        lines.append("All matrix rows resolved and matched their claimed status.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def emit_source_ledger(lean_file_paths) -> None:
+    """Write the source ledger artifact; never abort the review over it."""
+    try:
+        content = build_source_ledger(lean_file_paths)
+        with open(SOURCE_LEDGER_FILE, "w", encoding="utf-8") as f:
+            f.write(content)
+        logging.info(f"Wrote source ledger to {SOURCE_LEDGER_FILE}")
+    except Exception as e:
+        # The ledger is an optional deterministic artifact — a failure here must
+        # degrade to a warning, not take down the whole review.
+        logging.warning(f"Source ledger emission failed: {describe_exc(e)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="AI Code Reviewer")
     parser.add_argument("--pr-number", required=True)
@@ -2985,6 +3259,8 @@ def main():
     parser.add_argument("--max-workers", type=int, default=5, help="Max parallel threads for per-file review.")
     parser.add_argument("--enable-web-search", action="store_true", help="Enable OpenRouter web-search grounding for agents (adds cost).")
     parser.add_argument("--no-lean-tools", action="store_true", help="Disable Lean toolchain access (lean_check/print/typecheck) for the reviewer and verifier.")
+    parser.add_argument("--exhaustive", action="store_true", help="Enable the heavier exhaustive-mode passes/artifacts (source ledger; see BOOTSTRAP_toolkit-gaps.md). Default runs are unaffected.")
+    parser.add_argument("--coverage-matrix-path", default="", help="Repo-relative path to a coverage/audit matrix (markdown table) whose symbols are deterministically resolved and checked against #print axioms. Empty disables the phase.")
     args = parser.parse_args()
 
     # Validate inputs
@@ -3015,6 +3291,11 @@ def main():
     global THINKING_BUDGET_HIGH, THINKING_BUDGET_LOW
     THINKING_BUDGET_HIGH, THINKING_BUDGET_LOW = _compute_thinking_budgets(args.thinking_budget)
 
+    # Exhaustive mode (R7 Gap C): resolved before any early exit so the
+    # deterministic exhaustive-mode artifacts are emitted on every path.
+    exhaustive = resolve_exhaustive(args.exhaustive, os.environ)
+    logging.info(f"Exhaustive mode: {'enabled' if exhaustive else 'disabled'}")
+
     # Delete any stale output files before we run — and before EVERY early
     # exit below. The Lean build step executes PR-branch lakefile code in this
     # same workspace BEFORE review.py, and lean_tools run model-directed Lean
@@ -3023,7 +3304,7 @@ def main():
     # review_health.json (read by the shell step). This must precede the
     # no-Lean-files return and the API_KEY/budget exits: those paths still let
     # Post Review run, so a planted file would otherwise be posted verbatim.
-    for _stale in ("review_annotations.json", "review_comments.json", REVIEW_HEALTH_FILE):
+    for _stale in ("review_annotations.json", "review_comments.json", REVIEW_HEALTH_FILE, SOURCE_LEDGER_FILE):
         try:
             os.remove(_stale)
         except FileNotFoundError:
@@ -3039,8 +3320,17 @@ def main():
     diff_by_file = split_diff_into_files(diff)
     lean_files = {f: d for f, d in diff_by_file.items() if f.endswith('.lean')}
     if not lean_files:
+        if exhaustive:
+            # Marker-form ledger so absence-of-file is never ambiguous on the
+            # early-exit path (an absent artifact could mean "not emitted").
+            emit_source_ledger([])
         print("### 🤖 AI Review\n\nNo Lean files were changed in this PR.")
         return
+
+    if exhaustive:
+        # Emitted BEFORE the LLM orchestration phases: a budget trip or hard
+        # LLM failure must not lose a purely deterministic artifact.
+        emit_source_ledger(lean_files.keys())
 
     context_warnings = []
 
@@ -3186,6 +3476,30 @@ def main():
         logging.warning("Lean tools requested but `lake` was not found; agents will run without them.")
     logging.info(f"Lean toolchain tools: {'enabled' if LEAN_TOOLS_ENABLED else 'disabled'}")
 
+    # --- Coverage-matrix resolution (R7 Gap B) — deterministic, pre-LLM ---
+    # Runs BEFORE the orchestration try (and before any LLM spend) so its
+    # results survive a budget trip or hard LLM failure; the degraded comment
+    # renders the section too. Its own opt-in: the configured path alone
+    # enables it (gate-1 decision D2); empty path = byte-identical default run.
+    coverage_findings: list = []
+    coverage_warnings: List[str] = []
+    coverage_notes: List[str] = []
+    coverage_matrix_path = (
+        args.coverage_matrix_path or os.environ.get(ENV_COVERAGE_MATRIX_PATH, "")
+    ).strip()
+    if coverage_matrix_path:
+        coverage_findings, coverage_warnings, coverage_notes = run_coverage_matrix_phase(
+            coverage_matrix_path,
+            os.getcwd(),
+            set(diff_by_file.keys()),
+            build_status == "success",
+            LEAN_TOOLS_ENABLED,
+        )
+    coverage_section = (
+        _format_coverage_section(coverage_findings, coverage_warnings, coverage_notes)
+        if coverage_matrix_path else None
+    )
+
     # Partial-result accumulators, initialized BEFORE the orchestration try so the
     # top-level containment handler can render whatever completed if a fatal (budget
     # trip / hard LLM failure) aborts the run before these are reached inside the try.
@@ -3204,6 +3518,10 @@ def main():
             "review_model": args.review_model,
             "max_workers": args.max_workers,
             "build_succeeded": build_status == "success",
+            # Reserved: no LLM phase branches on this yet — the current
+            # exhaustive-mode artifacts (source ledger) are emitted before the
+            # orchestration try. Future gated passes read it from here.
+            "exhaustive": exhaustive,
         }
         
         lean4_checklist_path = os.path.join(ACTION_PATH, "prompts", "lean4_checklist.md")
@@ -3494,6 +3812,7 @@ def main():
         det_verdict, det_reasons = compute_deterministic_verdict(
             precheck_scan, per_file_structured, cross_file_structured, review_incomplete,
             verification_required=verification_enabled,
+            coverage_matrix_findings=coverage_findings,
         )
         logging.info(f"Deterministic verdict: {det_verdict}")
 
@@ -3547,6 +3866,7 @@ def main():
             det_verdict, det_reasons = compute_deterministic_verdict(
                 precheck_scan, per_file_structured, cross_file_structured, review_incomplete,
                 verification_required=verification_enabled,
+                coverage_matrix_findings=coverage_findings,
             )
             logging.info(f"Verdict re-derived after post-verdict degradation: {det_verdict}")
 
@@ -3580,6 +3900,9 @@ def main():
 
         if has_findings:
             final_comment += f"\n<details><summary>🔍 **Mechanical Pre-Check Results**</summary>\n\n{pre_check_findings}\n</details>\n"
+
+        if coverage_section is not None:
+            final_comment += f"\n<details><summary>🧮 **Coverage matrix check**</summary>\n\n{coverage_section}\n</details>\n"
 
         if cross_file_text:
             final_comment += f"\n<details><summary>🔗 **Cross-File Analysis**</summary>\n\n{cross_file_text}\n</details>\n"
@@ -3659,7 +3982,7 @@ def main():
         # completed, then exit 0 (or the loud-exit code, applied at the entrypoint).
         run_health.record_budget_trip()
         logging.error("Review aborted early: per-run budget exhausted; reporting as incomplete.")
-        _emit_degraded_review(per_file_reviews, context_records)
+        _emit_degraded_review(per_file_reviews, context_records, coverage_section=coverage_section)
     except Exception as e:
         # A hard spend/auth/quota failure re-raised to here. Anything NOT hard keeps
         # today's behaviour: propagate (a genuine bug must not be reported as a clean
@@ -3669,7 +3992,7 @@ def main():
             raise
         run_health.record_hard_failure()
         logging.error(f"Review aborted: hard LLM failure; reporting as incomplete: {describe_exc(e)}")
-        _emit_degraded_review(per_file_reviews, context_records)
+        _emit_degraded_review(per_file_reviews, context_records, coverage_section=coverage_section)
     finally:
         logging.info(token_tracker.summary())
 

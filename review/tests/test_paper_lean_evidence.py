@@ -283,3 +283,178 @@ def test_pdf_without_extractor_is_explicitly_unavailable(tmp_path, monkeypatch):
 
     assert evidence.extract_paper_statements(paper, warnings) == []
     assert warnings and "visual inspection" in warnings[0]
+
+
+# --- Session 15 Gap A: citation-tag extraction ---
+
+class TestCitationTag:
+    def _decls(self, tmp_path, source):
+        f = tmp_path / "Cite.lean"
+        f.write_text(source)
+        return {d["short_name"]: d for d in evidence.extract_lean_declarations(f)}
+
+    def test_docstring_tag_parsed(self, tmp_path):
+        decls = self._decls(tmp_path, (
+            "/-- Admitted external, see [BCHKS25 Thm 1.3] for the bound. -/\n"
+            "theorem foo : True := sorry\n"
+        ))
+        assert decls["foo"]["citation_tag"] == "[BCHKS25 Thm 1.3]"
+
+    def test_multiline_docstring_and_attributes_skipped(self, tmp_path):
+        decls = self._decls(tmp_path, (
+            "/-- Long docstring.\n"
+            "Cites [GG25 Cor 4.10] here.\n"
+            "-/\n"
+            "@[simp]\n"
+            "set_option maxHeartbeats 400000 in\n"
+            "theorem bar : True := sorry\n"
+        ))
+        assert decls["bar"]["citation_tag"] == "[GG25 Cor 4.10]"
+
+    def test_same_line_docstring(self, tmp_path):
+        decls = self._decls(tmp_path, "/-- [CS25 Thm 2] -/ theorem baz : True := sorry\n")
+        assert decls["baz"]["citation_tag"] == "[CS25 Thm 2]"
+
+    def test_code_reference_lookalikes_rejected(self, tmp_path):
+        for tag in ("[SHA256]", "[BN254 G1]", "[Curve25519]", "[GF256]", "[SHA256 spec]"):
+            decls = self._decls(tmp_path, (
+                f"/-- Uses {tag} internally. -/\n"
+                "theorem qux : True := sorry\n"
+            ))
+            assert decls["qux"]["citation_tag"] is None, tag
+
+    def test_no_cross_decl_inheritance_blank_line(self, tmp_path):
+        decls = self._decls(tmp_path, (
+            "/-- [ABC24] -/\n"
+            "theorem a : True := sorry\n"
+            "\n"
+            "theorem b : True := sorry\n"
+        ))
+        assert decls["a"]["citation_tag"] == "[ABC24]"
+        assert decls["b"]["citation_tag"] is None
+
+    def test_no_inheritance_from_previous_decl_body(self, tmp_path):
+        decls = self._decls(tmp_path, (
+            "theorem a : True := by\n"
+            "  -- see [XYZ23 Thm 1]\n"
+            "  trivial\n"
+            "theorem b : True := sorry\n"
+        ))
+        assert decls["b"]["citation_tag"] is None
+
+    def test_module_docstring_never_qualifies(self, tmp_path):
+        decls = self._decls(tmp_path, (
+            "/-! Module doc citing [XYZ23]. -/\n"
+            "theorem c : True := sorry\n"
+        ))
+        assert decls["c"]["citation_tag"] is None
+
+    def test_plain_block_comment_never_qualifies(self, tmp_path):
+        decls = self._decls(tmp_path, (
+            "/- plain comment [XYZ23] -/\n"
+            "theorem d : True := sorry\n"
+        ))
+        assert decls["d"]["citation_tag"] is None
+
+    def test_body_token_not_scanned(self, tmp_path):
+        decls = self._decls(tmp_path, (
+            "theorem e : True := by\n"
+            "  exact trivial -- [ABC24]\n"
+        ))
+        assert decls["e"]["citation_tag"] is None
+
+    def test_mnemonic_rendered_unverified(self, tmp_path):
+        decls = self._decls(tmp_path, "theorem bound_bchks25 : True := sorry\n")
+        assert decls["bound_bchks25"]["citation_tag"] == "name-mnemonic: bchks25 (unverified)"
+
+    def test_mnemonic_false_positives_rejected(self, tmp_path):
+        src = "\n".join(
+            f"theorem {n} : True := sorry" for n in
+            ("sum_mod37", "hash_base64", "encode_utf16", "pow_two_mod97", "size_uint32")
+        ) + "\n"
+        decls = self._decls(tmp_path, src)
+        for n in ("sum_mod37", "hash_base64", "encode_utf16", "pow_two_mod97", "size_uint32"):
+            assert decls[n]["citation_tag"] is None, n
+
+    def test_short_or_one_digit_suffixes_rejected(self, tmp_path):
+        decls = self._decls(tmp_path, "theorem foo_sq2 : True := sorry\ntheorem bar_l2 : True := sorry\n")
+        assert decls["foo_sq2"]["citation_tag"] is None
+        assert decls["bar_l2"]["citation_tag"] is None
+
+    def test_docstring_tag_wins_over_mnemonic(self, tmp_path):
+        decls = self._decls(tmp_path, (
+            "/-- [CS25 Thm 2] -/\n"
+            "theorem thing_bchks25 : True := sorry\n"
+        ))
+        assert decls["thing_bchks25"]["citation_tag"] == "[CS25 Thm 2]"
+
+    def test_hostile_tag_capped_and_flattened(self, tmp_path):
+        long_tail = "x" * 300
+        decls = self._decls(tmp_path, (
+            f"/-- [ABC24 {long_tail}] -/\n"
+            "theorem f : True := sorry\n"
+        ))
+        tag = decls["f"]["citation_tag"]
+        assert tag is not None and len(tag) <= 121 and tag.endswith("…")
+
+    def test_format_evidence_prompt_surface_unchanged_by_citation_tag(self, tmp_path):
+        # D8: citation_tag is additive in the JSON artifact and must not leak
+        # into the prompt rendering.
+        lean = tmp_path / "Main.lean"
+        lean.write_text("/-- [ABC24] -/\ntheorem g : True := sorry\n")
+        payload = evidence.build_evidence([lean], [])
+        rendered = evidence.format_evidence(payload)
+        stripped_payload = {
+            **payload,
+            "lean_declarations": [
+                {k: v for k, v in d.items() if k != "citation_tag"}
+                for d in payload["lean_declarations"]
+            ],
+        }
+        assert rendered == evidence.format_evidence(stripped_payload)
+        assert "citation_tag" not in rendered and "ABC24" not in rendered
+
+    # --- Phase-3 review regressions (B1: forged `-/` closer) ---
+
+    def test_forged_closer_trailing_line_comment_no_inheritance(self, tmp_path):
+        # B1 repro from the adversarial review: a code line whose trailing
+        # `--` comment happens to end in `-/` must not act as a doc-comment
+        # closer, or decl b inherits decl a's citation across real code.
+        decls = self._decls(tmp_path, (
+            "/-- Cites [AB12 Thm 3]. -/\n"
+            "theorem a : True := trivial\n"
+            "example : 2 = 2 := by rfl -- see docs -/\n"
+            "theorem b : False := sorry\n"
+        ))
+        assert decls["a"]["citation_tag"] == "[AB12 Thm 3]"
+        assert decls["b"]["citation_tag"] is None
+
+    def test_forged_closer_inline_block_comment_no_inheritance(self, tmp_path):
+        decls = self._decls(tmp_path, (
+            "/-- [CD34 Lemma 2]. -/\n"
+            "theorem c : True := trivial\n"
+            "def helper : Nat := 0 /- tidy -/\n"
+            "theorem d : False := sorry\n"
+        ))
+        assert decls["c"]["citation_tag"] == "[CD34 Lemma 2]"
+        assert decls["d"]["citation_tag"] is None
+
+    def test_code_between_opener_and_closer_no_inheritance(self, tmp_path):
+        # Opener search must not walk past real code up to an unrelated `/--`.
+        decls = self._decls(tmp_path, (
+            "/-- [EF56]. -/\n"
+            "theorem e : True := trivial\n"
+            "-/\n"
+            "theorem f : False := sorry\n"
+        ))
+        assert decls["f"]["citation_tag"] is None
+
+    def test_genuine_multiline_docstring_still_parsed_after_fix(self, tmp_path):
+        decls = self._decls(tmp_path, (
+            "/--\n"
+            "Admitted external.\n"
+            "Cites [GH78 Thm 9].\n"
+            "-/\n"
+            "theorem g : False := sorry\n"
+        ))
+        assert decls["g"]["citation_tag"] == "[GH78 Thm 9]"

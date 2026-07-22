@@ -3451,3 +3451,385 @@ class TestMergeCsv:
 
     def test_existing_whitespace_normalized(self):
         assert _merge_csv(" a , b ", ["c"]) == "a,b,c"
+
+
+# --- Session 15 Gap C: exhaustive-mode switch ---
+
+class TestResolveExhaustive:
+    def test_default_env_is_off(self):
+        assert review.resolve_exhaustive(False, {}) is False
+
+    def test_gha_literal_false_is_off(self):
+        # GitHub Actions forwards the input's literal default string 'false'.
+        for v in ("false", "FALSE", "False", "0", "no", "", "  ", "garbage"):
+            assert review.resolve_exhaustive(False, {review.ENV_EXHAUSTIVE: v}) is False
+
+    def test_truthy_spellings_enable(self):
+        for v in ("true", "True", "TRUE", "1", "yes", " true "):
+            assert review.resolve_exhaustive(False, {review.ENV_EXHAUSTIVE: v}) is True
+
+    def test_cli_flag_wins_over_env(self):
+        assert review.resolve_exhaustive(True, {}) is True
+        assert review.resolve_exhaustive(True, {review.ENV_EXHAUSTIVE: "false"}) is True
+
+    def test_unrelated_env_keys_ignored(self):
+        assert review.resolve_exhaustive(False, {"EXHAUSTIVE_MODE": "true"}) is False
+
+
+class TestSession15ActionWiring:
+    """Gap C/B wiring: the new inputs exist with safe defaults and reach review.py
+    via env only (never interpolated into a run: body)."""
+
+    def _action(self):
+        import yaml
+        p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "action.yml")
+        with open(p) as f:
+            return yaml.safe_load(f), open(p).read()
+
+    def _run_step(self, doc):
+        return next(s for s in doc["runs"]["steps"] if s.get("id") == "run_review")
+
+    def test_inputs_declared_with_safe_defaults(self):
+        doc, _ = self._action()
+        assert doc["inputs"]["exhaustive"]["default"] == "false"
+        assert doc["inputs"]["coverage_matrix_path"]["default"] == ""
+
+    def test_env_names_match_python_constants(self):
+        doc, _ = self._action()
+        env = self._run_step(doc)["env"]
+        assert env[review.ENV_EXHAUSTIVE] == "${{ inputs.exhaustive }}"
+        assert env[review.ENV_COVERAGE_MATRIX_PATH] == "${{ inputs.coverage_matrix_path }}"
+
+    def test_new_inputs_never_interpolated_into_run_body(self):
+        doc, _ = self._action()
+        for s in doc["runs"]["steps"]:
+            run = s.get("run", "")
+            assert "inputs.exhaustive" not in run
+            assert "inputs.coverage_matrix_path" not in run
+
+
+# --- Session 15 Gap A: deterministic source ledger ---
+
+class TestSourceLedger:
+    def _write(self, tmp_path, name, text):
+        p = tmp_path / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        return name
+
+    def test_rows_for_admitted_decls_only(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f = self._write(tmp_path, "A.lean", (
+            "/-- [BCHKS25 Thm 1.3] -/\n"
+            "theorem admitted_one : True := sorry\n"
+            "theorem proven_one : True := trivial\n"
+        ))
+        ledger = review.build_source_ledger([f])
+        assert "admitted_one" in ledger
+        assert "proven_one" not in ledger
+        assert "[BCHKS25 Thm 1.3]" in ledger
+        assert "unadjudicated" in ledger
+
+    def test_missing_citation_renders_literal(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f = self._write(tmp_path, "B.lean", "theorem uncited : True := sorry\n")
+        ledger = review.build_source_ledger([f])
+        assert "no cited source found" in ledger
+
+    def test_citation_less_pr_is_complete_and_neutral(self, tmp_path, monkeypatch):
+        # Maintainer acceptance criterion (gate 1): a PR with no reference
+        # paper/citations still yields a complete ledger — every admitted decl
+        # listed, all rows 'no cited source found' — and the ledger is pure
+        # artifact (no findings/verdict surface is touched by construction).
+        monkeypatch.chdir(tmp_path)
+        f = self._write(tmp_path, "C.lean", (
+            "theorem one : True := sorry\n"
+            "lemma two : 1 = 1 := sorry\n"
+            "def three : Nat := sorry\n"
+        ))
+        ledger = review.build_source_ledger([f])
+        for name in ("one", "two", "three"):
+            assert name in ledger
+        assert ledger.count("no cited source found") == 3
+        assert "unadjudicated" in ledger
+
+    def test_zero_admits_marker(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f = self._write(tmp_path, "D.lean", "theorem fine : True := trivial\n")
+        ledger = review.build_source_ledger([f])
+        assert "No admitted declarations" in ledger
+        assert "|" not in ledger.split("\n\n")[-1]
+
+    def test_deleted_file_skipped_and_noted(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        ledger = review.build_source_ledger(["Gone.lean"])
+        assert "Skipped 1 changed file(s)" in ledger
+
+    def test_symlink_not_followed(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        outside = tmp_path.parent / "outside.lean"
+        outside.write_text("theorem leak : True := sorry\n")
+        os.symlink(outside, tmp_path / "Link.lean")
+        ledger = review.build_source_ledger(["Link.lean"])
+        assert "leak" not in ledger
+        assert "Skipped 1 changed file(s)" in ledger
+
+    def test_rows_sorted_and_deduped(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        fb = self._write(tmp_path, "B.lean", "theorem bbb : True := sorry\n")
+        fa = self._write(tmp_path, "A.lean", (
+            "theorem early : True := sorry\n"
+            "theorem late : True := sorry\n"
+        ))
+        ledger = review.build_source_ledger([fb, fa, fb])
+        rows = [ln for ln in ledger.splitlines() if ln.startswith("| `")]
+        assert len(rows) == 3
+        assert "early" in rows[0] and "late" in rows[1] and "bbb" in rows[2]
+
+    def test_hostile_cell_content_neutralized(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f = self._write(tmp_path, "E.lean", (
+            "/-- [EVIL25 | fake | row] tag -/\n"
+            "theorem pipe_bomb : True := sorry\n"
+        ))
+        ledger = review.build_source_ledger([f])
+        row = next(ln for ln in ledger.splitlines() if "pipe_bomb" in ln)
+        # Escaped pipes must not add table columns.
+        assert row.count(" | ") == 2
+        assert "\\|" in row
+
+    def test_emit_never_raises(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(review, "build_source_ledger", lambda *_: (_ for _ in ()).throw(RuntimeError("boom")))
+        review.emit_source_ledger(["X.lean"])  # must not raise
+        assert not (tmp_path / review.SOURCE_LEDGER_FILE).exists()
+
+
+class TestExhaustiveGating:
+    def _run_main(self, monkeypatch, tmp_path, argv_extra=(), env=None):
+        monkeypatch.setattr(review, "get_pr_diff", lambda pr_number: ("diff --git a/README.md b/README.md\n", []))
+        monkeypatch.setattr(sys, "argv", ["review.py", "--pr-number", "9"] + list(argv_extra))
+        for k in (review.ENV_EXHAUSTIVE,):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in (env or {}).items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.chdir(tmp_path)
+        review.main()
+
+    def test_default_run_emits_no_ledger(self, monkeypatch, tmp_path, capsys):
+        self._run_main(monkeypatch, tmp_path)
+        capsys.readouterr()
+        assert not (tmp_path / review.SOURCE_LEDGER_FILE).exists()
+
+    def test_exhaustive_early_exit_emits_marker_ledger(self, monkeypatch, tmp_path, capsys):
+        self._run_main(monkeypatch, tmp_path, argv_extra=["--exhaustive"])
+        capsys.readouterr()
+        content = (tmp_path / review.SOURCE_LEDGER_FILE).read_text()
+        assert "No admitted declarations" in content
+
+    def test_exhaustive_env_true_emits(self, monkeypatch, tmp_path, capsys):
+        self._run_main(monkeypatch, tmp_path, env={review.ENV_EXHAUSTIVE: "true"})
+        capsys.readouterr()
+        assert (tmp_path / review.SOURCE_LEDGER_FILE).exists()
+
+    def test_stale_ledger_deleted_on_default_run(self, monkeypatch, tmp_path, capsys):
+        # Planted-artifact defense: the Lean build step runs PR lakefile code
+        # before review.py; a planted ledger must not survive a default run.
+        (tmp_path / review.SOURCE_LEDGER_FILE).write_text("planted")
+        self._run_main(monkeypatch, tmp_path)
+        capsys.readouterr()
+        assert not (tmp_path / review.SOURCE_LEDGER_FILE).exists()
+
+
+# --- Session 15 Gap B: coverage-matrix phase, verdict, rendering ---
+
+class TestCoverageMatrixPhase:
+    def _matrix_file(self, tmp_path, body=None):
+        (tmp_path / "Foo.lean").write_text("theorem x : True := trivial\n")
+        m = tmp_path / "coverage.md"
+        m.write_text(body if body is not None else (
+            "| result | symbol | status | file |\n"
+            "| --- | --- | --- | --- |\n"
+            "| Thm | `Ns.foo` | proven | Foo.lean |\n"
+        ))
+        return m
+
+    def test_missing_matrix_skips_with_warning(self, tmp_path):
+        findings, warnings, notes = review.run_coverage_matrix_phase(
+            "nope.md", str(tmp_path), set(), True, True)
+        assert findings == [] and notes == []
+        assert any("does not resolve" in w for w in warnings)
+
+    def test_build_failure_gates_phase(self, tmp_path):
+        self._matrix_file(tmp_path)
+        findings, warnings, _ = review.run_coverage_matrix_phase(
+            "coverage.md", str(tmp_path), set(), False, True)
+        assert findings == []
+        assert any("build did not succeed" in w for w in warnings)
+
+    def test_lean_unavailable_gates_phase(self, tmp_path):
+        self._matrix_file(tmp_path)
+        findings, warnings, _ = review.run_coverage_matrix_phase(
+            "coverage.md", str(tmp_path), set(), True, False)
+        assert findings == []
+        assert any("unavailable or disabled" in w for w in warnings)
+
+    def test_oversized_matrix_gates_phase(self, tmp_path):
+        import coverage_matrix as cm
+        self._matrix_file(tmp_path, body="x" * (cm.MAX_MATRIX_BYTES + 1))
+        findings, warnings, _ = review.run_coverage_matrix_phase(
+            "coverage.md", str(tmp_path), set(), True, True)
+        assert findings == []
+        assert any("exceeds" in w for w in warnings)
+
+    def test_hostile_binary_matrix_degrades_to_warning(self, tmp_path, monkeypatch):
+        self._matrix_file(tmp_path)
+        import coverage_matrix as cm
+        monkeypatch.setattr(cm, "parse_coverage_matrix",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        # run_coverage_matrix_phase imports coverage_matrix at call time, so
+        # patching the module attribute reaches it.
+        findings, warnings, _ = review.run_coverage_matrix_phase(
+            "coverage.md", str(tmp_path), set(), True, True)
+        assert findings == []
+        assert any("failed and was skipped" in w for w in warnings)
+
+    def _run_with_fake_lean(self, tmp_path, monkeypatch, changed_files, output):
+        import lean_info_extractor
+        self._matrix_file(tmp_path)
+        monkeypatch.setattr(
+            lean_info_extractor, "run_lean_command",
+            lambda mod, cmd, timeout=30, env=None: output.format(
+                d=cmd.removeprefix("#print axioms ")),
+        )
+        return review.run_coverage_matrix_phase(
+            "coverage.md", str(tmp_path), changed_files, True, True)
+
+    def test_causal_blocking_pr_touches_decl_file(self, tmp_path, monkeypatch):
+        findings, _, _ = self._run_with_fake_lean(
+            tmp_path, monkeypatch, {"Foo.lean"},
+            "'{d}' depends on axioms: [sorryAx]")
+        assert len(findings) == 1 and findings[0].blocking is True
+
+    def test_causal_blocking_pr_touches_matrix(self, tmp_path, monkeypatch):
+        findings, _, _ = self._run_with_fake_lean(
+            tmp_path, monkeypatch, {"coverage.md"},
+            "'{d}' depends on axioms: [sorryAx]")
+        assert len(findings) == 1 and findings[0].blocking is True
+
+    def test_preexisting_mismatch_not_blocking(self, tmp_path, monkeypatch):
+        findings, _, _ = self._run_with_fake_lean(
+            tmp_path, monkeypatch, {"Other.lean"},
+            "'{d}' depends on axioms: [sorryAx]")
+        assert len(findings) == 1 and findings[0].blocking is False
+
+    def test_unresolved_never_blocking_even_on_changed_file(self, tmp_path, monkeypatch):
+        findings, _, _ = self._run_with_fake_lean(
+            tmp_path, monkeypatch, {"Foo.lean", "coverage.md"},
+            "<stdin>:2:14: error: unknown constant '{d}'")
+        assert len(findings) == 1
+        assert findings[0].kind == "unresolved-symbol"
+        assert findings[0].blocking is False
+
+
+class TestCoverageVerdict:
+    _CLEAN = {"introduced": [], "preexisting": [], "large_files": []}
+
+    def _finding(self, blocking):
+        from coverage_matrix import CoverageFinding, MatrixRow
+        return CoverageFinding(
+            kind="status-mismatch",
+            row=MatrixRow(symbol="Ns.foo", file_path="Foo.lean", module="Foo",
+                          claimed="proven", line_no=3),
+            evidence="`#print axioms Ns.foo` reports `sorryAx`",
+            blocking=blocking,
+        )
+
+    def test_blocking_mismatch_forces_changes_requested(self):
+        v, reasons = review.compute_deterministic_verdict(
+            self._CLEAN, {}, None, False,
+            coverage_matrix_findings=[self._finding(True)])
+        assert v == "Changes Requested"
+        assert any("coverage-matrix" in r for r in reasons)
+
+    def test_blocking_persists_under_verification_required(self):
+        # 15de859 verification gate demotes unconfirmed LLM findings, never
+        # machine-verified compiler facts.
+        v, reasons = review.compute_deterministic_verdict(
+            self._CLEAN, {}, None, False, verification_required=True,
+            coverage_matrix_findings=[self._finding(True)])
+        assert v == "Changes Requested"
+
+    def test_advisory_finding_never_moves_verdict(self):
+        v, _ = review.compute_deterministic_verdict(
+            self._CLEAN, {}, None, False,
+            coverage_matrix_findings=[self._finding(False)])
+        assert v == "Approved"
+
+    def test_default_none_is_byte_identical(self):
+        v1 = review.compute_deterministic_verdict(self._CLEAN, {}, None, False)
+        v2 = review.compute_deterministic_verdict(
+            self._CLEAN, {}, None, False, coverage_matrix_findings=None)
+        v3 = review.compute_deterministic_verdict(
+            self._CLEAN, {}, None, False, coverage_matrix_findings=[])
+        assert v1 == v2 == v3
+
+
+class TestCoverageSectionRendering:
+    def _finding(self, kind, blocking, evidence="ev"):
+        from coverage_matrix import CoverageFinding, MatrixRow
+        return CoverageFinding(
+            kind=kind,
+            row=MatrixRow(symbol="s", file_path="F.lean", module="F",
+                          claimed="proven", line_no=1),
+            evidence=evidence, blocking=blocking)
+
+    def test_provenance_label_always_present(self):
+        section = review._format_coverage_section([], [], [])
+        assert "PR-supplied, unverified matrix input" in section
+        assert "All matrix rows resolved" in section
+
+    def test_blocking_and_advisory_separated(self):
+        section = review._format_coverage_section(
+            [self._finding("status-mismatch", True, "blocked-ev"),
+             self._finding("unresolved-symbol", False, "advisory-ev")],
+            ["warn-1"], ["note-1"])
+        assert section.index("verdict-blocking") < section.index("blocked-ev")
+        assert section.index("not verdict-affecting") < section.index("advisory-ev")
+        assert "warn-1" in section and "note-1" in section
+
+    def test_hostile_evidence_flattened(self):
+        section = review._format_coverage_section(
+            [self._finding("status-mismatch", True, "line1\n```\ninjected\n```")], [], [])
+        assert "```" not in section
+        assert "\ninjected\n" not in section
+
+
+class TestCoverageReviewRegressions:
+    def test_section_neutralizes_html_breakout(self):
+        # B3(b): raw Lean subprocess output in a warning must not close the
+        # <details> envelope or inject HTML into the PR comment.
+        section = review._format_coverage_section(
+            [], ["output was </details><img src=x onerror=alert(1)>"], [])
+        assert "</details>" not in section
+        assert "&lt;/details&gt;" in section
+        assert "<img" not in section
+
+    def test_matrix_path_normalized_for_changed_files_membership(self, tmp_path, monkeypatch):
+        # B2 (review.py side): a coverage_matrix_path spelled `./x/../cov.md`
+        # must still match the git-diff spelling `cov.md` for causal blocking.
+        import lean_info_extractor
+        (tmp_path / "Foo.lean").write_text("theorem x : True := trivial\n")
+        (tmp_path / "cov.md").write_text(
+            "| result | symbol | status | file |\n"
+            "| --- | --- | --- | --- |\n"
+            "| Thm | `Ns.foo` | proven | Foo.lean |\n"
+        )
+        monkeypatch.setattr(
+            lean_info_extractor, "run_lean_command",
+            lambda mod, cmd, timeout=30, env=None:
+                f"'{cmd.removeprefix('#print axioms ')}' depends on axioms: [sorryAx]",
+        )
+        findings, _, _ = review.run_coverage_matrix_phase(
+            "./x/../cov.md", str(tmp_path), {"cov.md"}, True, True)
+        assert len(findings) == 1 and findings[0].blocking is True

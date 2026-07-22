@@ -23,6 +23,12 @@ from leanrepo_common.lean_utils import (
     scrub_line,
 )
 
+# Same secret denylist the reviewer's lean_tools subprocesses already use for
+# the identical threat (case-insensitive, matches anywhere in the name): a
+# narrower suffix-only list would leave DEPLOY_SECRET/DB_PASSWORD/lowercase
+# spellings visible to import-time Lean IO in the secret-bearing step.
+from lean_tools import _SECRET_ENV_RE
+
 
 _DECL_RE = re.compile(
     # Attributes commonly share the declaration line (`@[simp] theorem ...`).
@@ -111,8 +117,31 @@ def get_module_name(file_path: str) -> Optional[str]:
     return file_path_to_module_name(file_path)
 
 
-def run_lean_command(module_name: str, command: str, timeout: int = 30) -> Optional[str]:
-    """Runs a Lean command in the context of a module via `lake env lean`."""
+def scrubbed_env() -> Dict[str, str]:
+    """A copy of the process env with secret-looking variables removed.
+
+    `lake env lean` elaborates PR-controlled code (the imported module), so the
+    child process must never inherit API keys or tokens: in the secret-bearing
+    run-review step an elaboration-time exploit could otherwise read
+    `API_KEY`/`GITHUB_TOKEN` straight from its environment. Scrubbing is the
+    default for every Lean subprocess spawned here — the pre-secret extractor
+    step loses nothing by it. (Full sandboxing of model-directed Lean IO is the
+    separate S7 roadmap item.)
+    """
+    return {k: v for k, v in os.environ.items() if not _SECRET_ENV_RE.search(k)}
+
+
+def run_lean_command(
+    module_name: str,
+    command: str,
+    timeout: int = 30,
+    env: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """Runs a Lean command in the context of a module via `lake env lean`.
+
+    The child env defaults to :func:`scrubbed_env` (secrets removed); pass an
+    explicit ``env`` only in tests.
+    """
     # Create a temporary Lean file that imports the module and runs the command
     lean_code = f"import {module_name}\n{command}\n"
     try:
@@ -122,7 +151,8 @@ def run_lean_command(module_name: str, command: str, timeout: int = 30) -> Optio
             capture_output=True,
             text=True,
             errors='replace',
-            timeout=timeout
+            timeout=timeout,
+            env=env if env is not None else scrubbed_env(),
         )
         # Combine stdout and stderr — Lean puts #check/#print output on stdout,
         # warnings on stderr

@@ -489,3 +489,55 @@ class TestGitHubOutputFormatting:
         assert "lean_info_json<<" in output_text
         assert "lean_info_formatted<<" in output_text
         assert '"sorry_locations": [' in output_text
+
+
+class TestScrubbedEnv:
+    def test_secret_variables_removed_benign_kept(self, monkeypatch):
+        monkeypatch.setenv("API_KEY", "sk-secret")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghs_secret")
+        monkeypatch.setenv("GH_TOKEN", "gho_secret")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+        monkeypatch.setenv("MY_DEPLOY_TOKEN", "tok")
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setenv("HOME", "/home/u")
+        env = lean_info_extractor.scrubbed_env()
+        for secret in ("API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "OPENROUTER_API_KEY", "MY_DEPLOY_TOKEN"):
+            assert secret not in env, secret
+        assert env["PATH"] == "/usr/bin"
+        assert env["HOME"] == "/home/u"
+
+    def test_run_lean_command_child_env_scrubbed_by_default(self, monkeypatch):
+        # D3 regression: attacker-influenced Lean elaboration in the secret-
+        # bearing run-review step must never see API_KEY in its environment.
+        monkeypatch.setenv("API_KEY", "sk-secret")
+        captured = {}
+
+        class FakeResult:
+            stdout = "ok"
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return FakeResult()
+
+        monkeypatch.setattr(lean_info_extractor.subprocess, "run", fake_run)
+        out = lean_info_extractor.run_lean_command("Foo", "#print axioms Foo.x")
+        assert out == "ok"
+        assert captured["env"] is not None
+        assert "API_KEY" not in captured["env"]
+        assert "PATH" in captured["env"]
+
+    def test_explicit_env_honored(self, monkeypatch):
+        captured = {}
+
+        class FakeResult:
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return FakeResult()
+
+        monkeypatch.setattr(lean_info_extractor.subprocess, "run", fake_run)
+        lean_info_extractor.run_lean_command("Foo", "#check 1", env={"PATH": "/x"})
+        assert captured["env"] == {"PATH": "/x"}

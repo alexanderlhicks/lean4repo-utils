@@ -226,6 +226,8 @@ Tune to your project's characteristics:
 | `llm_max_run_cost` | No | `""` | Per-run cost budget in OpenRouter credits. **Requires** `llm_max_run_tokens` (a cost-only budget is rejected — cost can be BYOK-fee-only or absent). Empty = disabled. |
 | `llm_budget_mode` | No | `advisory` | `advisory` prioritizes reviewing all PRs: budgets are prompt-sizing hints and are tracked but not enforced. `hard` prioritizes spend containment: crossing the budget stops further LLM calls and posts an incomplete/degraded review. |
 | `llm_loud_exit` | No | `false` | When `true`, the action exits **non-zero** if the run degraded (spend/quota/auth failure, or budget exhaustion in `hard` mode), *after* posting the comment. Default `false` keeps the job green with a banner + `::error::` annotation. See the warning below. |
+| `exhaustive` | No | `false` | Enable the heavier exhaustive-mode passes/artifacts (currently: the deterministic [source ledger](#exhaustive-mode--deterministic-artifacts)). Default runs are byte-identical to today. |
+| `coverage_matrix_path` | No | `""` | Repo-relative path to a coverage/audit matrix to check deterministically against `#print axioms` (its own opt-in — `exhaustive` is not required). Empty disables the phase. See [the format contract](#exhaustive-mode--deterministic-artifacts). |
 
 > **Coverage-first budget control.** The default `llm_budget_mode=advisory`
 > prioritizes complete reviews: `llm_max_run_tokens` / `llm_max_run_cost` are tracked
@@ -245,6 +247,49 @@ Tune to your project's characteristics:
 > Lean build step runs the PR branch's `lakefile` code. Until full `lean_tools`
 > sandboxing lands (tracked separately), do **not** wire this action under
 > `pull_request_target` with a privileged token on an untrusted-fork PR.
+
+### Exhaustive mode & deterministic artifacts
+
+Both features below are deterministic backstops (no LLM involved) from the
+ABF26 review distillation — see `review/BOOTSTRAP_toolkit-gaps.md` (gaps C/A/B).
+
+**Source ledger** (`exhaustive: true`): the run emits `review_source_ledger.md`
+in the workspace — one markdown table row per admitted (`sorry`/`admit`)
+declaration in the changed Lean files, with the citation tag parsed from its
+docstring (`[BCHKS25 Thm 1.3]`-style) or its name mnemonic (`_bchks25`,
+rendered distinctly as `name-mnemonic: bchks25 (unverified)`). The table schema
+is a versioned contract (v1): columns `decl | cited_source | disposition`, the
+literal `no cited source found` for a missing citation, `disposition` always
+`unadjudicated` (a later adjudicating pass may upgrade it to
+`shape-pass | fail | translation-gap`), and the literal marker
+`No admitted declarations in the changed Lean files of this PR.` when there are
+none. The ledger's universe is declarations recognized by the deterministic
+extractor in **changed files only** — anonymous `example` blocks are not
+declarations, and a `sorry` between two declarations attributes to the
+preceding one (a known extractor property, pinned by tests). A missing
+citation is informational: the ledger never affects findings or the verdict.
+A one-line pointer is appended to the workflow step summary.
+
+**Coverage-matrix check** (`coverage_matrix_path`): every matrix row's symbol
+is resolved with `#print axioms` in the PR checkout and its claimed status
+compared with the kernel. Format contract: a markdown table, one claim per
+row, with (a) exactly one cell holding a single **backticked fully-qualified
+Lean identifier**, (b) exactly one cell holding a repo-relative `.lean` file
+path, and (c) a status cell using the words `proven`/`complete`/`done`
+(proved) or `sorry`/`admitted`/`partial`/`wip`/`stated` (admitted) —
+word-boundary matched, case-insensitive. Emoji/checkmark statuses, negations
+next to a keyword ("not proven"), and mixed-class cells are unsupported: the
+row is skipped with a warning, never guessed. Rows are checked in matrix
+order and the phase is capped (100 rows, 1 MB, ~600 s) — front-load critical
+rows. Requires a successful workflow Lean build and `lake` on the runner.
+Verdict policy (causal responsibility): a machine-verified status mismatch
+(`sorryAx` present where the matrix claims proven) forces **Changes
+Requested** only when the PR's changed files include that declaration's file
+or the matrix itself; pre-existing mismatches and unresolved symbols render
+as loud advisory notes and never block unrelated PRs. The matrix is PR-tree
+content — the comment section is labeled as derived from PR-supplied,
+unverified input, and matrix-driven Lean subprocesses run with a
+secret-scrubbed environment.
 
 ### Reviews the PR head, and shows what it used
 
