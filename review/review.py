@@ -1173,13 +1173,6 @@ def format_prechecks(scan: Dict[str, list]) -> str:
     return "\n\n".join(parts)
 
 
-def run_mechanical_prechecks(diff_by_file: Dict[str, str]) -> str:
-    """Deterministic pre-checks: escape-hatch scan + file-size check, formatted
-    as markdown. See :func:`scan_escape_hatches` for the structured form used by
-    the deterministic verdict."""
-    return format_prechecks(scan_escape_hatches(diff_by_file))
-
-
 def get_summary_context(paths_str: str) -> str:
     """Reads type signatures and key declarations from files for summary-level context.
     Handles attributes on preceding lines, where-clauses, and inductive constructors."""
@@ -1550,14 +1543,6 @@ def _format_repo_files(files_by_path: Dict[str, str], exclude: Optional[set] = N
             else "No repository context files remain after excluding files under review."
     return "".join(emitted)
 
-
-def get_repo_files_content(paths_str: str) -> Tuple[str, List[str]]:
-    """Legacy wrapper: returns the concatenated REPO_CONTEXT string."""
-    if not paths_str:
-        logging.info("No repository context files were provided.")
-        return "No repository context files were provided.", []
-    files_by_path, errors = get_repo_files_by_path(paths_str)
-    return _format_repo_files(files_by_path), errors
 
 def split_diff_into_files(diff_content: str) -> Dict[str, str]:
     """Splits a full git diff into a dictionary of per-file diffs.

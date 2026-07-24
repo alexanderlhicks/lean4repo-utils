@@ -10,7 +10,6 @@ import discover_files
 from discover_files import (
     get_lean_module_name,
     get_dependent_lean_files,
-    get_dependency_lean_files,
     get_transitive_dependencies,
     convert_module_to_file_path,
     build_lean_file_index,
@@ -56,27 +55,6 @@ class TestGetDependentLeanFiles:
         assert result == []
 
 
-class TestGetDependencyLeanFiles:
-    def test_basic(self):
-        graph = [
-            {"name": "A", "imports": ["B", "C"]},
-            {"name": "B", "imports": []},
-            {"name": "C", "imports": []},
-        ]
-        result = get_dependency_lean_files({"A"}, graph)
-        assert "B" in result
-        assert "C" in result
-
-    def test_excludes_changed(self):
-        graph = [
-            {"name": "A", "imports": ["B"]},
-            {"name": "B", "imports": []},
-        ]
-        # Both A and B changed — B should not be in dependencies
-        result = get_dependency_lean_files({"A", "B"}, graph)
-        assert "B" not in result
-
-
 class TestConvertModuleToFilePath:
     def test_basic(self):
         index = ["src/Foo/Bar.lean", "src/Baz.lean"]
@@ -115,7 +93,7 @@ class TestTransitiveDependencies:
     ]
 
     def test_depth_1_matches_direct(self):
-        """At depth 1, should match get_dependency_lean_files behavior."""
+        """At depth 1, only direct imports are returned."""
         result = get_transitive_dependencies({"A"}, self.GRAPH, max_depth=1)
         assert set(result.keys()) == {"B", "C"}
         assert all(d == 1 for d in result.values())

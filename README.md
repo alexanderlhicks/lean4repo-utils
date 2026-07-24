@@ -27,34 +27,37 @@ endpoint, so you never need per-provider credentials.
 ### PR summaries and AI review (GitHub Actions)
 
 1. In the Lean repository you want to use this on, add the key as an Actions
-   secret named `OPENROUTER_API_KEY`
+   secret named `OPENROUTER_KEY`
    (**Settings → Secrets and variables → Actions → New repository secret**).
 2. Add a workflow file to that repository:
    - **PR summaries:** copy the example workflow from
      [`summary/README.md`](summary/README.md#usage) to
      `.github/workflows/pr_summary.yml`.
-   - **AI review:** copy the recommended combined workflow from
-     [`review/README.md`](review/README.md#recommended-combined-workflow-auto--chatops)
+   - **AI review:** copy the recommended ChatOps workflow from
+     [`review/README.md`](review/README.md#recommended-chatops-workflow-review)
      to `.github/workflows/ai-review.yml`.
-3. Open a pull request — the summary/review is posted as a PR comment. The
-   review can also be re-run on demand by commenting `/review` on the PR.
+3. Open a pull request — a summary is posted (and refreshed on each push) as a
+   PR comment. The review runs on demand: comment `/review` on the PR (a repo
+   member — the review builds the PR's Lean with secrets in scope, so it is
+   ChatOps-only by default).
 
 Because the actions live in subdirectories of this repository, workflows
 reference them with a path:
 
 ```yaml
-- uses: alexanderlhicks/lean4repo-utils/summary@main   # or .../review@main
+- uses: alexanderlhicks/lean4repo-utils/summary@0.3   # or .../review@0.3
   with:
     github_token: ${{ secrets.GITHUB_TOKEN }}
-    api_key: ${{ secrets.OPENROUTER_API_KEY }}
+    api_key: ${{ secrets.OPENROUTER_KEY }}
     ...
 ```
 
 Each action's README documents every input:
 [`summary/README.md`](summary/README.md) ·
 [`review/README.md`](review/README.md). The review action defaults to
-open-weight models (`deepseek/deepseek-v4-pro`, verified by `z-ai/glm-5.2`);
-any OpenRouter slug can be substituted.
+open-weight models — deep agents on `z-ai/glm-5.2`, an independent verification
+pass on a different family (`deepseek/deepseek-v4-pro`); any OpenRouter slug can
+be substituted.
 
 ### sorry-tracker (CLI)
 

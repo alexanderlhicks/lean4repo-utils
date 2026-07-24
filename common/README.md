@@ -11,12 +11,13 @@ it via `leanrepo-common = { workspace = true }`.
 
 ## What it provides
 
-Two submodules under `leanrepo_common`:
+Three submodules under `leanrepo_common`:
 
 | Module | Public surface | Responsibility |
 | --- | --- | --- |
-| `llm_provider` | `create_provider`, `OpenRouterProvider`, `ContentPart`, `TokenUsage`, `RunBudget`, `BudgetExceededError`, `is_hard_llm_failure` | The OpenRouter gateway. Every model (Claude, Gemini, GPT, DeepSeek, …) is reached through OpenRouter's OpenAI-compatible Chat Completions endpoint, selected purely by slug — no per-provider branching. Handles schema-validated structured output, free-form and tool-calling generation, PDF/multimodal content parts, prompt caching, reasoning budgets, token-usage accounting, and a per-run token/cost spend ceiling. |
-| `lean_utils` | `is_in_comment`, `strip_comments`, `scrub_line`, `detect_src_dir`, `file_path_to_module_name`, `import_search_dirs`, `resolve_import`, `FileCache` | Lean 4 source utilities: comment- and string-aware line scanners (handling `--` line comments and nested `/- ... -/` block comments) used to detect `sorry`/`admit` without false positives, bidirectional mapping between dotted module names and files on disk, `.lake` import resolution, and a small read-once file cache. |
+| `llm_provider` | `create_provider`, `OpenRouterProvider`, `ContentPart`, `TokenUsage`, `RunBudget`, `BudgetExceededError`, `is_hard_llm_failure`, `RunHealth`, `parse_run_budget`, `describe_exc`, `LLMResponseEnvelopeError` | The OpenRouter gateway. Every model (Claude, Gemini, GPT, DeepSeek, …) is reached through OpenRouter's OpenAI-compatible Chat Completions endpoint, selected purely by slug — no per-provider branching. Handles schema-validated structured output, free-form and tool-calling generation, PDF/multimodal content parts, prompt caching, reasoning budgets, token-usage accounting, and a per-run token/cost spend ceiling. |
+| `lean_utils` | comment/string scrubbers (`is_in_comment`, `strip_comments`, `strip_comments_preserve_strings`, `scrub_line`); the canonical escape-hatch matcher (`KERNEL_BYPASS_KEYWORDS`, `keyword_pattern`, `keywords_pattern`, `find_keywords`); module↔file mapping (`detect_src_dir`, `file_path_to_module_name`, `import_search_dirs`, `resolve_import`); `resolve_confined_path`; `FileCache` | Lean 4 source utilities: comment- and string-aware line scanners (handling `--` line comments and nested `/- ... -/` block comments) and the single word-boundary keyword matcher used to detect `sorry`/`admit`/`native_decide`/… without false positives, bidirectional mapping between dotted module names and files on disk, `.lake` import resolution, PR-checkout path confinement, and a small read-once file cache. |
+| `diff_utils` | `parse_git_diff_header`, `unquote_git_path` | Git unified-diff parsing shared by review and summary: parse a `diff --git` header (rename-aware) and decode git's C-quoted (non-ASCII) paths so such files are never silently dropped. |
 
 ## Usage
 

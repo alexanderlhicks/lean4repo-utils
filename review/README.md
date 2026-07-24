@@ -5,7 +5,7 @@ This GitHub Action provides an AI-powered code review for Pull Requests in Lean 
 **Fastest start:** add an `OPENROUTER_KEY` Actions secret, then copy the [recommended ChatOps workflow](#recommended-chatops-workflow-review) below to `.github/workflows/ai-review.yml` in your repository. The sections below explain the workflow, every input, and how the pipeline works.
 
 - [Usage](#usage)
-  - [Recommended: Combined Workflow (Auto + ChatOps)](#recommended-combined-workflow-auto--chatops)
+  - [Recommended: ChatOps Workflow (`/review`)](#recommended-chatops-workflow-review)
   - [Alternative: Minimal Push Workflow (No ChatOps)](#alternative-minimal-push-workflow-no-chatops)
   - [Recommended deployment](#recommended-deployment)
   - [Inputs](#inputs)
@@ -93,37 +93,20 @@ jobs:
           } >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - uses: alexanderlhicks/lean4repo-utils/review@0.2
+      - uses: alexanderlhicks/lean4repo-utils/review@0.3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_KEY }}
-
-          # --- Models (open-weight, a two-family combination) ---------------
-          # These two are the action's DEFAULTS (shown for clarity — you can omit
-          # them). `model` runs the deep agents (spec, per-file review, cross-file,
-          # dependent-impact). `verify_model` is a DIFFERENT family so the
-          # verification pass is an independent check (less self-agreement bias).
-          # Both MUST support tool-calling (for lean_tools) + structured output;
-          # confirm current slugs and the per-model "Tool Call Error Rate" at
-          # https://openrouter.ai/models.
-          model: z-ai/glm-5.2                  # deep agents — top open repo-level coder, 1M ctx
-          verify_model: deepseek/deepseek-v4-pro  # verifier — a top model of a DIFFERENT family
-          # Optional cost tier — light structural agents on a cheaper open model:
-          # triage_model: minimax/minimax-m3
-          # synthesis_model: minimax/minimax-m3
-
           pr_number: ${{ github.event.issue.number }}
-
           # URLs and repo paths mentioned in the /review comment are extracted
           # into external/spec/repo context automatically; the text itself
           # reaches the reviewers as focus instructions.
           additional_comments: "${{ steps.get_args.outputs.instructions }}"
-
-          # --- Behaviour ----------------------------------------------------
-          lean_tools: true          # check claims against the real compiler (kills FP typecheck claims)
-          verify_findings: true     # adversarial precision pass
-          # See the "Recommended deployment" section below to tune spec_refs,
-          # escape_hatch_allowlist, and dependent_impact_max by project.
+          # Everything else uses the action defaults: the deep agents run on
+          # `z-ai/glm-5.2`, the verification pass on a different family
+          # (`deepseek/deepseek-v4-pro`), `lean_tools` and `verify_findings` are
+          # on. See "Recommended deployment" below to override models or tune
+          # spec_refs / escape_hatch_allowlist / dependent_impact_max per project.
 ```
 
 **Key features of this workflow:**
@@ -181,7 +164,7 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: alexanderlhicks/lean4repo-utils/review@0.2
+      - uses: alexanderlhicks/lean4repo-utils/review@0.3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_KEY }}
@@ -191,7 +174,7 @@ jobs:
 
 ### Recommended deployment
 
-The [combined (auto + ChatOps) workflow above](#recommended-combined-workflow-auto--chatops) is ready to use as-is for Mathlib-based Lean 4 projects. Its defaults:
+The [ChatOps workflow above](#recommended-chatops-workflow-review) is ready to use as-is for Mathlib-based Lean 4 projects. Its defaults:
 
 - **A two-family, open-weight model combination** — the deep agents share a strong `model`, and the verification pass runs on a *different* family (`verify_model`), because an independent, different-family verifier catches false positives a same-model one rationalizes away. (A single model everywhere works and is simpler, but forgoes that benefit; optionally, put the light structural agents — `triage_model`/`synthesis_model` — on a cheaper variant.) Any strong open model qualifies as long as it supports **tool-calling** (for `lean_tools`) and **structured output**; confirm the current slug and the per-model *Tool Call Error Rate* at [openrouter.ai/models](https://openrouter.ai/models). Good open-weight picks as of mid-2026 (pick two *different families* for `model` and `verify_model`): `z-ai/glm-5.2` (deep agents — the current open-weights leader on repo-level coding, 1M context) and `deepseek/deepseek-v4-pro` (verifier — a different top family, strongest open model on algorithmic reasoning, 1M context, prompt caching), with `minimax/minimax-m3` or `deepseek/deepseek-v4-flash` for the optional cheap `triage`/`synthesis` tier. Cheaper strong-agentic verifier alternatives: `xiaomi/mimo-v2.5-pro`, `minimax/minimax-m3`. (`moonshotai/kimi-k2.6` is exceptional at tool-call *throughput* but ranks a notch lower on raw intelligence, so it's a weaker choice for the judgement-heavy verifier.) Avoid `*-max`-style tiers that are proprietary — they aren't open-weight. The pipeline runs tool-calling and structured output in **separate phases**, so it avoids the known issue where models given both at once mis-emit tool arguments.
 - **`lean_tools: true`** — the reviewer/verifier check claims against the real compiler, so "won't typecheck / lemma doesn't exist" claims are grounded, not guessed. Fails open to a tool-free review if the model can't call tools.
@@ -227,6 +210,7 @@ Tune to your project's characteristics:
 | `dependency_depth` | No | `2` | Depth of transitive dependency traversal (1=direct only, 2=imports of imports) |
 | `dependent_impact_max` | No | `10` | Max unchanged dependent files to review for breakage caused by the PR (second-order pass). `0` disables it. |
 | `verify_findings` | No | `true` | Run the adversarial verification pass before the verdict. Refuted findings are removed; only confirmed findings may hard-block or become inline annotations; uncertain/unavailable findings remain advisory. `false` deliberately restores grounded initial-reviewer findings to the blocking path. |
+| `verify_findings_max` | No | `40` | Per-PR ceiling on adversarial verifier calls (independent of the token/cost budget). When more findings than this exist, the budget is spent on the ones that can hard-block (critical/high severity) first; the rest stay unverified and are rendered advisory. Empty uses the default. |
 | `escape_hatch_allowlist` | No | `""` | Comma-separated escape hatches sanctioned for this repo (e.g. `opaque,axiom`). Still reported, but do not trigger the hard "Changes Requested" verdict when introduced. |
 | `enable_web_search` | No | `false` | Enable OpenRouter web-search grounding for agents (adds cost). Set `true` to enable. |
 | `lean_tools` | No | `true` | Give the reviewer + verifier Lean toolchain tools (`lean_check` / `lean_print` / `lean_print_axioms` / `lean_typecheck` via `lake env lean`) so they check claims against the real compiler instead of guessing. `false` to disable. Requires a tool-calling-capable model. |

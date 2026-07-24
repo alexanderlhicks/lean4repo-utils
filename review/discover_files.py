@@ -71,15 +71,6 @@ def get_dependent_lean_files(changed_modules, lake_graph_json):
             dependent_modules.add(module_name)
     return list(dependent_modules)
 
-def get_dependency_lean_files(changed_modules, lake_graph_json):
-    """Returns direct dependencies only (depth 1). Use get_transitive_dependencies for deeper traversal."""
-    dependency_modules = set()
-    for module_info in lake_graph_json:
-        if module_info['name'] in changed_modules:
-            dependency_modules.update(module_info.get('imports', []))
-    return list(dependency_modules - changed_modules)
-
-
 def get_transitive_dependencies(changed_modules, lake_graph_json, max_depth=2):
     """BFS to find transitive dependencies (what changed files import, recursively).
     Returns dict mapping module_name -> depth (1 = direct import, 2 = import-of-import, etc.)."""

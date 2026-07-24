@@ -8,7 +8,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import lean_tools
-from lean_tools import LeanToolbox, lean_available, _scrubbed_env
+from lean_tools import LeanToolbox, lean_available, scrubbed_env
 
 
 class TestScrubEnv:
@@ -19,7 +19,7 @@ class TestScrubEnv:
         monkeypatch.setenv("DB_PASSWORD", "p")
         monkeypatch.setenv("PATH", "/bin")
         monkeypatch.setenv("HOME", "/home/x")
-        env = _scrubbed_env()
+        env = scrubbed_env()
         for leaked in ("GITHUB_TOKEN", "OPENROUTER_API_KEY", "MY_SECRET", "DB_PASSWORD"):
             assert leaked not in env
         assert env["PATH"] == "/bin"

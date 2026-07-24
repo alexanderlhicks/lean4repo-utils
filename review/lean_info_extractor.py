@@ -28,7 +28,7 @@ from leanrepo_common.lean_utils import (
 # the identical threat (case-insensitive, matches anywhere in the name): a
 # narrower suffix-only list would leave DEPLOY_SECRET/DB_PASSWORD/lowercase
 # spellings visible to import-time Lean IO in the secret-bearing step.
-from lean_tools import _SECRET_ENV_RE
+from lean_tools import scrubbed_env
 
 
 _DECL_RE = re.compile(
@@ -116,20 +116,6 @@ def get_lean_declarations(file_path: str) -> List[str]:
 def get_module_name(file_path: str) -> Optional[str]:
     """Convert a file path to a Lean module name."""
     return file_path_to_module_name(file_path)
-
-
-def scrubbed_env() -> Dict[str, str]:
-    """A copy of the process env with secret-looking variables removed.
-
-    `lake env lean` elaborates PR-controlled code (the imported module), so the
-    child process must never inherit API keys or tokens: in the secret-bearing
-    run-review step an elaboration-time exploit could otherwise read
-    `API_KEY`/`GITHUB_TOKEN` straight from its environment. Scrubbing is the
-    default for every Lean subprocess spawned here — the pre-secret extractor
-    step loses nothing by it. (Full sandboxing of model-directed Lean IO is the
-    separate S7 roadmap item.)
-    """
-    return {k: v for k, v in os.environ.items() if not _SECRET_ENV_RE.search(k)}
 
 
 def run_lean_command(

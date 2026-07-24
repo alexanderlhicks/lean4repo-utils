@@ -6,7 +6,7 @@ For pull requests with multiple file changes, the action employs a hierarchical 
 
 ## Usage
 
-You need an [OpenRouter API key](https://openrouter.ai/keys) stored as an Actions secret named `OPENROUTER_API_KEY`. Then create a workflow file at `.github/workflows/pr_summary.yml`:
+You need an [OpenRouter API key](https://openrouter.ai/keys) stored as an Actions secret named `OPENROUTER_KEY`. Then create a workflow file at `.github/workflows/pr_summary.yml`:
 
 ```yaml
 name: 'PR Summary'
@@ -29,10 +29,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Generate PR Summary
-        uses: alexanderlhicks/lean4repo-utils/summary@0.2
+        uses: alexanderlhicks/lean4repo-utils/summary@0.3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          api_key: ${{ secrets.OPENROUTER_API_KEY }}
+          api_key: ${{ secrets.OPENROUTER_KEY }}
           model: anthropic/claude-haiku-4.5  # any OpenRouter slug, e.g. google/gemini-3-flash-preview, openai/gpt-5-mini
           github_repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
@@ -150,7 +150,7 @@ The behavior of each AI agent is governed by Markdown prompt templates in the `p
 |--------|-------|-------------|
 | `triage.md` | Triage (normal) | `{{FILE_LIST}}` |
 | `triage_tiered.md` | Triage (>50 files) | `{{FILE_LIST}}` |
-| `summarize_file.md` | Summarizer | `{{FILE_PATH}}`, `{{FILE_DIFF}}` |
+| `summarize_file.md` | Summarizer | `{{FILE_PATH}}`, `{{FILE_DIFF}}`, `{{DECL_CONTEXT_SECTION}}` |
 | `additional_instructions.md` | Additional-instructions | `{{INSTRUCTIONS_CONTENT}}`, `{{DIFF_CONTENT}}` |
 | `synthesize_summary.md` | Synthesizer | `{{PR_TITLE}}`, `{{PR_BODY}}`, `{{PER_FILE_SUMMARIES}}`, `{{PR_TYPE_HINT}}` |
 

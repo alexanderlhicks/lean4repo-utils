@@ -37,8 +37,18 @@ def lean_available() -> bool:
     return shutil.which("lake") is not None
 
 
-def _scrubbed_env() -> Dict[str, str]:
-    """A copy of the process environment with secret-looking variables removed."""
+def scrubbed_env() -> Dict[str, str]:
+    """A copy of the process env with secret-looking variables removed.
+
+    `lake env lean` elaborates PR-controlled code (the imported module), so the
+    child process must never inherit API keys or tokens: in the secret-bearing
+    run-review step an elaboration-time exploit could otherwise read
+    `API_KEY`/`GITHUB_TOKEN` straight from its environment. Scrubbing is the
+    default for every Lean subprocess spawned by the review action (both the
+    model-directed toolbox here and the axiom/coverage extractors in
+    lean_info_extractor, which import this). Full sandboxing of model-directed
+    Lean IO is the separate S7 roadmap item.
+    """
     return {k: v for k, v in os.environ.items() if not _SECRET_ENV_RE.search(k)}
 
 
@@ -55,7 +65,7 @@ def _run_lean(command: str, module: Optional[str], timeout: int) -> str:
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=_scrubbed_env(),
+            env=scrubbed_env(),
         )
     except subprocess.TimeoutExpired:
         return f"(lean tool timed out after {timeout}s)"

@@ -9,7 +9,7 @@ Used by the summary and review actions and the sorry-tracker CLI.
 import os
 import re
 import stat
-from typing import Dict, Iterable, List, Optional, Pattern, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 def resolve_confined_path(
@@ -83,55 +83,13 @@ def strip_comments(line: str, nesting_depth: int) -> Tuple[str, int]:
     comment, this removes the comment text so a keyword mentioned in a trailing
     comment is not matched against real code. Returns
     (code_only_text, new_nesting_depth).
+
+    This is the single-line (no cross-line string state) form of
+    :func:`strip_comments_preserve_strings`; it delegates to it with the string
+    state reset each line, so the scanning logic lives in exactly one place.
     """
-    out = []
-    i = 0
-    n = len(line)
-    in_string = False
-    while i < n:
-        ch = line[i]
-        if in_string:
-            out.append(ch)
-            # Consume an escaped character as a pair. This correctly handles an
-            # even backslash run before a quote: the first slash escapes the
-            # second, then the quote closes the string. Looking only at the
-            # immediately previous character incorrectly kept that quote open.
-            if ch == '\\' and i + 1 < n:
-                out.append(line[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_string = False
-            i += 1
-            continue
-        if nesting_depth == 0:
-            if ch == '"':
-                in_string = True
-                out.append(ch)
-                i += 1
-                continue
-            pair = line[i:i + 2]
-            if pair == '/-':
-                nesting_depth += 1
-                i += 2
-                continue
-            if pair == '--':
-                break  # rest of the line is a single-line comment
-            out.append(ch)
-            i += 1
-            continue
-        # Inside a block comment (nesting_depth > 0): consume until it closes.
-        pair = line[i:i + 2]
-        if pair == '/-':
-            nesting_depth += 1
-            i += 2
-            continue
-        if pair == '-/':
-            nesting_depth -= 1
-            i += 2
-            continue
-        i += 1
-    return ''.join(out), nesting_depth
+    code, nesting_depth, _ = strip_comments_preserve_strings(line, nesting_depth, False)
+    return code, nesting_depth
 
 
 def strip_comments_preserve_strings(
@@ -287,11 +245,11 @@ KERNEL_BYPASS_KEYWORDS: Tuple[str, ...] = (
     "opaque", "implemented_by", "extern", "axiom",
 )
 
-_KEYWORD_PATTERN_CACHE: Dict[str, "Pattern[str]"] = {}
-_KEYWORDS_PATTERN_CACHE: Dict[Tuple[str, ...], "Pattern[str]"] = {}
+_KEYWORD_PATTERN_CACHE: Dict[str, "re.Pattern[str]"] = {}
+_KEYWORDS_PATTERN_CACHE: Dict[Tuple[str, ...], "re.Pattern[str]"] = {}
 
 
-def keyword_pattern(keyword: str) -> "Pattern[str]":
+def keyword_pattern(keyword: str) -> "re.Pattern[str]":
     """Compiled canonical-boundary matcher for a single Lean keyword (cached).
 
     A match requires the keyword to be a standalone token — not preceded or
@@ -304,7 +262,7 @@ def keyword_pattern(keyword: str) -> "Pattern[str]":
     return pattern
 
 
-def keywords_pattern(keywords: Iterable[str]) -> "Pattern[str]":
+def keywords_pattern(keywords: Iterable[str]) -> "re.Pattern[str]":
     """Compiled canonical-boundary matcher for several keywords as one regex.
 
     The single alternation matches any of ``keywords`` as a standalone token,

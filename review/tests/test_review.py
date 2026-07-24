@@ -16,8 +16,8 @@ from review import (
     _extract_added_lines,
     _fetch_url_content,
     _normalize_external_url,
-    run_mechanical_prechecks,
     scan_escape_hatches,
+    format_prechecks,
     introduced_hatches_triggering_verdict,
     _get_diff_lines,
     _load_prompt,
@@ -196,7 +196,7 @@ class TestIsInComment:
         assert depth == 1  # still inside the outer comment
 
 
-# --- run_mechanical_prechecks ---
+# --- escape-hatch mechanical prechecks (scan_escape_hatches + format_prechecks) ---
 
 class TestMechanicalPrechecks:
     # Diffs use realistic `@@` hunk headers (as `gh pr diff` emits): the scan
@@ -210,14 +210,14 @@ class TestMechanicalPrechecks:
         lean_file = tmp_path / "Foo.lean"
         lean_file.write_text("def foo := 1\n")
         diff = "@@ -0,0 +1 @@\n+def foo := 1\n"
-        result = run_mechanical_prechecks({str(lean_file): diff})
+        result = format_prechecks(scan_escape_hatches({str(lean_file): diff}))
         assert "No escape hatches" in result
 
     def test_sorry_in_diff(self, tmp_path):
         lean_file = tmp_path / "Foo.lean"
         lean_file.write_text("theorem foo : True := sorry\n")
         diff = "@@ -0,0 +1 @@\n+theorem foo : True := sorry\n"
-        result = run_mechanical_prechecks({str(lean_file): diff})
+        result = format_prechecks(scan_escape_hatches({str(lean_file): diff}))
         assert "sorry" in result
         assert "introduced" in result.lower()
 
@@ -225,7 +225,7 @@ class TestMechanicalPrechecks:
         lean_file = tmp_path / "Foo.lean"
         lean_file.write_text("-- sorry this is a comment\ndef foo := 1\n")
         diff = "@@ -0,0 +1,2 @@\n+-- sorry this is a comment\n+def foo := 1\n"
-        result = run_mechanical_prechecks({str(lean_file): diff})
+        result = format_prechecks(scan_escape_hatches({str(lean_file): diff}))
         # sorry in a line comment should not be flagged as introduced
         assert "**`sorry`** introduced" not in result
 
@@ -316,14 +316,14 @@ class TestMechanicalPrechecks:
     def test_non_lean_file_skipped(self, tmp_path):
         md_file = tmp_path / "README.md"
         md_file.write_text("sorry\n")
-        result = run_mechanical_prechecks({str(md_file): "@@ -0,0 +1 @@\n+sorry\n"})
+        result = format_prechecks(scan_escape_hatches({str(md_file): "@@ -0,0 +1 @@\n+sorry\n"}))
         assert "No escape hatches" in result
 
     def test_large_file_warning(self, tmp_path):
         lean_file = tmp_path / "Big.lean"
         lean_file.write_text("def x := 1\n" * 2000)
         diff = "@@ -0,0 +1 @@\n+def x := 1\n"
-        result = run_mechanical_prechecks({str(lean_file): diff})
+        result = format_prechecks(scan_escape_hatches({str(lean_file): diff}))
         assert "Large file" in result
 
     def test_introduced_hatch_not_also_listed_preexisting(self, tmp_path):
@@ -331,7 +331,7 @@ class TestMechanicalPrechecks:
         lean_file = tmp_path / "Foo.lean"
         lean_file.write_text("theorem foo : True := sorry\n")
         diff = "@@ -0,0 +1 @@\n+theorem foo : True := sorry\n"
-        result = run_mechanical_prechecks({str(lean_file): diff})
+        result = format_prechecks(scan_escape_hatches({str(lean_file): diff}))
         assert "introduced" in result
         assert "Pre-existing escape hatches" not in result
 
@@ -340,7 +340,7 @@ class TestMechanicalPrechecks:
         lean_file.write_text("theorem old : True := sorry\ndef added := 1\n")
         # Only line 2 is added; the sorry on line 1 is an unchanged context line.
         diff = "@@ -1,1 +1,2 @@\n theorem old : True := sorry\n+def added := 1\n"
-        result = run_mechanical_prechecks({str(lean_file): diff})
+        result = format_prechecks(scan_escape_hatches({str(lean_file): diff}))
         assert "Pre-existing escape hatches" in result
         assert "introduced" not in result.lower()
 
@@ -350,7 +350,7 @@ class TestMechanicalPrechecks:
         lean_file = tmp_path / "Big.lean"
         lean_file.write_text("def x := 1\n" * 2000)
         diff = "@@ -0,0 +1 @@\n+def x := 1\n"
-        result = run_mechanical_prechecks({str(lean_file): diff})
+        result = format_prechecks(scan_escape_hatches({str(lean_file): diff}))
         assert "Large file" in result
         # The large-file note lives in its own neutral section, not the
         # hard-verdict "introduced" section.
