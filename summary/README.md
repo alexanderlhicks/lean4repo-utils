@@ -33,13 +33,13 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_KEY }}
-          model: anthropic/claude-haiku-4.5  # any OpenRouter slug, e.g. google/gemini-3-flash-preview, openai/gpt-5-mini
           github_repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
-          # Optional:
-          # additional_instructions_path: 'CONTRIBUTING.md'
-          # validate_title: 'true'
-          # upstream_path: 'ToMathlib/'
+          # Uses the default model (deepseek/deepseek-v4-flash). Optional knobs:
+          # model: <any OpenRouter slug>       # e.g. google/gemini-3-flash-preview
+          # additional_instructions_path: 'CONTRIBUTING.md'  # default; read from the base ref
+          # validate_title: 'true'             # enforce conventional-commit PR titles
+          # upstream_path: 'ToMathlib/'        # remind on changes under this prefix
 ```
 
 > **Note on the trigger:** This example uses `pull_request_target` so the workflow also runs for PRs from forks (the `pull_request` event does not expose repository secrets to fork-triggered workflows, and its `GITHUB_TOKEN` is read-only). `pull_request_target` runs in the context of the base branch, so take care not to execute untrusted code from the fork. This action is safe under `pull_request_target` because it only reads the diff and posts a comment — it does not execute code from the PR branch. The checkout uses `pull_request.head.sha` to fetch the correct diff, while the workflow itself runs from the base branch. If your repository does not accept fork PRs, you can switch the trigger to `pull_request` without other changes.
