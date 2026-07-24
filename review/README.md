@@ -297,7 +297,10 @@ secret-scrubbed environment.
   reviews the PR's code — not the base branch. The same commit anchors the diff, file
   discovery, and the line annotations, and is stamped in the posted comment
   (*"Reviewed at commit `…`"*). Note this means the action reviews the **head** commit
-  for every trigger.
+  for every trigger. The same stamp also carries a **prompts version** — a short
+  content fingerprint of the shipped `prompts/*.md` set (*"prompts `…`"*) — so a posted
+  review is traceable to the exact prompt revision that produced it; it is emitted on
+  every review, including the degraded-run notice.
 - **"References & context used."** Each review comment ends with a collapsible manifest
   listing what actually grounded it — external references fetched, knowledge-base /
   specification files loaded, and repository dependency-graph files (context that

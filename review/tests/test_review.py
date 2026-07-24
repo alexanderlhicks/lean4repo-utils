@@ -3164,7 +3164,7 @@ class TestS1ResolveScript:
 
 
 class TestReviewLabelling:
-    """Guided/unguided header + reviewed-at stamp (drops the old Initial/subsequent axis)."""
+    """Guided/unguided header + provenance stamp (reviewed-at commit + prompts version)."""
 
     def test_unguided_header(self, monkeypatch):
         monkeypatch.delenv("PR_HEAD_SHA", raising=False)
@@ -3185,6 +3185,67 @@ class TestReviewLabelling:
         monkeypatch.setenv("PR_HEAD_SHA", "abcdef1234567890fedcba")
         h = review._review_comment_header("")
         assert "Reviewed at commit `abcdef123456`" in h   # short, 12 chars
+
+    def test_prompts_version_stamped_even_without_head(self, monkeypatch):
+        # The prompt fingerprint is emitted unconditionally — it must NOT be gated on the
+        # head SHA being resolved (regression guard for the `if head:` trap).
+        monkeypatch.delenv("PR_HEAD_SHA", raising=False)
+        h = review._review_comment_header("")
+        assert "prompts `" in h                          # stamp present with no head
+        assert "Reviewed at commit" not in h             # ...and no head half when unset
+
+    def test_prompts_version_deterministic_and_short(self):
+        pv = review._prompts_version()
+        assert pv and pv == review._prompts_version()    # stable across calls
+        assert len(pv) == 12 and all(c in "0123456789abcdef" for c in pv)
+
+
+class TestPromptsVersionContract:
+    """The fingerprint's actual contract — not just its shape. Format/determinism checks
+    alone pass even for a constant or a filename-only digest, so these guard the DoD (d)
+    criteria directly: the digest must MOVE when prompt content moves, IGNORE non-`.md`
+    files, and fail closed (empty, no crash) on an unreadable prompts dir."""
+
+    def _mk(self, tmp_path, monkeypatch):
+        d = tmp_path / "prompts"
+        d.mkdir()
+        (d / "a.md").write_text("alpha")
+        (d / "b.md").write_text("beta")
+        monkeypatch.setattr(review, "ACTION_PATH", str(tmp_path))
+        return d
+
+    def test_digest_moves_when_md_content_changes(self, tmp_path, monkeypatch):
+        d = self._mk(tmp_path, monkeypatch)
+        before = review._prompts_version()
+        (d / "a.md").write_text("alpha CHANGED")
+        assert review._prompts_version() != before     # content-sensitive (hashes bytes)
+
+    def test_digest_moves_when_md_added(self, tmp_path, monkeypatch):
+        d = self._mk(tmp_path, monkeypatch)
+        before = review._prompts_version()
+        (d / "c.md").write_text("alpha")               # same bytes as a.md; name participates
+        assert review._prompts_version() != before
+
+    def test_digest_ignores_non_md_files(self, tmp_path, monkeypatch):
+        d = self._mk(tmp_path, monkeypatch)
+        before = review._prompts_version()
+        (d / "notes.txt").write_text("stray")
+        (d / ".DS_Store").write_bytes(b"\x00\x01")
+        assert review._prompts_version() == before     # *.md only
+
+    def test_empty_and_stamp_omitted_on_unreadable_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(review, "ACTION_PATH", str(tmp_path / "nope"))
+        monkeypatch.delenv("PR_HEAD_SHA", raising=False)
+        assert review._prompts_version() == ""         # OSError -> '' (fail closed)
+        assert review._provenance_stamp() == ""         # ...and the stamp degrades cleanly
+
+    def test_degraded_review_carries_provenance_stamp(self, tmp_path, monkeypatch, capsys):
+        # README guarantees the stamp on EVERY review, including the degraded-run notice.
+        self._mk(tmp_path, monkeypatch)
+        monkeypatch.setenv("PR_HEAD_SHA", "deadbeefcafe0000")
+        review._emit_degraded_review({})
+        out = capsys.readouterr().out
+        assert "prompts `" in out and "Reviewed at commit `deadbeefcafe`" in out
 
 
 class TestReferenceManifest:

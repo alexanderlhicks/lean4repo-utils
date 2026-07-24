@@ -7,6 +7,18 @@ Attribution notices for reused or adapted code (including code ported
 from the maintainer's own repositories, per the project reuse policy)
 are recorded in this file.
 
+- review/prompts/ adapts review-rubric prose from TauCetiProject/TauCetiReview
+  (https://github.com/TauCetiProject/TauCetiReview) at commit
+  b9539a39556d34b3e3bf6199d0da7b4e7d5d4c27 (2026-07-22), licensed Apache-2.0.
+  The passages are independently reworded (not copied verbatim) and re-mapped to
+  this repo's finding categories and severity/verdict tiers:
+    * _operating_contract.md "Assume a same-model author" ← rubrics/_common.md
+      ("Assume an adversarial author");
+    * lean4_checklist.md items 10–13 (vacuity/placeholders, extensionality/free
+      data, reuse-search, robust automation) ← rubrics/correctness.md,
+      api-design.md, reuse.md, proof-quality.md respectively.
+  Per-item provenance is recorded inline in those files.
+
 - summary/ is ported from alexanderlhicks/lean-summary-workflow
   (https://github.com/alexanderlhicks/lean-summary-workflow), port base
   commit 871a07c12ab7f8d0ae555d54efe4d1c05ec0833d (2026-06-30). That

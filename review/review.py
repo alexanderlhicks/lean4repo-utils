@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import ipaddress
 import json
 import logging
@@ -52,6 +53,38 @@ def _read_prompt_file(name: str) -> str:
 # (untrusted-input posture, grounding requirement, confidence calibration).
 # Defined once here so the agents stay consistent instead of each redefining it.
 OPERATING_CONTRACT = _read_prompt_file("_operating_contract.md")
+
+
+def _prompts_version() -> str:
+    """Content fingerprint of the prompt set, stamped into every posted review so a
+    report can be traced to the exact prompt revision that produced it.
+
+    Hashes every ``*.md`` under ``ACTION_PATH/prompts`` — filename then raw bytes, in
+    sorted-filename order — and returns a short hex digest. Always reads the shipped
+    prompts under ``ACTION_PATH``, never the working directory (which, in the deployed
+    action, is the untrusted PR checkout). Returns ``''`` if the prompts dir is
+    unreadable, so a stat failure degrades to an omitted stamp rather than a crash."""
+    prompts_dir = os.path.join(ACTION_PATH, "prompts")
+    try:
+        names = sorted(n for n in os.listdir(prompts_dir) if n.endswith(".md"))
+    except OSError as exc:
+        # Fail closed (no stamp) but not silently: an unreadable prompts dir usually means
+        # the operating contract / injection defense also failed to load, so surface it.
+        logging.warning(f"prompts_version: cannot list {prompts_dir} ({exc}); omitting stamp.")
+        return ""
+    h = hashlib.sha256()
+    for name in names:
+        try:
+            with open(os.path.join(prompts_dir, name), "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            logging.warning(f"prompts_version: cannot read {name} ({exc}); omitting stamp.")
+            return ""
+        h.update(name.encode("utf-8"))
+        h.update(b"\x00")  # filename can't contain NUL, so this delimits name from bytes
+        h.update(data)
+        h.update(b"\x00")
+    return h.hexdigest()[:12]
 
 # --- Pydantic Schemas for Multi-Agent Orchestration ---
 class ReferenceMappingEntry(BaseModel):
@@ -323,6 +356,22 @@ def _write_review_health() -> None:
         logging.warning(f"Failed to write review health flag: {describe_exc(e)}")
 
 
+def _provenance_stamp() -> str:
+    """One italic provenance line for a posted review: the resolved head commit (when
+    ``PR_HEAD_SHA`` is set) and the prompt-set fingerprint (whenever the prompts dir is
+    readable), so any posted report traces to the exact commit + prompt revision behind
+    it. The prompt fingerprint is emitted unconditionally — it does not depend on the
+    head commit being resolved. Returns ``''`` only when neither is available."""
+    bits = []
+    head = (os.environ.get("PR_HEAD_SHA") or "").strip()
+    if head:
+        bits.append(f"Reviewed at commit `{head[:12]}`")
+    pv = _prompts_version()
+    if pv:
+        bits.append(f"prompts `{pv}`")
+    return f"*{' · '.join(bits)}.*\n\n" if bits else ""
+
+
 def _review_comment_header(additional_comments: str) -> str:
     """Header for a posted review. Distinguishes a GUIDED review — the reviewer supplied
     ``/review`` instructions, laid out so the review can be read against them — from an
@@ -335,8 +384,7 @@ def _review_comment_header(additional_comments: str) -> str:
     stays contained; in the pilot they come from a commenter-gated (trusted) ``/review``.
     """
     instr = (additional_comments or "").strip()
-    head = (os.environ.get("PR_HEAD_SHA") or "").strip()
-    stamp = f"*Reviewed at commit `{head[:12]}`.*\n\n" if head else ""
+    stamp = _provenance_stamp()
     if instr:
         title = "### 🤖 AI Review (with additional instructions)\n\n"
         quoted = "\n".join(f"> {ln}" for ln in instr.splitlines())
@@ -398,9 +446,7 @@ def _emit_degraded_review(
     skipped-files marker. The comment is STILL written, so the failure is loud and
     visible rather than a silent red job with no explanation (acceptance #3)."""
     comment = "### 🤖 AI Review\n\n"
-    _head = (os.environ.get("PR_HEAD_SHA") or "").strip()
-    if _head:
-        comment += f"*Reviewed at commit `{_head[:12]}`.*\n\n"
+    comment += _provenance_stamp()
     comment += _LOUD_BANNER + "\n"
     comment += _skipped_marker()
     comment += "\n" + _format_verdict_basis(
