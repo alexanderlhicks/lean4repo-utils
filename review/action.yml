@@ -87,6 +87,10 @@ inputs:
     description: 'Run the adversarial verification pass. Refuted findings are removed; only confirmed findings may block or become inline annotations; uncertain/unavailable findings remain advisory. "false" to disable and use grounded initial-reviewer findings directly.'
     required: false
     default: 'true'
+  verify_findings_max:
+    description: 'Per-PR ceiling on adversarial verifier calls (R4). A hostile or very large PR can surface hundreds of findings; without a cap each spawns its own verifier LLM call. When the cap binds, the budget is spent on the findings that can hard-block (critical/high severity) first; the rest stay unverified and are rendered advisory. Empty = default (40). Independent of the token/cost budget.'
+    required: false
+    default: ''
   llm_max_run_tokens:
     description: 'Per-run token ceiling (C3). Once exceeded, no further LLM calls are made and the run degrades gracefully (partial results + a loud banner) instead of consuming unbounded spend on a shared key. Empty = disabled. The token ceiling is authoritative; source from workflow/secrets config, NEVER from PR content.'
     required: false
@@ -296,6 +300,7 @@ runs:
         SYNTHESIS_MODEL: ${{ inputs.synthesis_model }}
         VERIFY_MODEL: ${{ inputs.verify_model }}
         VERIFY_FINDINGS: ${{ inputs.verify_findings }}
+        REVIEW_MAX_VERIFY_CALLS: ${{ inputs.verify_findings_max }}
         # Per-run spend control (C3). Threaded ONLY through env (never interpolated into
         # the run: body — that would be a GHA expression-injection sink). Empty == unset
         # == disabled. Names must match review.py's ENV_MAX_RUN_* constants exactly.

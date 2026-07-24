@@ -13,7 +13,7 @@ name: 'PR Summary'
 
 on:
   pull_request_target:
-    types: [opened, synchronize]
+    types: [opened, synchronize, reopened]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Generate PR Summary
-        uses: alexanderlhicks/lean4repo-utils/summary@main
+        uses: alexanderlhicks/lean4repo-utils/summary@0.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_API_KEY }}
@@ -45,6 +45,10 @@ jobs:
 > **Note on the trigger:** This example uses `pull_request_target` so the workflow also runs for PRs from forks (the `pull_request` event does not expose repository secrets to fork-triggered workflows, and its `GITHUB_TOKEN` is read-only). `pull_request_target` runs in the context of the base branch, so take care not to execute untrusted code from the fork. This action is safe under `pull_request_target` because it only reads the diff and posts a comment — it does not execute code from the PR branch. The checkout uses `pull_request.head.sha` to fetch the correct diff, while the workflow itself runs from the base branch. If your repository does not accept fork PRs, you can switch the trigger to `pull_request` without other changes.
 >
 > The `issues: read` permission is used to link affected sorries to open GitHub issues labeled `proof wanted`.
+
+### Security & trust model
+
+Summary is safe to run on **every** PR update (open + each new commit), including fork PRs, under `pull_request_target` — which is why the trigger above needs no author gate. Unlike the [review action](../review/README.md#security--trust-model), the summary path **never builds or executes PR code**: it reads the diff and committed source as data, and reads its policy file (`additional_instructions_path`, default `CONTRIBUTING.md`) from the **base ref** (S4), never the PR checkout, so a fork PR cannot rewrite the instructions that steer the model. See the review README's [Security & trust model](../review/README.md#security--trust-model) for the full event-vs-secret table and why *review* (which does build PR code) is restricted to member `/review` comments instead.
 
 ## Inputs
 

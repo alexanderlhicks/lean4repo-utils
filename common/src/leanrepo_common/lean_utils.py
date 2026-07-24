@@ -9,7 +9,7 @@ Used by the summary and review actions and the sorry-tracker CLI.
 import os
 import re
 import stat
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Pattern, Tuple
 
 
 def resolve_confined_path(
@@ -245,6 +245,88 @@ def scrub_line(line: str, nesting_depth: int, in_string: bool) -> Tuple[str, int
             continue
         i += 1
     return ''.join(out), nesting_depth, in_string
+
+
+# ---------------------------------------------------------------------------
+# Canonical escape-hatch / kernel-bypass keyword matcher (C5)
+# ---------------------------------------------------------------------------
+# One word-boundary convention for the whole toolkit. A keyword matches only as
+# a standalone identifier token: not as a substring of a larger identifier, and
+# not as the stem of a primed identifier. This is deliberately STRICTER than
+# ``\b``, which treats a trailing prime as a word boundary and so matches the
+# ``sorry`` inside the identifier ``sorry'`` — a false positive that, in
+# review's mechanical pre-check, could wrongly force a "Changes Requested"
+# verdict.
+#
+# Callers MUST pass comment/string-scrubbed code (see :func:`scrub_line`); the
+# matcher does no comment handling itself.
+#
+# ``KERNEL_BYPASS_KEYWORDS`` is the full classification vocabulary shared by the
+# soundness gates. Individual tools scan a subset appropriate to their policy
+# (e.g. review's blocking set excludes ``decide``/``extern``); the point of C5
+# is that they all share ONE boundary rule and ONE compiled-pattern cache — not
+# that they all act on the same keywords.
+#
+# The vocabulary itself is standard Lean 4 kernel-bypass / trust-reducing
+# constructs, per Lean's own ValidatingProofs manual
+# (https://lean-lang.org/doc/reference/latest/ValidatingProofs/); the
+# standalone-token boundary follows this repo's existing sorry-tracker scanner.
+# The same forbidden-tactic concept appears in evm-asm's
+# scripts/check-forbidden-tactics.sh (MIT, © ZkSecurity) — noted as a courtesy
+# see-also; only the (uncopyrightable) keyword facts are shared, no code was
+# copied, so this is not an Apache-2.0 §4(d) NOTICE obligation.
+#
+# NOTE: ``bv_decide`` is in the vocabulary (it is kernel-bypassing via
+# ``Lean.ofReduceBool``, like ``native_decide``) but NO caller scans for it yet
+# — review's ``ESCAPE_HATCHES`` and summary's quality signals do not include it.
+# Closing that end-to-end detection gap is deferred to the M3 soundness gate
+# (ROADMAP G3), which is where the cheating-tactic policy lives.
+
+KERNEL_BYPASS_KEYWORDS: Tuple[str, ...] = (
+    "sorry", "admit", "sorryAx", "native_decide", "bv_decide", "decide",
+    "opaque", "implemented_by", "extern", "axiom",
+)
+
+_KEYWORD_PATTERN_CACHE: Dict[str, "Pattern[str]"] = {}
+_KEYWORDS_PATTERN_CACHE: Dict[Tuple[str, ...], "Pattern[str]"] = {}
+
+
+def keyword_pattern(keyword: str) -> "Pattern[str]":
+    """Compiled canonical-boundary matcher for a single Lean keyword (cached).
+
+    A match requires the keyword to be a standalone token — not preceded or
+    followed by an identifier character or a prime (``'``). Pass already-scrubbed
+    code (see :func:`scrub_line`)."""
+    pattern = _KEYWORD_PATTERN_CACHE.get(keyword)
+    if pattern is None:
+        pattern = re.compile(rf"(?<![\w']){re.escape(keyword)}(?![\w'])")
+        _KEYWORD_PATTERN_CACHE[keyword] = pattern
+    return pattern
+
+
+def keywords_pattern(keywords: Iterable[str]) -> "Pattern[str]":
+    """Compiled canonical-boundary matcher for several keywords as one regex.
+
+    The single alternation matches any of ``keywords`` as a standalone token,
+    with the same boundary rule as :func:`keyword_pattern`. ``match.group()`` is
+    the matched keyword, so callers can classify via ``search``/``finditer``.
+    Cached by keyword tuple. Pass already-scrubbed code."""
+    key = tuple(keywords)
+    pattern = _KEYWORDS_PATTERN_CACHE.get(key)
+    if pattern is None:
+        alternation = "|".join(re.escape(k) for k in key)
+        pattern = re.compile(rf"(?<![\w'])(?:{alternation})(?![\w'])")
+        _KEYWORDS_PATTERN_CACHE[key] = pattern
+    return pattern
+
+
+def find_keywords(code: str, keywords: Iterable[str]) -> List[str]:
+    """Keywords present as standalone tokens in already-scrubbed ``code``.
+
+    Preserves the order of ``keywords`` and reports each at most once. ``code``
+    must already have comments and string contents removed (see
+    :func:`scrub_line`)."""
+    return [kw for kw in keywords if keyword_pattern(kw).search(code)]
 
 
 def detect_src_dir(root: str = '.') -> Optional[str]:

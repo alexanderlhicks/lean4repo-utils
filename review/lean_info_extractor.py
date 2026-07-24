@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 
 from leanrepo_common.lean_utils import (
     file_path_to_module_name,
+    keyword_pattern,
     resolve_confined_path,
     scrub_line,
 )
@@ -229,9 +230,12 @@ def extract_sorry_warnings(file_path: str) -> List[str]:
             in_string = False
             for i, line in enumerate(f, 1):
                 code, comment_depth, in_string = scrub_line(line, comment_depth, in_string)
-                if re.search(r'\bsorry\b', code):
+                # Canonical shared matcher (C5): standalone-token boundary, so
+                # `sorry'`/`sorryAx` don't false-hit. Kept as two checks to
+                # preserve the one-location-per-keyword behaviour.
+                if keyword_pattern('sorry').search(code):
                     sorry_locations.append(f"{file_path}:{i}")
-                if re.search(r'\badmit\b', code):
+                if keyword_pattern('admit').search(code):
                     sorry_locations.append(f"{file_path}:{i}")
     except (OSError, UnicodeError):
         pass

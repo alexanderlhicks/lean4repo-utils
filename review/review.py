@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from leanrepo_common.diff_utils import parse_git_diff_header, unquote_git_path
 from leanrepo_common.lean_utils import (
-    scrub_line, strip_comments_preserve_strings,
+    scrub_line, find_keywords,
     FileCache, file_path_to_module_name, resolve_confined_path,
 )
 from leanrepo_common.llm_provider import (
@@ -1026,34 +1026,17 @@ def _added_line_numbers(diff_text: str) -> set:
     return added
 
 
-def _is_in_string(keyword: str, line: str) -> bool:
-    """Basic check: if the keyword appears only inside a string literal."""
-    # Find all string regions and check if keyword is exclusively within them
-    in_string = False
-    string_ranges = []
-    start = 0
-    for i, ch in enumerate(line):
-        if not in_string and ch == '"':
-            in_string = True
-            start = i
-        elif in_string and ch == '"' and (i == 0 or line[i-1] != '\\'):
-            in_string = False
-            string_ranges.append((start, i))
-
-    if not string_ranges:
-        return False
-
-    # Check each occurrence of keyword
-    for m in re.finditer(rf'\b{re.escape(keyword)}\b', line):
-        in_any_string = any(s <= m.start() <= e for s, e in string_ranges)
-        if not in_any_string:
-            return False  # At least one occurrence is outside strings
-    return True  # All occurrences are inside strings
-
-
 # Kernel-bypassing constructs scanned deterministically by the mechanical
 # pre-check. Escape hatches introduced by a PR trigger the hard verdict rule
 # (unless allow-listed for the project — see ESCAPE_HATCH_ALLOWLIST).
+#
+# This is review's BLOCKING subset of the shared KERNEL_BYPASS_KEYWORDS
+# vocabulary, deliberately narrower: `implemented_by` is included (it *replaces*
+# a declaration's compiled behaviour, so a wrong one silently diverges from the
+# verified spec), but `@[extern]`/`extern` is NOT — a bare `@[extern]` binding
+# is the normal, sound way to attach an FFI symbol and is not itself a proof or
+# spec bypass. `bv_decide` is likewise omitted here (deferred to G3). A repo that
+# wants stricter/looser policy uses ESCAPE_HATCH_ALLOWLIST.
 ESCAPE_HATCHES = ['sorry', 'admit', 'axiom', 'native_decide', 'implemented_by', 'opaque', 'sorryAx']
 
 # Project-configurable allowlist of escape hatches that are sanctioned for this
@@ -1100,18 +1083,21 @@ def scan_escape_hatches(diff_by_file: Dict[str, str]) -> Dict[str, list]:
             # scan the diff's added lines directly. Block-comment depth cannot be
             # reconstructed from a non-contiguous added-line view, so this path
             # is approximate; it is only reached when the accurate full-file scan
-            # is impossible.
+            # is impossible. Use scrub_line (not strip_comments_preserve_strings)
+            # so the canonical matcher's "scrubbed code" contract holds on this
+            # path too: string bodies are dropped, so a `sorry` inside a string
+            # literal on an added line can't force a false introduced-hatch
+            # verdict here the way the full-file path already avoids.
             comment_depth = 0
             in_string = False
             for line in _extract_added_lines(diff):
-                code, comment_depth, in_string = strip_comments_preserve_strings(
+                code, comment_depth, in_string = scrub_line(
                     line, comment_depth, in_string,
                 )
                 if not code.strip():
                     continue
-                for keyword in ESCAPE_HATCHES:
-                    if re.search(rf'\b{keyword}\b', code):
-                        introduced.append((file_path, keyword, line.strip()[:120]))
+                for keyword in find_keywords(code, ESCAPE_HATCHES):
+                    introduced.append((file_path, keyword, line.strip()[:120]))
             continue
 
         full_lines = full_content.splitlines(keepends=True)
@@ -1121,9 +1107,10 @@ def scan_escape_hatches(diff_by_file: Dict[str, str]) -> Dict[str, list]:
             code, comment_depth, in_string = scrub_line(line, comment_depth, in_string)
             if not code.strip():
                 continue
-            for keyword in ESCAPE_HATCHES:
-                if re.search(rf'\b{keyword}\b', code):
-                    snippet = line.strip()[:120]
+            matched = find_keywords(code, ESCAPE_HATCHES)
+            if matched:
+                snippet = line.strip()[:120]
+                for keyword in matched:
                     if i in added:
                         introduced.append((file_path, keyword, snippet))
                     else:
@@ -1132,7 +1119,26 @@ def scan_escape_hatches(diff_by_file: Dict[str, str]) -> Dict[str, list]:
         if len(full_lines) > LARGE_FILE_LINE_THRESHOLD:
             large_files.append((file_path, len(full_lines)))
 
+    # Dedupe overlapping clusters (R5): the introduced snippet drops the line
+    # number, so the same keyword on identically-spelled added lines yields
+    # duplicate tuples that would render as repeated bullets and inflate the
+    # apparent hatch count. Collapse exact (file, keyword, snippet) duplicates,
+    # preserving first-seen order. Pre-existing entries keep their line number
+    # and are already distinct.
+    introduced = _dedupe_preserving_order(introduced)
+
     return {"introduced": introduced, "preexisting": preexisting, "large_files": large_files}
+
+
+def _dedupe_preserving_order(items: list) -> list:
+    """Return ``items`` with exact duplicates removed, keeping first-seen order."""
+    seen = set()
+    out = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 def introduced_hatches_triggering_verdict(scan: Dict[str, list]) -> list:
@@ -1788,6 +1794,29 @@ _ADVISORY_CATEGORIES = {"style", "generalization", "proof", "documentation"}
 
 # Ordering for the verifier's downward-only severity correction (survives()).
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+# Per-PR ceiling on adversarial verifier calls (R4). A hostile or very large PR
+# can surface hundreds of findings; without a cap each spawns its own verifier
+# LLM call. The per-run token/cost budget (C3) bounds total spend, but this
+# bounds the call COUNT directly and independently. When the cap binds, the
+# fixed budget is spent on the findings that can actually hard-block
+# (critical/high severity) first; the remainder are left unverified and so are
+# rendered advisory — they cannot force a blocking verdict without confirmation
+# (the R1 verified-only policy). Overridable via REVIEW_MAX_VERIFY_CALLS.
+_DEFAULT_MAX_VERIFY_CALLS = 40
+
+
+def _verify_call_cap() -> int:
+    """Resolve the per-PR verifier-call ceiling (env override, positive int)."""
+    raw = os.environ.get("REVIEW_MAX_VERIFY_CALLS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    return _DEFAULT_MAX_VERIFY_CALLS
 _EVIDENCE_SOURCE_MEDIA = {
     "compiler": {"compiler"},
     "kernel": {"kernel"},
@@ -2666,6 +2695,23 @@ def verify_findings(provider: LLMProvider, per_file_structured: Dict[str, FileRe
 
     if not jobs:
         return []
+
+    # Per-PR verifier-call ceiling (R4). Spend the fixed budget on the findings
+    # that can actually drive a blocking verdict: stable-sort by descending
+    # severity (ties keep discovery order) and verify only the top `cap`. The
+    # dropped findings keep verification_status "unverified", so the verified-only
+    # rendering policy already shows them as advisory rather than blocking.
+    cap = _verify_call_cap()
+    if len(jobs) > cap:
+        dropped = len(jobs) - cap
+        jobs.sort(key=lambda job: _SEVERITY_RANK.get(job[0].severity, -1), reverse=True)
+        jobs = jobs[:cap]
+        logging.warning(
+            "Verification call cap reached: verifying %d of %d finding(s), "
+            "highest severity first; %d left unverified and rendered advisory. "
+            "Raise REVIEW_MAX_VERIFY_CALLS to verify more.",
+            cap, cap + dropped, dropped,
+        )
 
     logging.info(f"Verification pass: checking {len(jobs)} finding(s)...")
     verdicts: Dict[int, Optional[FindingVerdict]] = {}

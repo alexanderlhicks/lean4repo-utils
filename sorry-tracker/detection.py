@@ -13,7 +13,7 @@ import re
 import sys
 from dataclasses import dataclass
 
-from leanrepo_common.lean_utils import scrub_line
+from leanrepo_common.lean_utils import keywords_pattern, scrub_line
 
 # Declaration keywords a `sorry` is attributed to. Kept in sync with _NAME_RE.
 _DECL_KEYWORDS = (
@@ -32,10 +32,10 @@ _DECL_RE = re.compile(
     rf"^\s*(?:@\[[^\]]*\]\s*)*(?:(?:{_DECL_MODIFIERS})\s+)*(?:{_DECL_KEYWORDS})\b"
 )
 _NAME_RE = re.compile(rf".*?(?:{_DECL_KEYWORDS})\s+([^\s\(\{{\[:]+)")
-# Incompleteness keywords. The lookarounds exclude `\w` *and* the prime `'` on
-# either side, so `sorryAx` (the underlying axiom) and identifiers like `sorry'`
-# are not mistaken for a proof obligation.
-_SORRY_RE = re.compile(r"(?<![\w'])(?:sorry|admit)(?![\w'])")
+# Incompleteness keywords. The shared matcher's boundary excludes `\w` *and* the
+# prime `'` on either side, so `sorryAx` (the underlying axiom) and identifiers
+# like `sorry'` are not mistaken for a proof obligation.
+_SORRY_RE = keywords_pattern(("sorry", "admit"))
 
 # Directories never scanned: build output and vendored dependencies.
 _SKIP_DIRS = {".lake", "build"}

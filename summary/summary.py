@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 from leanrepo_common.diff_utils import parse_git_diff_header
 from leanrepo_common.lean_utils import (
     is_in_comment, resolve_confined_path, scrub_line,
-    strip_comments_preserve_strings,
+    strip_comments_preserve_strings, keyword_pattern, keywords_pattern,
 )
 from leanrepo_common.llm_provider import (
     ContentPart, LLMProvider, TokenUsage, create_provider,
@@ -434,8 +434,10 @@ def apply_additional_instructions(diff_content, instructions_content, model_name
     })
     return _call_prose(prompt, model_name)
 
-_PROOF_RELEVANT_PATTERNS = re.compile(r'\b(sorry|admit|native_decide)\b')
-_SORRY_RE = re.compile(r'\bsorry\b')
+# Canonical-boundary matchers (C5): a keyword matches only as a standalone
+# token, so an identifier like `sorry'` or `sorryAx` is not a false hit.
+_PROOF_RELEVANT_PATTERNS = keywords_pattern(("sorry", "admit", "native_decide"))
+_SORRY_RE = keyword_pattern("sorry")
 
 def _detect_proof_signals(file_diff):
     """Find proof keywords in changed Lean code, excluding strings/comments."""
@@ -1110,8 +1112,8 @@ class DiffAnalyzer:
 
     # Patterns for Lean quality signals (only checked on added lines)
     _QUALITY_SIGNALS = [
-        (re.compile(r'\badmit\b'), "admit", "`admit` bypasses proof checking"),
-        (re.compile(r'\bnative_decide\b'), "native_decide", "`native_decide` bypasses the kernel — potential soundness concern"),
+        (keyword_pattern("admit"), "admit", "`admit` bypasses proof checking"),
+        (keyword_pattern("native_decide"), "native_decide", "`native_decide` bypasses the kernel — potential soundness concern"),
         (re.compile(r'^\s*#check\b'), "#check", "`#check` debug command left in code"),
         (re.compile(r'^\s*#eval\b'), "#eval", "`#eval` debug command left in code"),
         (re.compile(r'set_option\s+autoImplicit\s+true'), "autoImplicit", "`set_option autoImplicit true` re-enabled"),

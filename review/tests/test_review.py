@@ -15,7 +15,6 @@ from review import (
     split_diff_into_files,
     _extract_added_lines,
     _fetch_url_content,
-    _is_in_string,
     _normalize_external_url,
     run_mechanical_prechecks,
     scan_escape_hatches,
@@ -197,23 +196,6 @@ class TestIsInComment:
         assert depth == 1  # still inside the outer comment
 
 
-# --- _is_in_string ---
-
-class TestIsInString:
-    def test_keyword_in_string(self):
-        assert _is_in_string("sorry", 'let msg := "sorry about that"') is True
-
-    def test_keyword_outside_string(self):
-        assert _is_in_string("sorry", "  sorry") is False
-
-    def test_keyword_both(self):
-        # "sorry" appears both in a string and outside — should return False
-        assert _is_in_string("sorry", 'let x := "sorry"; sorry') is False
-
-    def test_no_strings(self):
-        assert _is_in_string("axiom", "axiom myAxiom : True") is False
-
-
 # --- run_mechanical_prechecks ---
 
 class TestMechanicalPrechecks:
@@ -281,6 +263,55 @@ class TestMechanicalPrechecks:
         scan = scan_escape_hatches({str(lean_file): diff})
         assert scan["introduced"] == []
         assert introduced_hatches_triggering_verdict(scan) == []
+
+    def test_primed_identifier_not_flagged(self, tmp_path):
+        """C5 boundary: `sorry'` is a legal identifier, not the `sorry` tactic.
+        The old `\\bsorry\\b` matcher flagged it (a trailing prime is a word
+        boundary) and could wrongly force Changes Requested; the canonical
+        matcher must not."""
+        lean_file = tmp_path / "Primed.lean"
+        lean_file.write_text("def sorry' : Nat := 0\n")
+        diff = "@@ -0,0 +1 @@\n+def sorry' : Nat := 0\n"
+        scan = scan_escape_hatches({str(lean_file): diff})
+        assert scan["introduced"] == []
+        assert introduced_hatches_triggering_verdict(scan) == []
+
+    def test_duplicate_introduced_hatches_deduped(self, tmp_path):
+        """R5: the same keyword on identically-spelled added lines must render
+        once, not once per occurrence (the introduced snippet drops the line
+        number, so the tuples would otherwise be exact duplicates)."""
+        lean_file = tmp_path / "Dup.lean"
+        lean_file.write_text(
+            "theorem a : True := sorry\ntheorem a : True := sorry\n"
+        )
+        diff = (
+            "@@ -0,0 +1,2 @@\n"
+            "+theorem a : True := sorry\n"
+            "+theorem a : True := sorry\n"
+        )
+        scan = scan_escape_hatches({str(lean_file): diff})
+        assert scan["introduced"] == [
+            (str(lean_file), "sorry", "theorem a : True := sorry")
+        ]
+
+    def test_distinct_introduced_hatches_not_collapsed(self, tmp_path):
+        """R5 negative control: dedupe keys on (file, keyword, snippet), so two
+        DIFFERENT added lines with the same keyword must stay as two entries —
+        the collapse must not over-reach to keyword-only."""
+        lean_file = tmp_path / "Two.lean"
+        lean_file.write_text(
+            "theorem a : True := sorry\ntheorem b : True := sorry\n"
+        )
+        diff = (
+            "@@ -0,0 +1,2 @@\n"
+            "+theorem a : True := sorry\n"
+            "+theorem b : True := sorry\n"
+        )
+        scan = scan_escape_hatches({str(lean_file): diff})
+        assert scan["introduced"] == [
+            (str(lean_file), "sorry", "theorem a : True := sorry"),
+            (str(lean_file), "sorry", "theorem b : True := sorry"),
+        ]
 
     def test_non_lean_file_skipped(self, tmp_path):
         md_file = tmp_path / "README.md"
@@ -2180,6 +2211,27 @@ class TestVerifyFindings:
         refuted = review.verify_findings(provider, {"A.lean": r}, None, {"A.lean": "d"}, "", "m")
         assert refuted == []
         assert len(r.lean_issues) == 1
+
+    def test_verify_call_cap_prioritizes_high_severity(self, monkeypatch):
+        """R4: when the number of findings exceeds the per-PR verifier-call cap,
+        the fixed budget is spent on the findings that can hard-block (highest
+        severity first); the rest are left unverified and therefore advisory."""
+        monkeypatch.setattr(review, "_read_repo_text", lambda p: "c")
+        monkeypatch.setenv("REVIEW_MAX_VERIFY_CALLS", "2")
+        descs = ["d-low", "d-crit", "d-med", "d-high"]
+        r = self._review(lean_issues=[
+            review.Finding(description="d-low", severity="low"),
+            review.Finding(description="d-crit", severity="critical"),
+            review.Finding(description="d-med", severity="medium"),
+            review.Finding(description="d-high", severity="high"),
+        ])
+        provider = self._provider({d: "confirmed" for d in descs})
+        review.verify_findings(provider, {"A.lean": r}, None, {"A.lean": "d"}, "", "m", max_workers=2)
+        status = {f.description: f.verification_status for f in r.lean_issues}
+        assert status["d-crit"] == "confirmed"
+        assert status["d-high"] == "confirmed"
+        assert status["d-med"] == "unverified"
+        assert status["d-low"] == "unverified"
 
     def test_cross_file_finding_refuted(self, monkeypatch):
         monkeypatch.setattr(review, "_read_repo_text", lambda p: "c")

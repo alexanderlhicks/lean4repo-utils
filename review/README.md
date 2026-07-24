@@ -2,7 +2,7 @@
 
 This GitHub Action provides an AI-powered code review for Pull Requests in Lean 4 projects, with a strong focus on detecting misformalization issues. It reaches any LLM through [OpenRouter](https://openrouter.ai) and analyzes code changes against formal specifications and project dependencies through a multi-agent pipeline.
 
-**Fastest start:** add an `OPENROUTER_API_KEY` Actions secret, then copy the [recommended combined workflow](#recommended-combined-workflow-auto--chatops) below to `.github/workflows/ai-review.yml` in your repository. The sections below explain the workflow, every input, and how the pipeline works.
+**Fastest start:** add an `OPENROUTER_KEY` Actions secret, then copy the [recommended ChatOps workflow](#recommended-chatops-workflow-review) below to `.github/workflows/ai-review.yml` in your repository. The sections below explain the workflow, every input, and how the pipeline works.
 
 - [Usage](#usage)
   - [Recommended: Combined Workflow (Auto + ChatOps)](#recommended-combined-workflow-auto--chatops)
@@ -19,45 +19,54 @@ This GitHub Action provides an AI-powered code review for Pull Requests in Lean 
 
 ## Usage
 
-This is a composite action. It supports both automatic review on PR open and on-demand review via `/review` comments, ideally combined in a single workflow.
+This is a composite action. The recommended deployment runs review **on demand only**, via a `/review` comment from a repo member. See [Security & trust model](#security--trust-model) for why on-open auto-review is not recommended while untrusted Lean is built with secrets in scope.
 
-### Recommended: Combined Workflow (Auto + ChatOps)
+### Security & trust model
 
-Create a workflow file at `.github/workflows/ai-review.yml`:
+Read this before wiring the action on a public repository.
+
+**When are the secrets and the write token in scope?** GitHub only exposes repository secrets (your `OPENROUTER_KEY`) and a writable `GITHUB_TOKEN` to a workflow run when the run is *trusted*:
+
+| Trigger | Fork PR sees secrets? | Runs which code? |
+|---|---|---|
+| `pull_request` | No (read-only token, no secrets) | the PR head |
+| `pull_request_target` | **Yes** | base workflow, but a checkout is the PR head |
+| `issue_comment` | **Yes** | base workflow, in the base repo context |
+
+**Why review is ChatOps-only.** The review pipeline *builds and elaborates the PR's Lean code* (`lake build`, and — with `lean_tools: true` — model-directed `lake env lean`). That is arbitrary code execution. On `issue_comment` the run holds the `OPENROUTER_KEY` and a write token, so building an outside contributor's PR would run attacker-controlled Lean/lakefile code next to those credentials (cf. CVE-2025-47928, CVSS 9.1). The action ships defense-in-depth for this (a resolved-PR-head checkout with `persist-credentials: false`, a scrubbed child env for model-directed Lean, path confinement on every PR-controlled read), but the **two-stage secret-free build split (S2) and full `lean_tools` sandbox (S7) are not yet live**. Until they are:
+
+- **Restrict the trigger to repo members** (`OWNER`/`MEMBER`/`COLLABORATOR`) — the template below does this. The **comment author**, not the PR author, is the trust boundary: a maintainer is expected to look at a fork PR's diff before typing `/review` on it.
+- **Do not** wire review as an auto-run on `pull_request`/`pull_request_target` for a public repo, and **do not** drop the author gate, until S2/S7 land.
+
+**Summary is different and safe on every PR** (see the [summary action](../summary/README.md)): it never builds or executes PR code — it reads the diff and committed source as data and reads its policy file from the base ref (S4) — so it runs under `pull_request_target` on every push.
+
+### Recommended: ChatOps Workflow (`/review`)
+
+Create a workflow file at `.github/workflows/ai-review.yml`. This is the canonical safe deployment — review is triggered only by a member's `/review` comment:
 
 ```yaml
 name: PR Review
 
 on:
-  pull_request:
-    types: [opened]
   issue_comment:
     types: [created]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: ${{ github.workflow }}-${{ github.event.issue.number }}
   cancel-in-progress: true
 
 jobs:
   review:
+    # The COMMENT author (not the PR author) is the trust boundary. See the
+    # Security & trust model section above.
     if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/review') &&
       (
-        github.event_name == 'pull_request' &&
-        (
-          github.event.pull_request.author_association == 'OWNER' ||
-          github.event.pull_request.author_association == 'MEMBER' ||
-          github.event.pull_request.author_association == 'COLLABORATOR'
-        )
-      ) ||
-      (
-        github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        startsWith(github.event.comment.body, '/review') &&
-        (
-          github.event.comment.author_association == 'OWNER' ||
-          github.event.comment.author_association == 'MEMBER' ||
-          github.event.comment.author_association == 'COLLABORATOR'
-        )
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
       )
     runs-on: ubuntu-latest
     # The budget is mostly for the multi-agent LLM review (many API calls). The
@@ -73,7 +82,6 @@ jobs:
       # and any URLs or repo paths it mentions become review context automatically.
       - name: Extract instructions from /review comment
         id: get_args
-        if: github.event_name == 'issue_comment'
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
@@ -85,10 +93,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - uses: alexanderlhicks/lean4repo-utils/review@main
+      - uses: alexanderlhicks/lean4repo-utils/review@0.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          api_key: ${{ secrets.OPENROUTER_API_KEY }}
+          api_key: ${{ secrets.OPENROUTER_KEY }}
 
           # --- Models (open-weight, a two-family combination) ---------------
           # These two are the action's DEFAULTS (shown for clarity — you can omit
@@ -104,7 +112,7 @@ jobs:
           # triage_model: minimax/minimax-m3
           # synthesis_model: minimax/minimax-m3
 
-          pr_number: ${{ github.event.issue.number || github.event.pull_request.number }}
+          pr_number: ${{ github.event.issue.number }}
 
           # URLs and repo paths mentioned in the /review comment are extracted
           # into external/spec/repo context automatically; the text itself
@@ -120,12 +128,12 @@ jobs:
 
 **Key features of this workflow:**
 - **Concurrency control** prevents duplicate reviews on the same PR.
-- **Access control** restricts triggers to owners, members, and collaborators only (prevents abuse on public repos).
-- **Combined triggers** handle both auto-review on PR open and on-demand `/review` comments.
+- **Access control** restricts the `/review` trigger to owners, members, and collaborators only — the comment author is the trust boundary (see [Security & trust model](#security--trust-model)).
+- **ChatOps trigger** keeps review on-demand, so untrusted PR code is only built when a maintainer asks for it.
 
 **How developers use it:**
 
-Automatic review runs on PR open. For re-review with context, comment `/review` followed by anything (or nothing):
+To review (or re-review) a PR, a member comments `/review` followed by anything (or nothing):
 
 ```text
 /review Check that the ring homomorphism in Foo/Hom.lean matches Section 4 of
@@ -141,6 +149,13 @@ The text is freeform. From it, the action automatically:
 A project-wide knowledge base (a `docs/kb/` of notes, a LaTeX blueprint, spec documents) should instead be configured statically with `spec_refs` in the `with:` block, so every review gets it — the comment is for per-PR extras: the paper being formalized, a file to focus on, or plain instructions.
 
 ### Alternative: Minimal Push Workflow (No ChatOps)
+
+> **Use only on a private or trusted-contributor repo.** This auto-runs on
+> `pull_request`, which builds PR code. On a public repo, fork PRs get no
+> secrets (so the action can't run) and the member gate blocks the rest — but
+> for a repo where *all* branch pushers are trusted it is a convenient
+> always-on review. It is **not** the recommended fleet deployment; prefer the
+> ChatOps workflow above. Never switch this to `pull_request_target`.
 
 ```yaml
 name: AI Code Review for Lean PRs
@@ -166,10 +181,10 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: alexanderlhicks/lean4repo-utils/review@main
+      - uses: alexanderlhicks/lean4repo-utils/review@0.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          api_key: ${{ secrets.OPENROUTER_API_KEY }}
+          api_key: ${{ secrets.OPENROUTER_KEY }}
           # model / verify_model default to open-weight z-ai/glm-5.2 + deepseek/deepseek-v4-pro; override with any slug.
           pr_number: ${{ github.event.pull_request.number }}
 ```
