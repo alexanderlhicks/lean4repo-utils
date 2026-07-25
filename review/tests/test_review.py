@@ -3175,10 +3175,11 @@ class TestScopeGuard:
         import shlex
         binp = tmp_path / "bin"
         binp.mkdir(exist_ok=True)
-        body = "#!/usr/bin/env bash\n"
-        for line in files:
-            body += f"printf '%s\\n' {shlex.quote(line)}\n"
-        body += f"exit {gh_exit}\n"
+        # Stub gh by cat-ing a data file (efficient + faithful for large lists), then
+        # exit gh_exit — so gh_exit!=0 still prints stdout, modelling a failing API call.
+        data = tmp_path / "gh_files.txt"
+        data.write_text("".join(f"{line}\n" for line in files))
+        body = f"#!/usr/bin/env bash\ncat {shlex.quote(str(data))}\nexit {gh_exit}\n"
         (binp / "gh").write_text(body)
         (binp / "gh").chmod(0o755)
         out = tmp_path / "gh_output.txt"
@@ -3228,6 +3229,30 @@ class TestScopeGuard:
     def test_nonzero_on_regex_unsafe_src(self, tmp_path):
         rc, out = self._run(tmp_path, ["MyLib/A.lean"], src="a|b")
         assert rc == 2 and "scope=" not in out       # <src> can't inject regex alternation
+
+    def test_fail_closed_large_out_of_scope_list(self, tmp_path):
+        # SIGPIPE/pipefail regression: an out-of-scope path early in a >64KB list must
+        # still route to a human. The old `printf | grep -vq` form failed OPEN here
+        # (printf died with SIGPIPE, pipefail -> if False -> fell through to in_scope).
+        files = [".github/workflows/evil.yml"] + [f"MyLib/{'a' * 40}/F{i}.lean" for i in range(2500)]
+        _, out = self._run(tmp_path, files)
+        assert "scope=in_scope" not in out and "scope=out_of_scope" in out
+
+    def test_bump_large_list(self, tmp_path):
+        # Same SIGPIPE hazard on the bump grep: a pin among many src files still -> bump.
+        files = ["lean-toolchain"] + [f"MyLib/{'x' * 30}/F{i}.lean" for i in range(2500)]
+        _, out = self._run(tmp_path, files)
+        assert "scope=bump" in out
+
+    def test_cap_fails_closed(self, tmp_path):
+        files = [f"MyLib/F{i}.lean" for i in range(3000)]   # hits the 3000-file API cap
+        _, out = self._run(tmp_path, files)
+        assert "scope=infra" in out
+
+    def test_dot_in_src_is_literal_not_wildcard(self, tmp_path):
+        # src "My.Lib" must not match "MyXLib/..." — the '.' is escaped, not a wildcard.
+        _, out = self._run(tmp_path, ["MyXLib/A.lean"], src="My.Lib")
+        assert "scope=out_of_scope" in out
 
 
 class TestReviewLabelling:

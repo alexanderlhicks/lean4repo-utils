@@ -20,7 +20,7 @@
 #   reads GH_TOKEN from the environment; writes exactly one `scope=<decision>` to
 #   $GITHUB_OUTPUT, where <decision> is one of:
 #     in_scope     — only <src>/ (and <src>.lean) changed: safe to sandbox-build
-#     bump         — only Lake pins changed: validate as a forward bump, then build
+#     bump         — Lake pins are among the changes: validate as a forward bump first
 #     out_of_scope — touches paths outside the overlay: route to a human
 #     infra        — cannot determine the change set: route to a human (fail closed)
 # Fail-closed: any unresolved/empty/oversized/errored listing yields `infra` (human);
@@ -54,27 +54,38 @@ emit() { echo "scope=$1" >> "$GITHUB_OUTPUT"; echo "::notice::scope_guard: $1"; 
 if ! files=$(gh api --paginate "repos/${repo}/pulls/${pr}/files" --jq '.[].filename'); then
   echo "::warning::scope_guard: gh api failed to list PR files — routing to human" >&2; emit infra
 fi
-n=$(printf '%s\n' "$files" | grep -c . || true)
+# NOTE: every match below uses a here-string (`<<<`), never `printf ... | grep`. With
+# `set -o pipefail` a `grep -q` closes the pipe on its first match and the still-writing
+# `printf` dies with SIGPIPE (141); pipefail then makes the pipeline non-zero, so an
+# `if printf | grep -vq` guarding `out_of_scope` would be FALSE even when a bad path was
+# found — a fail-OPEN on any file list larger than the ~64KB pipe buffer. Here-strings
+# have no second process, so no SIGPIPE, and the exit status is grep's alone.
+n=$(grep -c . <<<"$files" || true)
 
 # Fail closed on an empty or capped listing: a truncated list could hide an
 # out-of-scope path, so route to a human rather than assume in-scope.
 if [ -z "$files" ] || [ "$n" -eq 0 ]; then
   echo "::warning::scope_guard: empty/unlistable change set — routing to human" >&2; emit infra
 fi
+# GitHub's paginated pulls/<n>/files tops out at 3000 entries; at the cap the list may
+# be truncated (could hide an out-of-scope path), so fail closed.
 if [ "$n" -ge 3000 ]; then
   echo "::warning::scope_guard: change set hit the 3000-file API cap — failing closed" >&2; emit infra
 fi
 
 # Allowlist over the trusted list. Anything NOT matching (including a nested
 # lakefile/lean-toolchain at any depth, scripts/**, .github/**) => out of scope.
-allow="^${src}/|^${src}\.lean$|^lake-manifest\.json$|^lean-toolchain$"
-if printf '%s\n' "$files" | grep -vqE "$allow"; then
+# Escape any '.' in <src> so it is a literal, not a regex wildcard.
+src_re="${src//./\\.}"
+allow="^${src_re}/|^${src_re}\.lean$|^lake-manifest\.json$|^lean-toolchain$"
+if grep -vqE "$allow" <<<"$files"; then
   echo "::warning::scope_guard: PR touches paths outside ${src}/ + Lake pins — needs human review" >&2
   emit out_of_scope
 fi
-# Everything is in the allowlist. If any Lake-pin file changed, it is a bump (validate
-# separately as forward-only before building); otherwise pure <src>/ changes.
-if printf '%s\n' "$files" | grep -qE '^lake-manifest\.json$|^lean-toolchain$'; then
+# Everything is in the allowlist. If ANY Lake-pin file is among the changes, it is a
+# bump (scope=bump) — its pins must pass separate forward-only validation before build,
+# whether or not <src>/ also changed; otherwise the change is pure <src>/ source.
+if grep -qE '^lake-manifest\.json$|^lean-toolchain$' <<<"$files"; then
   emit bump
 fi
 emit in_scope
