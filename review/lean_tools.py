@@ -18,6 +18,7 @@ scrubbed, so model-directed code cannot read credentials (e.g.
 ``#eval IO.getEnv "GITHUB_TOKEN"``) and smuggle them into the review output.
 """
 
+import logging
 import os
 import re
 import shutil
@@ -48,8 +49,12 @@ _ENV_ALLOWLIST = frozenset({
 _ENV_ALLOWLIST_PREFIXES = ("LAKE_",)
 
 # Secondary net: even an allowlisted / prefix-allowed name is dropped if it looks
-# like a secret (e.g. a stray `LAKE_TOKEN`), so the prefix rule can't admit one.
-_SECRET_ENV_RE = re.compile(r'(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL)', re.IGNORECASE)
+# like a secret (e.g. a stray `LAKE_TOKEN` / `LAKE_AUTH`), so the `LAKE_` prefix rule
+# can't admit one. Covers the credential-bearing name fragments, not just TOKEN/KEY.
+_SECRET_ENV_RE = re.compile(
+    r'(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|BEARER|PEM|PRIVATE|CERT|SIGNING)',
+    re.IGNORECASE,
+)
 
 # Cap on a single tool's returned text, to keep tool results from bloating the
 # conversation fed back to the model.
@@ -91,14 +96,26 @@ class SandboxUnavailable(RuntimeError):
     binary is missing — we fail closed rather than run PR-controlled Lean unconfined."""
 
 
+_SANDBOX_ON = frozenset({"1", "true", "yes", "on", "require", "enabled"})
+_SANDBOX_OFF = frozenset({"", "0", "false", "no", "off", "disabled"})
+
+
 def sandbox_enabled() -> bool:
     """Whether Lean elaboration should run under the landrun (Landlock) sandbox.
 
-    Off by default (local dev, unit tests) so the suites and CLI runs behave
-    normally. The two-stage CI review job sets ``LEANREPO_SANDBOX=1`` (or
-    ``require``) for the secret-bearing phase, where every model-directed / PR-file
-    ``lake env lean`` must be confined."""
-    return os.environ.get("LEANREPO_SANDBOX", "").strip().lower() in ("1", "on", "require")
+    Off by default (unset/empty) so local dev, unit tests, and CLI runs behave
+    normally. The two-stage CI review job sets ``LEANREPO_SANDBOX`` to a truthy value
+    for the secret-bearing phase, where every model-directed / PR-file ``lake env
+    lean`` must be confined. An UNRECOGNISED non-empty value fails CLOSED (treated as
+    enabled, with a warning) rather than silently disabling confinement — a security
+    control must not become a no-op because of a value typo (``true`` vs ``1``)."""
+    v = os.environ.get("LEANREPO_SANDBOX", "").strip().lower()
+    if v in _SANDBOX_ON:
+        return True
+    if v in _SANDBOX_OFF:
+        return False
+    logging.warning(f"LEANREPO_SANDBOX={v!r} not recognised; treating as ENABLED (fail closed).")
+    return True
 
 
 def landrun_available() -> bool:

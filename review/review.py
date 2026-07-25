@@ -409,6 +409,35 @@ def _write_review_health() -> None:
         logging.warning(f"Failed to write review health flag: {describe_exc(e)}")
 
 
+def _finalize_exit_code() -> int:
+    """Write the health flag (the action's shell step reads it to emit the ``::error::``
+    annotation) and compute the process exit code: non-zero only when ``LLM_LOUD_EXIT``
+    is opted in AND the run degraded. Shared by the normal tail AND every early degraded
+    return, so no failure path can skip the health signal or the loud-exit contract."""
+    _write_review_health()
+    loud_exit = os.environ.get(ENV_LOUD_EXIT, "").strip().lower() in ("1", "true", "yes")
+    if loud_exit and run_health.degraded:
+        logging.warning("LLM_LOUD_EXIT enabled and the run degraded — exiting non-zero.")
+        return LOUD_EXIT_CODE
+    return 0
+
+
+def _refuse_review_no_contract() -> int:
+    """Fail LOUD when the operating contract did not load intact: record the hard
+    failure, post a visible NOT-reviewed comment, AND run the shared finalize path
+    (health flag + loud-exit) — so this most-severe posture failure is at least as loud
+    at the CI layer as a provider outage, never a silent green job (the bug the earlier
+    bare ``return`` introduced)."""
+    logging.error("Operating contract failed its integrity check (missing/empty/truncated); "
+                  "injection-defense posture unavailable — refusing to run a review.")
+    run_health.record_hard_failure()
+    print("### 🤖 AI Review\n\n" + _provenance_stamp()
+          + "> [!CAUTION]\n> **Review not performed.** The reviewer's operating contract "
+            "(untrusted-input / injection-defense posture) did not load intact, so the "
+            "automated review could not run safely. Treat this PR as **NOT reviewed**.\n")
+    return _finalize_exit_code()
+
+
 def _provenance_stamp() -> str:
     """One italic provenance line for a posted review: the resolved head commit (when
     ``PR_HEAD_SHA`` is set) and the prompt-set fingerprint (whenever the prompts dir is
@@ -3583,17 +3612,10 @@ def main():
 
     # Fail LOUD (not silently degraded) if the injection-defense contract did not load
     # intact: the agents would run without the untrusted-input posture, so no review may
-    # be posted. Checked here, before any spend, and surfaced as a visible NOT-reviewed
-    # comment rather than a silent red job.
+    # be posted. Checked here, before any spend; the refusal writes the health flag and
+    # honors loud-exit (via the shared finalize path) so it is not a silent green job.
     if not _operating_contract_intact():
-        logging.error("Operating contract failed its integrity check (missing/empty/truncated); "
-                      "injection-defense posture unavailable — refusing to run a review.")
-        run_health.record_hard_failure()
-        print("### 🤖 AI Review\n\n" + _provenance_stamp()
-              + "> [!CAUTION]\n> **Review not performed.** The reviewer's operating contract "
-                "(untrusted-input / injection-defense posture) did not load intact, so the "
-                "automated review could not run safely. Treat this PR as **NOT reviewed**.\n")
-        return
+        return _refuse_review_no_contract()
 
     hard_budget = budget if budget_mode == "hard" else None
     provider = create_provider(api_key, enable_web_search=enable_web_search, budget=hard_budget)
@@ -4141,18 +4163,12 @@ def main():
     finally:
         logging.info(token_tracker.summary())
 
-    # Health flag for the action's shell step (which emits the ::error:: annotation —
-    # review.py's stdout is the PR-comment channel and must not print it itself).
-    _write_review_health()
-
-    # Loud-exit (R1): a non-zero process exit ONLY when explicitly opted in AND the
-    # run degraded — computed here, outside any finally, so it cannot mask a traceback
-    # and runs only after the comment above has been printed. Default OFF.
-    loud_exit = os.environ.get(ENV_LOUD_EXIT, "").strip().lower() in ("1", "true", "yes")
-    if loud_exit and run_health.degraded:
-        logging.warning("LLM_LOUD_EXIT enabled and the run degraded — exiting non-zero.")
-        return LOUD_EXIT_CODE
-    return 0
+    # Health flag + loud-exit (R1): the shared finalize path (also used by the
+    # contract-refusal early return) writes review_health.json for the action's shell
+    # step to emit the ::error:: annotation, then applies loud-exit — a non-zero exit
+    # ONLY when explicitly opted in AND the run degraded. Computed here, outside any
+    # finally, so it cannot mask a traceback and runs after the comment is printed.
+    return _finalize_exit_code()
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -48,6 +48,15 @@ class TestScrubEnv:
         monkeypatch.setenv("SOME_RANDOM_CONFIG", "v")   # not on the allowlist -> dropped
         assert "SOME_RANDOM_CONFIG" not in scrubbed_env()
 
+    def test_lake_prefixed_secret_name_variants_dropped(self, monkeypatch):
+        # Backstop covers credential fragments beyond TOKEN/KEY, so a LAKE_-prefixed
+        # secret can't slip through the prefix allow rule.
+        for v in ("LAKE_AUTH", "LAKE_BEARER", "LAKE_PRIVATE", "LAKE_MY_PEM", "LAKE_SIGNING"):
+            monkeypatch.setenv(v, "leak")
+        env = scrubbed_env()
+        for v in ("LAKE_AUTH", "LAKE_BEARER", "LAKE_PRIVATE", "LAKE_MY_PEM", "LAKE_SIGNING"):
+            assert v not in env
+
 
 class TestSandbox:
     def test_passthrough_when_disabled(self, monkeypatch):
@@ -64,6 +73,24 @@ class TestSandbox:
         assert "--net" not in wrapped                         # egress denied by default
         i = wrapped.index("--")                               # command follows the separator
         assert wrapped[i + 1:] == ["lake", "env", "lean", "--stdin"]
+
+    def test_enabled_accepts_common_truthy_values(self, monkeypatch):
+        for v in ("1", "true", "yes", "on", "require", "enabled", "TRUE"):
+            monkeypatch.setenv("LEANREPO_SANDBOX", v)
+            assert lean_tools.sandbox_enabled() is True, v
+
+    def test_disabled_on_empty_and_explicit_off(self, monkeypatch):
+        monkeypatch.delenv("LEANREPO_SANDBOX", raising=False)
+        assert lean_tools.sandbox_enabled() is False
+        for v in ("0", "false", "no", "off", "disabled"):
+            monkeypatch.setenv("LEANREPO_SANDBOX", v)
+            assert lean_tools.sandbox_enabled() is False, v
+
+    def test_fail_closed_on_unrecognized_value(self, monkeypatch):
+        # A typo (e.g. LEANREPO_SANDBOX=enable/yolo) must NOT silently disable the
+        # sandbox — a security control fails closed (enabled), not open.
+        monkeypatch.setenv("LEANREPO_SANDBOX", "yolo")
+        assert lean_tools.sandbox_enabled() is True
 
     def test_fail_closed_when_enabled_but_absent(self, monkeypatch):
         monkeypatch.setenv("LEANREPO_SANDBOX", "1")

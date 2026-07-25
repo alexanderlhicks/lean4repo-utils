@@ -275,6 +275,28 @@ def test_pdf_candidates_are_marked_visual_required_when_text_extraction_availabl
     assert statements[0]["requires_visual_confirmation"] is True
 
 
+def test_pdf_extraction_scrubs_secrets_from_subprocess_env(tmp_path, monkeypatch):
+    # Regression (S18-2a 5th seam): pdftotext parses an UNTRUSTED PR-supplied PDF, so it
+    # must run under scrubbed_env() — no secret may be in the child environment.
+    paper = tmp_path / "paper.pdf"
+    paper.write_bytes(b"%PDF fake")
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    monkeypatch.setenv("OR_AUTH", "secret2")      # novel name the old denylist missed
+    monkeypatch.setattr(evidence.shutil, "which", lambda name: "/usr/bin/pdftotext")
+    captured = {}
+
+    class Result:
+        stdout = ""
+
+    def fake_run(*args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return Result()
+    monkeypatch.setattr(evidence.subprocess, "run", fake_run)
+    evidence.extract_paper_statements(paper)
+    assert captured["env"] is not None            # env= was passed (not inherited)
+    assert "GITHUB_TOKEN" not in captured["env"] and "OR_AUTH" not in captured["env"]
+
+
 def test_pdf_without_extractor_is_explicitly_unavailable(tmp_path, monkeypatch):
     paper = tmp_path / "paper.pdf"
     paper.write_bytes(b"%PDF fake")

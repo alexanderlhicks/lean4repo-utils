@@ -3273,6 +3273,25 @@ class TestOperatingContractIntegrity:
         monkeypatch.setattr(review, "OPERATING_CONTRACT", body)
         assert review._operating_contract_intact() is False
 
+    def test_refusal_is_loud_writes_health_and_honors_loud_exit(self, monkeypatch, tmp_path, capsys):
+        # The refusal must be at least as loud at the CI layer as a provider outage:
+        # a visible comment, a RECORDED hard failure, a written health flag (the
+        # ::error:: annotation keys on it), and loud-exit honored — not a bare return.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("PR_HEAD_SHA", raising=False)
+        monkeypatch.delenv("LLM_LOUD_EXIT", raising=False)
+        monkeypatch.setattr(review, "run_health", review.RunHealth(), raising=False)
+        code = review._refuse_review_no_contract()
+        out = capsys.readouterr().out
+        assert "Review not performed" in out                     # visible NOT-reviewed comment
+        assert review.run_health.degraded                        # hard failure recorded, not dropped
+        assert (tmp_path / "review_health.json").exists()        # health flag written for the annotation
+        assert code == 0                                         # loud-exit off by default
+        # opted into loud-exit + degraded -> non-zero, matching the documented contract
+        monkeypatch.setattr(review, "run_health", review.RunHealth(), raising=False)
+        monkeypatch.setenv("LLM_LOUD_EXIT", "1")
+        assert review._refuse_review_no_contract() == review.LOUD_EXIT_CODE
+
 
 class TestLoadProviderKey:
     """Key lifecycle (S2): the OpenRouter key is read into a local variable and
