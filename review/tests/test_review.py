@@ -3248,6 +3248,90 @@ class TestPromptsVersionContract:
         assert "prompts `" in out and "Reviewed at commit `deadbeefcafe`" in out
 
 
+class TestOperatingContractIntegrity:
+    """Fail-LOUD contract load: integrity (length + section sentinels), not mere
+    non-emptiness — a truncated/corrupted contract is a weakened injection defense
+    and must be caught so no review is posted without the full untrusted-input posture."""
+
+    def test_intact_for_the_real_contract(self):
+        assert review._operating_contract_intact() is True   # the shipped file loads intact
+
+    def test_not_intact_when_empty(self, monkeypatch):
+        monkeypatch.setattr(review, "OPERATING_CONTRACT", "")
+        assert review._operating_contract_intact() is False
+
+    def test_not_intact_when_truncated_nonempty(self, monkeypatch):
+        # Non-empty but too short and missing sentinels — the exact case an
+        # emptiness-only check would wrongly pass.
+        monkeypatch.setattr(review, "OPERATING_CONTRACT", "# Operating contract\nUntrusted input...")
+        assert review._operating_contract_intact() is False
+
+    def test_not_intact_when_missing_a_sentinel(self, monkeypatch):
+        # Long enough, but a required section is absent (partial write / edit).
+        body = "## Untrusted input\n" + ("padding line\n" * 300) + "## Grounding\n"
+        assert "## Confidence calibration" not in body
+        monkeypatch.setattr(review, "OPERATING_CONTRACT", body)
+        assert review._operating_contract_intact() is False
+
+
+class TestLoadProviderKey:
+    """Key lifecycle (S2): the OpenRouter key is read into a local variable and
+    removed from the environment before the model loop, and a file-staged key is
+    unlinked after reading so it does not outlive the read."""
+
+    def test_reads_env_and_pops_it(self, monkeypatch):
+        monkeypatch.setenv("API_KEY", "sk-live")
+        monkeypatch.delenv("API_KEY_FILE", raising=False)
+        assert review._load_provider_key() == "sk-live"
+        assert "API_KEY" not in os.environ            # not left for the model loop / children
+
+    def test_reads_file_and_unlinks(self, monkeypatch, tmp_path):
+        f = tmp_path / "openrouter.key"
+        f.write_text("sk-file\n")
+        monkeypatch.setenv("API_KEY_FILE", str(f))
+        monkeypatch.delenv("API_KEY", raising=False)
+        assert review._load_provider_key() == "sk-file"
+        assert not f.exists()                          # staged secret unlinked
+        assert "API_KEY_FILE" not in os.environ
+
+    def test_file_preferred_over_env(self, monkeypatch, tmp_path):
+        f = tmp_path / "k"
+        f.write_text("sk-from-file")
+        monkeypatch.setenv("API_KEY_FILE", str(f))
+        monkeypatch.setenv("API_KEY", "sk-from-env")
+        assert review._load_provider_key() == "sk-from-file"
+        assert "API_KEY" not in os.environ             # env copy still scrubbed
+
+    def test_none_when_unset(self, monkeypatch):
+        monkeypatch.delenv("API_KEY", raising=False)
+        monkeypatch.delenv("API_KEY_FILE", raising=False)
+        assert review._load_provider_key() is None
+
+    def test_missing_file_falls_back_to_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("API_KEY_FILE", str(tmp_path / "nope"))
+        monkeypatch.setenv("API_KEY", "sk-fallback")
+        assert review._load_provider_key() == "sk-fallback"
+
+    def test_empty_staged_file_falls_back_and_unlinks(self, monkeypatch, tmp_path):
+        f = tmp_path / "empty.key"
+        f.write_text("   \n")                          # present but blank
+        monkeypatch.setenv("API_KEY_FILE", str(f))
+        monkeypatch.setenv("API_KEY", "sk-fallback")
+        assert review._load_provider_key() == "sk-fallback"
+        assert not f.exists()                           # blank staged file still unlinked
+        assert "API_KEY" not in os.environ
+
+    def test_unreadable_file_falls_back_and_scrubs(self, monkeypatch, tmp_path):
+        # An OSError reading the staged file must not crash and must still fall back
+        # to API_KEY while scrubbing both from the environment.
+        d = tmp_path / "is-a-dir.key"
+        d.mkdir()                                       # opening a directory raises OSError
+        monkeypatch.setenv("API_KEY_FILE", str(d))
+        monkeypatch.setenv("API_KEY", "sk-fallback")
+        assert review._load_provider_key() == "sk-fallback"
+        assert "API_KEY" not in os.environ and "API_KEY_FILE" not in os.environ
+
+
 class TestReferenceManifest:
     """The 'References & context used' manifest (deterministic render + load-status channel)."""
 

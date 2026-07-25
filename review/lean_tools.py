@@ -24,7 +24,31 @@ import shutil
 import subprocess
 from typing import Dict, List, Optional
 
-# Env var names matching this are removed from the Lean subprocess environment.
+# Environment ALLOWLIST for Lean subprocesses. `lake env lean` elaborates
+# PR-controlled code, so the child must inherit ONLY known-safe infrastructure
+# variables — never a credential. An allowlist (rather than the old secret-name
+# denylist) is robust to renamed or novel secret vars (`OR_AUTH`, `GH_APP_PEM`,
+# `BEARER`, …): a variable is inherited only if it is explicitly listed here, so
+# an unrecognised name is dropped by default. Modelled on leanprover/lean-eval's
+# env-allowlist probe. Add a name here only after confirming it carries no secret.
+_ENV_ALLOWLIST = frozenset({
+    # process / locale
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "TZ", "TERM",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE",
+    # scratch dirs (redirected into the sandbox in CI)
+    "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    # Lean / Lake / elan toolchain
+    "ELAN_HOME", "ELAN_TOOLCHAIN", "RUSTUP_HOME",
+    "LEAN_PATH", "LEAN_SRC_PATH", "LEAN_SYSROOT", "LEAN_CC", "LEAN_ABORT_ON_PANIC",
+    "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+    # CI marker (harmless; some tools branch on it)
+    "CI", "GITHUB_ACTIONS",
+})
+# A var whose name starts with one of these is also allowed (Lake reads `LAKE_*`).
+_ENV_ALLOWLIST_PREFIXES = ("LAKE_",)
+
+# Secondary net: even an allowlisted / prefix-allowed name is dropped if it looks
+# like a secret (e.g. a stray `LAKE_TOKEN`), so the prefix rule can't admit one.
 _SECRET_ENV_RE = re.compile(r'(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL)', re.IGNORECASE)
 
 # Cap on a single tool's returned text, to keep tool results from bloating the
@@ -38,18 +62,84 @@ def lean_available() -> bool:
 
 
 def scrubbed_env() -> Dict[str, str]:
-    """A copy of the process env with secret-looking variables removed.
+    """A copy of the process env restricted to an allowlist of known-safe
+    infrastructure variables (`_ENV_ALLOWLIST` / `_ENV_ALLOWLIST_PREFIXES`).
 
     `lake env lean` elaborates PR-controlled code (the imported module), so the
     child process must never inherit API keys or tokens: in the secret-bearing
     run-review step an elaboration-time exploit could otherwise read
-    `API_KEY`/`GITHUB_TOKEN` straight from its environment. Scrubbing is the
-    default for every Lean subprocess spawned by the review action (both the
-    model-directed toolbox here and the axiom/coverage extractors in
-    lean_info_extractor, which import this). Full sandboxing of model-directed
-    Lean IO is the separate S7 roadmap item.
+    `API_KEY`/`GITHUB_TOKEN` (or a novel secret name the old denylist missed)
+    straight from its environment. The allowlist inherits only recognised
+    infra/toolchain vars, so a secret under any unlisted name is dropped by
+    default. This is the default env for every Lean subprocess spawned by the
+    review action (the model-directed toolbox here and the axiom/coverage/
+    diagnostics extractors in lean_info_extractor). Landlock sandboxing of that
+    Lean IO (S7) is applied on top of this by `sandbox_wrap`.
     """
-    return {k: v for k, v in os.environ.items() if not _SECRET_ENV_RE.search(k)}
+    return {
+        k: v for k, v in os.environ.items()
+        if (k in _ENV_ALLOWLIST or k.startswith(_ENV_ALLOWLIST_PREFIXES))
+        and not _SECRET_ENV_RE.search(k)
+    }
+
+
+_LANDRUN_BIN = "landrun"
+
+
+class SandboxUnavailable(RuntimeError):
+    """Raised when sandboxing is requested (LEANREPO_SANDBOX set) but the landrun
+    binary is missing — we fail closed rather than run PR-controlled Lean unconfined."""
+
+
+def sandbox_enabled() -> bool:
+    """Whether Lean elaboration should run under the landrun (Landlock) sandbox.
+
+    Off by default (local dev, unit tests) so the suites and CLI runs behave
+    normally. The two-stage CI review job sets ``LEANREPO_SANDBOX=1`` (or
+    ``require``) for the secret-bearing phase, where every model-directed / PR-file
+    ``lake env lean`` must be confined."""
+    return os.environ.get("LEANREPO_SANDBOX", "").strip().lower() in ("1", "on", "require")
+
+
+def landrun_available() -> bool:
+    return shutil.which(_LANDRUN_BIN) is not None
+
+
+def sandbox_wrap(argv: List[str], write_dir: Optional[str] = None) -> List[str]:
+    """Prefix ``argv`` with a landrun (Landlock) confinement invocation when
+    sandboxing is enabled; return it unchanged when disabled.
+
+    Confinement: the filesystem is read-only except the Lake build dir (``write_dir``
+    / ``.lake``); no network flag is passed, so egress is denied by default (Landlock
+    is TCP-only on the current runner kernel — UDP/DNS is a known, accepted residual,
+    so the key is kept out of the phase by `scrubbed_env` + the key-file lifecycle, NOT
+    by egress). When sandboxing is enabled but landrun is absent, raise
+    `SandboxUnavailable` — PR-controlled Lean is never run unconfined once confinement
+    is requested. In local/unit runs (`LEANREPO_SANDBOX` unset) this is a structural
+    no-op returning ``argv`` unchanged.
+
+    PROVISIONAL flag set: the exact landrun flags below are validated against a real
+    landrun in the CI self-test built in S18-2b (with a positive control — an in-``.lake``
+    write must SUCCEED — and the escape probes minus the unsatisfiable UDP-deny). The
+    review-stage checkout must use ``persist-credentials: false`` so this ``--rox`` of
+    the working tree cannot expose ``.git/config`` credentials to elaboration."""
+    if not sandbox_enabled():
+        return list(argv)
+    if not landrun_available():
+        raise SandboxUnavailable(
+            f"LEANREPO_SANDBOX is set but '{_LANDRUN_BIN}' is not on PATH; "
+            "refusing to elaborate PR-controlled Lean unconfined."
+        )
+    cwd = os.getcwd()
+    wdir = write_dir or os.path.join(cwd, ".lake")
+    wrapper = [_LANDRUN_BIN]
+    for ro in ("/usr", "/bin", "/lib", "/lib64", "/etc"):
+        wrapper += ["--rox", ro]
+    wrapper += ["--rox", os.path.expanduser("~/.elan")]
+    wrapper += ["--rox", cwd]        # source tree readable
+    wrapper += ["--rwx", wdir]       # Lake build dir writable (more specific wins)
+    wrapper += ["--"]                # no network flag => egress denied by default
+    return wrapper + list(argv)
 
 
 def _run_lean(command: str, module: Optional[str], timeout: int) -> str:
@@ -60,7 +150,7 @@ def _run_lean(command: str, module: Optional[str], timeout: int) -> str:
     code = f"{prelude}{command}\n"
     try:
         result = subprocess.run(
-            ["lake", "env", "lean", "--stdin"],
+            sandbox_wrap(["lake", "env", "lean", "--stdin"]),
             input=code,
             capture_output=True,
             text=True,

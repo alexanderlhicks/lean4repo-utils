@@ -54,6 +54,29 @@ def _read_prompt_file(name: str) -> str:
 # Defined once here so the agents stay consistent instead of each redefining it.
 OPERATING_CONTRACT = _read_prompt_file("_operating_contract.md")
 
+# Structural sentinels proving the operating contract loaded *fully*. Emptiness alone
+# is not enough: a truncated or partially-written file is non-empty yet a weakened
+# injection defense. The sentinels span the file — an early section, mid-file, and a
+# phrase from the FINAL paragraph — so a truncation that keeps only the first sections
+# is caught. Missing any sentinel (or below the length floor) => not intact.
+_CONTRACT_SENTINELS = (
+    "## Untrusted input",
+    "## Grounding",
+    "## Confidence calibration",
+    "do not claim that the changed code",  # in the closing paragraph (~97% through the file)
+)
+_CONTRACT_MIN_LEN = 2000
+
+
+def _operating_contract_intact() -> bool:
+    """True iff the operating contract (the untrusted-input / injection-defense
+    posture injected ahead of every agent) loaded fully. Checks a length floor AND
+    required section sentinels, so a truncated/corrupted file — which would pass a
+    mere emptiness check — is caught. A review must not be posted when this is false:
+    the agents would have run without the full contract, so the result is untrusted."""
+    c = OPERATING_CONTRACT or ""
+    return len(c) >= _CONTRACT_MIN_LEN and all(s in c for s in _CONTRACT_SENTINELS)
+
 
 def _prompts_version() -> str:
     """Content fingerprint of the prompt set, stamped into every posted review so a
@@ -85,6 +108,36 @@ def _prompts_version() -> str:
         h.update(data)
         h.update(b"\x00")
     return h.hexdigest()[:12]
+
+
+def _load_provider_key() -> Optional[str]:
+    """Obtain the OpenRouter key and remove it from the process environment (S2 key
+    hygiene). Prefers a file-staged key (`API_KEY_FILE`): the workflow writes the key
+    to a file, this reads it once and UNLINKS it, so the key lives only as a local
+    variable during the model loop — never on disk or in `os.environ`, where an
+    elaboration-time exploit or a spawned child could reach it. Falls back to the
+    legacy `API_KEY` env var. Either way `API_KEY`/`API_KEY_FILE` are popped from the
+    environment before the model loop. Returns None if no key is configured."""
+    key = None
+    key_file = (os.environ.get("API_KEY_FILE") or "").strip()
+    if key_file:
+        try:
+            with open(key_file, "r") as f:
+                key = f.read().strip() or None
+        except OSError as e:
+            logging.error(f"API_KEY_FILE set but unreadable ({describe_exc(e)}).")
+        finally:
+            try:
+                os.unlink(key_file)  # the staged secret must not outlive this read
+            except OSError:
+                pass
+        os.environ.pop("API_KEY_FILE", None)
+    if not key:
+        key = (os.environ.get("API_KEY") or "").strip() or None
+    # The key is now held only as a local variable; ensure no *_KEY secret is left in
+    # the environment for the model loop or any spawned Lean child to read.
+    os.environ.pop("API_KEY", None)
+    return key
 
 # --- Pydantic Schemas for Multi-Agent Orchestration ---
 class ReferenceMappingEntry(BaseModel):
@@ -3503,10 +3556,11 @@ def main():
     if all_errors:
         logging.warning("Encountered non-critical errors. Review will proceed with partial context.")
 
-    # API_KEY holds the OpenRouter key.
-    api_key = os.getenv("API_KEY")
+    # Obtain the OpenRouter key from a file-staged secret (preferred) or the legacy
+    # API_KEY env var, and remove it from the environment before the model loop.
+    api_key = _load_provider_key()
     if not api_key:
-        logging.error("Error: API_KEY not set (expects an OpenRouter API key).")
+        logging.error("Error: no OpenRouter key configured (set API_KEY_FILE or API_KEY).")
         sys.exit(1)
 
     enable_web_search = args.enable_web_search or os.environ.get("ENABLE_WEB_SEARCH", "").lower() in ("1", "true", "yes")
@@ -3526,6 +3580,20 @@ def main():
         sys.exit(1)
     global run_health
     run_health = RunHealth()
+
+    # Fail LOUD (not silently degraded) if the injection-defense contract did not load
+    # intact: the agents would run without the untrusted-input posture, so no review may
+    # be posted. Checked here, before any spend, and surfaced as a visible NOT-reviewed
+    # comment rather than a silent red job.
+    if not _operating_contract_intact():
+        logging.error("Operating contract failed its integrity check (missing/empty/truncated); "
+                      "injection-defense posture unavailable — refusing to run a review.")
+        run_health.record_hard_failure()
+        print("### 🤖 AI Review\n\n" + _provenance_stamp()
+              + "> [!CAUTION]\n> **Review not performed.** The reviewer's operating contract "
+                "(untrusted-input / injection-defense posture) did not load intact, so the "
+                "automated review could not run safely. Treat this PR as **NOT reviewed**.\n")
+        return
 
     hard_budget = budget if budget_mode == "hard" else None
     provider = create_provider(api_key, enable_web_search=enable_web_search, budget=hard_budget)

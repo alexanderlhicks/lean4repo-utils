@@ -362,6 +362,59 @@ class TestExtractDiagnostics:
         result = extract_diagnostics(str(lean_file), timeout=5)
         assert isinstance(result, list)
 
+    def test_env_is_scrubbed(self, monkeypatch):
+        """Regression: extract_diagnostics elaborates an untrusted PR file, so it
+        must run under scrubbed_env() (secrets removed), not the inherited env."""
+        import lean_info_extractor as lie
+        from types import SimpleNamespace
+        monkeypatch.setenv("GITHUB_TOKEN", "secret")
+        monkeypatch.setenv("OR_AUTH", "secret2")   # novel name the old denylist missed
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return SimpleNamespace(stdout="", stderr="")
+        monkeypatch.setattr(lie.subprocess, "run", fake_run)
+        lie.extract_diagnostics("/some/Pr/File.lean", timeout=5)
+        assert captured["env"] is not None                 # env= was passed (not inherited)
+        assert "GITHUB_TOKEN" not in captured["env"]
+        assert "OR_AUTH" not in captured["env"]
+
+    def test_wrapped_by_sandbox_when_enabled(self, monkeypatch):
+        """Seam 3 (extract_diagnostics) must route through sandbox_wrap, not just
+        seam 1. With sandboxing enabled + landrun 'present', the argv is landrun-wrapped."""
+        import lean_info_extractor as lie
+        import lean_tools
+        from types import SimpleNamespace
+        monkeypatch.setenv("LEANREPO_SANDBOX", "1")
+        monkeypatch.setattr(lean_tools, "landrun_available", lambda: True)
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return SimpleNamespace(stdout="", stderr="")
+        monkeypatch.setattr(lie.subprocess, "run", fake_run)
+        lie.extract_diagnostics("/some/Pr/File.lean", timeout=5)
+        assert captured["cmd"][0] == "landrun" and captured["cmd"][-1] == "/some/Pr/File.lean"
+
+
+class TestRunLeanCommandSandbox:
+    def test_seam2_wrapped_when_enabled(self, monkeypatch):
+        """Seam 2 (run_lean_command) must route through sandbox_wrap too."""
+        import lean_info_extractor as lie
+        import lean_tools
+        from types import SimpleNamespace
+        monkeypatch.setenv("LEANREPO_SANDBOX", "1")
+        monkeypatch.setattr(lean_tools, "landrun_available", lambda: True)
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return SimpleNamespace(stdout="ok", stderr="", returncode=0)
+        monkeypatch.setattr(lie.subprocess, "run", fake_run)
+        lie.run_lean_command("Proj.M", "#check Nat", timeout=5)
+        assert captured["cmd"][0] == "landrun" and "--stdin" in captured["cmd"]
+
 
 class TestExtractInfoForFiles:
     @pytest.fixture(autouse=True)

@@ -24,11 +24,10 @@ from leanrepo_common.lean_utils import (
     scrub_line,
 )
 
-# Same secret denylist the reviewer's lean_tools subprocesses already use for
-# the identical threat (case-insensitive, matches anywhere in the name): a
-# narrower suffix-only list would leave DEPLOY_SECRET/DB_PASSWORD/lowercase
-# spellings visible to import-time Lean IO in the secret-bearing step.
-from lean_tools import scrubbed_env
+# The same env allowlist + landrun sandbox the reviewer's lean_tools subprocesses use
+# for the identical threat: only known-safe infra vars reach import-time Lean IO in the
+# secret-bearing step, and a secret under any unlisted name is dropped by default.
+from lean_tools import scrubbed_env, sandbox_wrap
 
 
 _DECL_RE = re.compile(
@@ -133,7 +132,7 @@ def run_lean_command(
     lean_code = f"import {module_name}\n{command}\n"
     try:
         result = subprocess.run(
-            ['lake', 'env', 'lean', '--stdin'],
+            sandbox_wrap(['lake', 'env', 'lean', '--stdin']),
             input=lean_code,
             capture_output=True,
             text=True,
@@ -233,11 +232,12 @@ def extract_diagnostics(file_path: str, timeout: int = 60) -> List[str]:
     Runs after lake build, so imports use cached oleans."""
     try:
         result = subprocess.run(
-            ['lake', 'env', 'lean', file_path],
+            sandbox_wrap(['lake', 'env', 'lean', file_path]),
             capture_output=True,
             text=True,
             errors='replace',
-            timeout=timeout
+            timeout=timeout,
+            env=scrubbed_env(),  # elaborates an untrusted PR file — must not inherit secrets
         )
         diagnostics = []
         for line in (result.stderr + result.stdout).splitlines():

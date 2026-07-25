@@ -26,6 +26,7 @@ from typing import Iterable, Optional
 from urllib.parse import urlparse
 
 from leanrepo_common.lean_utils import resolve_confined_path
+from lean_tools import scrubbed_env
 
 
 DECL_RE = re.compile(
@@ -403,6 +404,7 @@ def _pdf_statements(path: Path, warnings: list[str]) -> list[dict]:
             capture_output=True,
             text=True,
             errors="replace",
+            env=scrubbed_env(),  # parses an untrusted PR-supplied PDF — must not inherit secrets
             timeout=90,
             check=True,
         )
