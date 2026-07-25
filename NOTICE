@@ -28,9 +28,12 @@ are recorded in this file.
   header and a §4(b) change note. Files:
     * review/scope_guard.sh ← .github/workflows/pr-build.yml (the "Scope guard" step),
       extracted as a standalone script and hardened (any-depth allowlist, >3000-file
-      cap, explicit gh-error fail-close).
-  (Further S18-2b files — authorize.sh, pr-build.yml, review.yml, sandbox-build.sh —
-  land with their own headers and are added here as they are written.)
+      cap, explicit gh-error/SIGPIPE fail-close).
+    * review/authorize.sh ← .github/workflows/review.yml (the authorize step),
+      extracted as a standalone script and hardened (distinct exit codes for
+      API-error vs deny, 404-non-collaborator handling, env-not-inline injection safety).
+  (Further S18-2b files — pr-build.yml, review.yml, sandbox-build.sh — land with their
+  own headers and are added here as they are written.)
 
 - summary/ is ported from alexanderlhicks/lean-summary-workflow
   (https://github.com/alexanderlhicks/lean-summary-workflow), port base

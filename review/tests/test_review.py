@@ -3255,6 +3255,76 @@ class TestScopeGuard:
         assert "scope=out_of_scope" in out
 
 
+class TestAuthorize:
+    """authorize.sh (S18/S2) — behavioral: stub `gh` on PATH, assert the DISTINCT exit
+    codes (authorized 0 / denied 1 / fail-closed 2 / not-a-command 3 / usage 4). The key
+    property: an API failure (2) is never conflated with a legitimate denial (1), and the
+    gate never fails OPEN."""
+
+    def _script(self):
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "authorize.sh")
+
+    def _run(self, tmp_path, actor="alice", assoc=None, comment=None,
+             gh_out="", gh_err="", gh_rc=0, repo="o/r"):
+        import subprocess
+        binp = tmp_path / "bin"
+        binp.mkdir(exist_ok=True)
+        (binp / "gh").write_text(
+            '#!/usr/bin/env bash\n'
+            '[ -n "${STUB_OUT:-}" ] && printf "%s\\n" "$STUB_OUT"\n'
+            '[ -n "${STUB_ERR:-}" ] && printf "%s\\n" "$STUB_ERR" >&2\n'
+            'exit "${STUB_RC:-0}"\n'
+        )
+        (binp / "gh").chmod(0o755)
+        env = dict(os.environ, PATH=f"{binp}:{os.environ['PATH']}", GH_TOKEN="x",
+                   STUB_OUT=gh_out, STUB_ERR=gh_err, STUB_RC=str(gh_rc))
+        for k, v in (("ACTOR", actor), ("ASSOC", assoc), ("COMMENT_BODY", comment)):
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
+        return subprocess.run(["bash", self._script(), repo], env=env,
+                              capture_output=True, text=True).returncode
+
+    def test_authorized_by_write_permission(self, tmp_path):
+        assert self._run(tmp_path, gh_out="write") == 0
+
+    def test_denied_read_permission_no_association(self, tmp_path):
+        assert self._run(tmp_path, gh_out="read") == 1
+
+    def test_authorized_by_association_when_permission_low(self, tmp_path):
+        assert self._run(tmp_path, gh_out="read", assoc="MEMBER") == 0
+
+    def test_404_non_collaborator_is_denied_not_failclosed(self, tmp_path):
+        assert self._run(tmp_path, gh_err="gh: HTTP 404 Not Found", gh_rc=1) == 1
+
+    def test_404_with_privileged_association_authorized(self, tmp_path):
+        assert self._run(tmp_path, gh_err="HTTP 404", gh_rc=1, assoc="OWNER") == 0
+
+    def test_network_failure_fails_closed_distinctly(self, tmp_path):
+        # The finding the gate raised: an API failure must be exit 2 (fail-closed),
+        # NEVER conflated with a legitimate denial (1) and NEVER authorized.
+        assert self._run(tmp_path, gh_err="dial tcp: i/o timeout", gh_rc=1) == 2
+
+    def test_network_failure_rescued_by_association(self, tmp_path):
+        assert self._run(tmp_path, gh_err="dial tcp: i/o timeout", gh_rc=1, assoc="MEMBER") == 0
+
+    def test_not_a_review_command_is_noop(self, tmp_path):
+        assert self._run(tmp_path, gh_out="write", comment="please /review this PR") == 3
+
+    def test_exact_review_line_proceeds(self, tmp_path):
+        assert self._run(tmp_path, gh_out="write", comment="ok\n/review\nthanks") == 0
+
+    def test_review_only_as_prefix_does_not_trigger(self, tmp_path):
+        assert self._run(tmp_path, gh_out="write", comment="/reviewer") == 3
+
+    def test_usage_error_on_injection_actor(self, tmp_path):
+        assert self._run(tmp_path, actor="alice;rm -rf /") == 4
+
+    def test_usage_error_on_empty_actor(self, tmp_path):
+        assert self._run(tmp_path, actor="") == 4
+
+
 class TestReviewLabelling:
     """Guided/unguided header + provenance stamp (reviewed-at commit + prompts version)."""
 
