@@ -3163,6 +3163,73 @@ class TestS1ResolveScript:
         assert "head_sha=" not in output
 
 
+class TestScopeGuard:
+    """scope_guard.sh (S18/S2) — behavioral: stub `gh` on PATH and drive the script.
+    Fail-closed allowlist over the trusted GitHub file list; guard at any depth."""
+
+    def _script(self):
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scope_guard.sh")
+
+    def _run(self, tmp_path, files, repo="o/r", pr="42", src="MyLib", gh_exit=0):
+        import subprocess
+        import shlex
+        binp = tmp_path / "bin"
+        binp.mkdir(exist_ok=True)
+        body = "#!/usr/bin/env bash\n"
+        for line in files:
+            body += f"printf '%s\\n' {shlex.quote(line)}\n"
+        body += f"exit {gh_exit}\n"
+        (binp / "gh").write_text(body)
+        (binp / "gh").chmod(0o755)
+        out = tmp_path / "gh_output.txt"
+        env = dict(os.environ, PATH=f"{binp}:{os.environ['PATH']}", GITHUB_OUTPUT=str(out), GH_TOKEN="x")
+        proc = subprocess.run(["bash", self._script(), repo, pr, src], env=env, capture_output=True, text=True)
+        return proc.returncode, (out.read_text() if out.exists() else "")
+
+    def test_in_scope_src_only(self, tmp_path):
+        rc, out = self._run(tmp_path, ["MyLib/A.lean", "MyLib/B.lean"])
+        assert rc == 0 and "scope=in_scope" in out
+
+    def test_root_lean_in_scope(self, tmp_path):
+        _, out = self._run(tmp_path, ["MyLib.lean"])
+        assert "scope=in_scope" in out
+
+    def test_out_of_scope_lakefile(self, tmp_path):
+        _, out = self._run(tmp_path, ["MyLib/A.lean", "lakefile.toml"])
+        assert "scope=out_of_scope" in out
+
+    def test_out_of_scope_nested_lakefile(self, tmp_path):
+        # A sub-package build config at any depth is NOT on the allowlist -> human.
+        _, out = self._run(tmp_path, ["MyLib/A.lean", "sub/pkg/lakefile.lean"])
+        assert "scope=out_of_scope" in out
+
+    def test_out_of_scope_dotgithub(self, tmp_path):
+        _, out = self._run(tmp_path, ["MyLib/A.lean", ".github/workflows/x.yml"])
+        assert "scope=out_of_scope" in out
+
+    def test_bump_pins_only(self, tmp_path):
+        _, out = self._run(tmp_path, ["lean-toolchain", "lake-manifest.json"])
+        assert "scope=bump" in out
+
+    def test_fail_closed_on_gh_error(self, tmp_path):
+        # The critical guarantee: a failing gh api (404/auth/network) that still prints
+        # partial stdout must NEVER yield in_scope — it routes to a human.
+        _, out = self._run(tmp_path, ["MyLib/A.lean"], gh_exit=1)
+        assert "scope=in_scope" not in out and "scope=infra" in out
+
+    def test_fail_closed_empty_list(self, tmp_path):
+        _, out = self._run(tmp_path, [])
+        assert "scope=infra" in out
+
+    def test_nonzero_on_non_numeric_pr(self, tmp_path):
+        rc, out = self._run(tmp_path, ["MyLib/A.lean"], pr="4x2")
+        assert rc == 2 and out == ""                 # malformed wiring -> exit, write nothing
+
+    def test_nonzero_on_regex_unsafe_src(self, tmp_path):
+        rc, out = self._run(tmp_path, ["MyLib/A.lean"], src="a|b")
+        assert rc == 2 and "scope=" not in out       # <src> can't inject regex alternation
+
+
 class TestReviewLabelling:
     """Guided/unguided header + provenance stamp (reviewed-at commit + prompts version)."""
 

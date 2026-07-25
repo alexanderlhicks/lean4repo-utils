@@ -19,6 +19,19 @@ are recorded in this file.
       api-design.md, reuse.md, proof-quality.md respectively.
   Per-item provenance is recorded inline in those files.
 
+- review/ two-stage CI security scripts and workflow templates (Session 18) are
+  adapted from TauCetiProject/TauCeti
+  (https://github.com/TauCetiProject/TauCeti) at commit
+  92c79e5e0a618f8c5c2b9909be1ce50f6891dde7 (2026-07-23), licensed Apache-2.0. That
+  repo declares no copyright holder and ships no NOTICE (so there is no Apache §4(d)
+  content to propagate); the adapted files carry an in-file `Adapted from …@92c79e5`
+  header and a §4(b) change note. Files:
+    * review/scope_guard.sh ← .github/workflows/pr-build.yml (the "Scope guard" step),
+      extracted as a standalone script and hardened (any-depth allowlist, >3000-file
+      cap, explicit gh-error fail-close).
+  (Further S18-2b files — authorize.sh, pr-build.yml, review.yml, sandbox-build.sh —
+  land with their own headers and are added here as they are written.)
+
 - summary/ is ported from alexanderlhicks/lean-summary-workflow
   (https://github.com/alexanderlhicks/lean-summary-workflow), port base
   commit 871a07c12ab7f8d0ae555d54efe4d1c05ec0833d (2026-06-30). That
