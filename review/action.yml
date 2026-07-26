@@ -182,17 +182,25 @@ runs:
         lint: ${{ inputs.lint }}
 
     # When the build below will be landrun-confined (LEANREPO_SANDBOX set, i.e. the
-    # two-stage secret-bearing review job), pre-fetch deps WITH network first, since the
-    # sandboxed build runs offline. A NO-OP when LEANREPO_SANDBOX is unset — existing
-    # deployments build exactly as before.
-    - name: Warm Lean deps for the offline sandboxed build (no-op unless sandboxing)
+    # two-stage secret-bearing review job), prove Landlock actually ENFORCES before any
+    # PR code runs — so the secret-bearing stage fails closed on a non-enforcing landrun,
+    # not just an absent binary. A NO-OP when LEANREPO_SANDBOX is unset.
+    #
+    # NOTE (S18b rollout): the sandboxed build runs OFFLINE, so the PR's Lake dependencies
+    # must already be present. We deliberately do NOT pre-fetch them here: fetching needs
+    # network and elaborates the (untrusted) PR-head lakefile, which — with the provider
+    # key staged on disk — would leak it. Dep pre-population for the sandboxed review stage
+    # (trusted pre-fetch, or consuming pr-build's build) is a caller/rollout concern; a
+    # missing dep makes the confined build fail closed (no leak), never fall through.
+    - name: Sandbox self-test — prove landrun confinement (no-op unless sandboxing)
       shell: bash
       run: |
         set -euo pipefail
-        case "$(printf '%s' "${LEANREPO_SANDBOX:-}" | tr '[:upper:]' '[:lower:]')" in
-          1|true|yes|on|require|enabled)
-            ( lake exe cache get ) || echo "::notice::lake cache get unavailable/missed — the sandboxed build must resolve deps offline" ;;
+        case "$(printf '%s' "${LEANREPO_SANDBOX:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+          ''|0|false|no|off|disabled) exit 0 ;;
         esac
+        mkdir -p "$PWD/.lake"
+        bash "${{ github.action_path }}/scripts/sandbox-selftest.sh" "$PWD/.lake"
 
     - name: Build Lean project with captured diagnostics
       id: lean_build

@@ -37,9 +37,15 @@ fi
 if [ -z "$wdir" ]; then echo "::error::landrun-wrap: empty writable dir" >&2; exit 2; fi
 mkdir -p "$wdir"
 
+# Redirect TMPDIR into the one writable dir: Landlock is default-deny, so lean/leanc/clang
+# temp writes to the default /tmp (or $RUNNER_TEMP) would hit EPERM and break the build.
+# The var must be PASSED IN (--env TMPDIR); the mount ($wdir, --rwx) already covers it.
+export TMPDIR="$wdir/tmp"
+mkdir -p "$TMPDIR"
+
 exec landrun \
   --rox /usr --rox /bin --rox /lib --rox /lib64 --rox /etc \
   --rw /dev/null --rox /dev/zero --rox /dev/urandom --rox /dev/random \
   --rox "$HOME/.elan" --rox "$PWD" --rwx "$wdir" \
-  --env PATH --env HOME --env CI --env LAKE_NO_CACHE \
+  --env PATH --env HOME --env CI --env LAKE_NO_CACHE --env TMPDIR \
   -- "$@"
