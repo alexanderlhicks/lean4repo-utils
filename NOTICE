@@ -32,8 +32,16 @@ are recorded in this file.
     * review/authorize.sh ← .github/workflows/review.yml (the authorize step),
       extracted as a standalone script and hardened (distinct exit codes for
       API-error vs deny, 404-non-collaborator handling, env-not-inline injection safety).
-  (Further S18-2b files — pr-build.yml, review.yml, sandbox-build.sh — land with their
-  own headers and are added here as they are written.)
+    * review/pr-build.yml ← .github/workflows/pr-build.yml (generalised two-stage
+      build template: pull_request_target overlay + scope guard + landrun + status handoff).
+    * review/review.yml ← .github/workflows/review.yml (generalised privileged-review
+      template: workflow_run/issue_comment, authorize, secrets only after build-status pass).
+    * review/scripts/sandbox-build.sh ← scripts/sandbox-build.sh (generalised confined
+      build; project-specific audits left to the adopting repo).
+    * review/scripts/sandbox-selftest.sh ← the inline landrun self-test in pr-build.yml
+      (extracted + hardened: positive control, no unsatisfiable UDP-deny, fail-closed host).
+  landrun (github.com/Zouuup/landrun, MIT) is used as a pinned + SHA256-verified binary,
+  not vendored.
 
 - summary/ is ported from alexanderlhicks/lean-summary-workflow
   (https://github.com/alexanderlhicks/lean-summary-workflow), port base

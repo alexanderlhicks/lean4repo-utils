@@ -1,0 +1,148 @@
+# TEMPLATE — Stage 1 of the two-stage outside-PR review split (S18/S2).
+# Adapted from TauCetiProject/TauCeti@92c79e5 .github/workflows/pr-build.yml (Apache-2.0);
+# generalised for any downstream Lean library. See the review action's NOTICE.
+#
+# Purpose: build an UNTRUSTED fork PR's Lean under landrun with NO secrets and NO write
+# token, then post a commit STATUS the trusted review workflow (review.yml) keys on — a
+# status-only handoff (no artifacts cross the trust boundary). A PR that touches anything
+# outside <SRC_DIR>/ + Lake pins routes to a human (scope_guard.sh, fail-closed).
+#
+# To adopt: set SRC_DIR to your library's source dir; pin ACTION_REPO/ACTION_REF to the
+# review action release that provides the guard + sandbox scripts; pin the action SHAs.
+name: PR build (untrusted, sandboxed)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+# The default GITHUB_TOKEN is dropped to the minimum: read the code, post a status.
+# Nothing here can comment, merge, or read secrets.
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: pr-build-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  SRC_DIR: MyLib                       # <-- your library source dir (the ONLY dir overlaid from the PR)
+  ACTION_REPO: OWNER/lean4repo-utils   # <-- the review action repo providing the guard/sandbox scripts
+  ACTION_REF: v0.5                     # <-- pin to a release tag or SHA
+  LANDRUN_VER: v0.1.14
+  LANDRUN_SHA256: 645178e3239cd33760560834e50efea0864183a2a8a82faf199760dffee6dd71
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Trusted scripts (scope_guard.sh, scripts/sandbox-*.sh) come from the pinned
+      # review action, NOT the PR — so untrusted code can never alter them.
+      - name: Checkout the review action (trusted, pinned)
+        uses: actions/checkout@v4    # pin to a SHA in production
+        with: { repository: "${{ env.ACTION_REPO }}", ref: "${{ env.ACTION_REF }}", path: rv, persist-credentials: false }
+
+      - name: Checkout trusted base (credential-free)
+        uses: actions/checkout@v4    # pin to a SHA in production
+        with: { ref: "${{ github.event.pull_request.base.ref }}", path: base, persist-credentials: false }
+
+      - name: Checkout PR head into a SEPARATE dir (credential-free)
+        uses: actions/checkout@v4    # pin to a SHA in production
+        with:
+          repository: "${{ github.event.pull_request.head.repo.full_name }}"
+          ref: "${{ github.event.pull_request.head.sha }}"
+          path: pr
+          persist-credentials: false
+
+      - name: Scope guard (fail-closed; only <SRC_DIR>/ + Lake pins may auto-build)
+        id: scope
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: bash rv/review/scope_guard.sh "${{ github.repository }}" "${{ github.event.pull_request.number }}" "$SRC_DIR"
+
+      - name: Overlay ONLY the PR's <SRC_DIR>/ onto the trusted base
+        if: steps.scope.outputs.scope == 'in_scope' || steps.scope.outputs.scope == 'bump'
+        run: |
+          set -euo pipefail
+          # Reject symlinks in the overlay: a symlink whose target escapes the overlay is
+          # invisible to the path-based scope guard (mode 120000). Route to a human.
+          # No pipe: `find | grep -q` would fail OPEN under pipefail (grep closes the pipe
+          # on the first hit, find dies with SIGPIPE 141, if-false, symlink overlaid) —
+          # the exact bug fixed in scope_guard.sh. Capture and test for non-empty instead.
+          if [ -n "$(find "pr/$SRC_DIR" -type l -print)" ]; then
+            echo "::error::PR overlay contains a symlink — routing to human"; exit 1
+          fi
+          rm -rf "base/$SRC_DIR"
+          cp -a "pr/$SRC_DIR" "base/$SRC_DIR"
+
+      - name: Install elan (trusted)
+        if: steps.scope.outputs.scope == 'in_scope' || steps.scope.outputs.scope == 'bump'
+        run: |
+          set -euo pipefail
+          curl -sSfL https://elan.lean-lang.org/elan-init.sh -o elan-init.sh
+          chmod +x elan-init.sh && ./elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Install landrun (pinned + checksum)
+        if: steps.scope.outputs.scope == 'in_scope' || steps.scope.outputs.scope == 'bump'
+        run: |
+          set -euo pipefail
+          curl -sSL -H "Accept: application/octet-stream" \
+            "https://github.com/Zouuup/landrun/releases/download/${LANDRUN_VER}/landrun-linux-amd64" -o landrun
+          echo "${LANDRUN_SHA256}  landrun" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"; install -m 0755 landrun "$HOME/.local/bin/landrun"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Warm toolchain + Lake deps (trusted config, network, NO token; no PR code)
+        if: steps.scope.outputs.scope == 'in_scope' || steps.scope.outputs.scope == 'bump'
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.elan/bin:$PATH"
+          # elan was installed with --default-toolchain none and ~/.elan is mounted
+          # READ-ONLY in the sandbox, so the pinned toolchain must be present FIRST or the
+          # offline landrun build cannot even start.
+          elan toolchain install "$(cat base/lean-toolchain)"
+          # Fetch dependencies into base/.lake from the TRUSTED base config (lakefile /
+          # manifest are base-trusted; no PR code runs and no token is in env). Mathlib-
+          # based projects use the Lake cache; tailor this line to your project's deps.
+          ( cd base && lake exe cache get ) || echo "::notice::lake cache get unavailable/missed — deps must already resolve offline for the sandboxed build"
+          mkdir -p base/.lake/tmp
+
+      - name: Sandbox self-test — prove confinement BEFORE any PR code
+        if: steps.scope.outputs.scope == 'in_scope' || steps.scope.outputs.scope == 'bump'
+        run: |
+          set -euo pipefail
+          mkdir -p base/.lake
+          # Uses the TRUSTED base scripts too (sandbox-build.sh from the action, copied in
+          # so the fixed landrun one-liner can `cd base && bash scripts/sandbox-build.sh`).
+          mkdir -p base/scripts && cp rv/review/scripts/sandbox-build.sh base/scripts/sandbox-build.sh
+          bash rv/review/scripts/sandbox-selftest.sh "$PWD/base/.lake"
+
+      - name: Build overlaid source under landrun (offline, no secrets)
+        id: build
+        if: steps.scope.outputs.scope == 'in_scope' || steps.scope.outputs.scope == 'bump'
+        env: { LAKE_NO_CACHE: "true" }
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$HOME/.elan/bin:$PATH"
+          # Fixed, comment-free one-liner: all prose lives in the trusted script.
+          landrun --rox /usr --rox /etc --rox /bin --rox /lib --rox /lib64 \
+            --rw /dev/null --rox /dev/zero --rox /dev/urandom --rox /dev/random \
+            --rox "$HOME/.elan" --rox "$PWD/base" --rwx "$PWD/base/.lake" \
+            --env PATH --env HOME --env CI --env LAKE_NO_CACHE \
+            -- bash -euxo pipefail -c 'cd base && exec bash scripts/sandbox-build.sh'
+
+      - name: Post the build status to the PR head commit (the handoff signal)
+        if: always()
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          set -euo pipefail
+          scope='${{ steps.scope.outputs.scope }}'
+          if [ "$scope" = out_of_scope ] || [ "$scope" = infra ]; then
+            state=failure; desc="routed to human ($scope)"
+          elif [ '${{ steps.build.outcome }}' = success ]; then
+            state=success; desc="sandboxed build passed"
+          else
+            state=failure; desc="sandboxed build failed"
+          fi
+          gh api -X POST "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+            -f state="$state" -f context="sandboxed-build" -f description="$desc" >/dev/null

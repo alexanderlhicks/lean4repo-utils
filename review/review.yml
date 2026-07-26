@@ -1,0 +1,119 @@
+# TEMPLATE — Stage 2 of the two-stage outside-PR review split (S18/S2): the TRUSTED,
+# privileged review. Adapted from TauCetiProject/TauCeti@92c79e5 .github/workflows/review.yml
+# (Apache-2.0). See the review action's NOTICE.
+#
+# Fires after the sandboxed build succeeds (workflow_run) or on an AUTHORIZED /review
+# comment. Secrets enter ONLY the `review` job, ONLY after the untrusted code has already
+# built and passed in stage 1 — so the model API key and write token are never present
+# while untrusted PR Lean is being built. The review action itself (2a-hardened) sandboxes
+# its Lean seams (LEANREPO_SANDBOX) and keeps the key out of os.environ (API_KEY_FILE).
+name: Review
+
+on:
+  workflow_run:
+    workflows: ["PR build (untrusted, sandboxed)"]
+    types: [completed]
+  issue_comment:
+    types: [created]
+
+# Minimal default token; the review job additionally receives the configured secrets.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: review-${{ github.event.workflow_run.head_sha || github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  ACTION_REPO: OWNER/lean4repo-utils   # <-- the review action repo (guard/authorize scripts)
+  ACTION_REF: v0.5                     # <-- pin to a release tag or SHA
+  LANDRUN_VER: v0.1.14
+  LANDRUN_SHA256: 645178e3239cd33760560834e50efea0864183a2a8a82faf199760dffee6dd71
+
+jobs:
+  # Gate + resolve the PR number. NO secrets here — only the default read token.
+  authorize:
+    runs-on: ubuntu-latest
+    if: >
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+    outputs:
+      pr: ${{ steps.gate.outputs.pr }}
+    steps:
+      - name: Checkout the review action (trusted, pinned) for authorize.sh
+        uses: actions/checkout@v4    # pin to a SHA in production
+        with: { repository: "${{ env.ACTION_REPO }}", ref: "${{ env.ACTION_REF }}", path: rv, persist-credentials: false }
+
+      - name: Authorize + resolve PR (fail-closed; distinct exit codes)
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Passed as DATA via env (never interpolated into the script body).
+          ACTOR: ${{ github.actor }}
+          ASSOC: ${{ github.event.comment.author_association }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -uo pipefail
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            # /review chatops: exact-line match + write+ permission. A no-build re-dispatch
+            # — this job runs no PR code; the review job below reviews the resolved head.
+            set +e; bash rv/review/authorize.sh "${{ github.repository }}"; rc=$?; set -e
+            case "$rc" in
+              0) echo "pr=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT" ;;
+              3) echo "::notice::not an exact /review command; skipping" ;;
+              *) echo "::notice::/review not authorized (rc=$rc); skipping" ;;
+            esac
+          else
+            # workflow_run path. The workflow CONCLUSION is NOT sufficient: a guard-routed
+            # (out_of_scope/infra) PR skips every build step yet the workflow still
+            # concludes success. Require the sandboxed-build COMMIT STATUS on the trusted
+            # head_sha to be 'success' before any privileged (secret-bearing) review runs.
+            head='${{ github.event.workflow_run.head_sha }}'
+            st=$(gh api "repos/${{ github.repository }}/commits/$head/statuses" --jq 'map(select(.context=="sandboxed-build"))[0].state // empty')
+            if [ "$st" != "success" ]; then
+              echo "::notice::sandboxed-build status is '${st:-none}' (not success) — skipping review"; exit 0
+            fi
+            # Derive the PR from the TRUSTED head_sha — workflow_run.pull_requests[] is
+            # EMPTY for fork-originated runs.
+            pr="${{ github.event.workflow_run.pull_requests[0].number }}"
+            if [ -z "$pr" ]; then
+              pr=$(gh api "repos/${{ github.repository }}/commits/$head/pulls" --jq '.[0].number // empty')
+            fi
+            if [ -n "$pr" ]; then echo "pr=$pr" >> "$GITHUB_OUTPUT"; else echo "::warning::could not resolve PR from head_sha"; fi
+          fi
+
+  # The privileged review. Secrets enter ONLY here, ONLY after authorize succeeded.
+  review:
+    needs: authorize
+    if: needs.authorize.outputs.pr != ''
+    runs-on: ubuntu-latest
+    # JOB-level env so the composite action's internal steps inherit it.
+    env:
+      LEANREPO_SANDBOX: "1"                       # require landrun confinement (fail-closed)
+      API_KEY_FILE: ${{ runner.temp }}/or.key     # review.py reads + unlinks this; key never in os.environ
+    steps:
+      - name: Stage the provider key to a file (kept out of the review's environment)
+        env:
+          OR_KEY: ${{ secrets.OPENROUTER_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null "$API_KEY_FILE"
+          printf '%s' "$OR_KEY" > "$API_KEY_FILE"
+
+      # LEANREPO_SANDBOX=1 makes review.py's Lean seams FAIL CLOSED without landrun, so it
+      # must be installed here (this job elaborates untrusted PR Lean while holding the key).
+      - name: Install landrun (pinned + checksum) so the sandbox can confine, not fail closed
+        run: |
+          set -euo pipefail
+          curl -sSL -H "Accept: application/octet-stream" \
+            "https://github.com/Zouuup/landrun/releases/download/${LANDRUN_VER}/landrun-linux-amd64" -o landrun
+          echo "${LANDRUN_SHA256}  landrun" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"; install -m 0755 landrun "$HOME/.local/bin/landrun"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run the review action (pinned)
+        uses: OWNER/lean4repo-utils/review@v0.5    # <-- pin to a SHA in production
+        with:
+          pr_number: ${{ needs.authorize.outputs.pr }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
