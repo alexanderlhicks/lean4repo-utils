@@ -122,6 +122,17 @@ def landrun_available() -> bool:
     return shutil.which(_LANDRUN_BIN) is not None
 
 
+def _forwarded_env_names() -> List[str]:
+    """Infra/toolchain env var names to forward into the landrun sandbox. landrun gives
+    the confined child ONLY the vars named with ``--env``, so without these the child
+    cannot even locate the Lean toolchain (PATH/HOME/ELAN_*/LEAN_*/LAKE_*/...). Same
+    allowlist as `scrubbed_env`, minus any secret-looking name."""
+    names = [n for n in _ENV_ALLOWLIST if n in os.environ and not _SECRET_ENV_RE.search(n)]
+    names += [n for n in os.environ
+              if n.startswith(_ENV_ALLOWLIST_PREFIXES) and not _SECRET_ENV_RE.search(n)]
+    return sorted(set(names))
+
+
 def sandbox_wrap(argv: List[str], write_dir: Optional[str] = None) -> List[str]:
     """Prefix ``argv`` with a landrun (Landlock) confinement invocation when
     sandboxing is enabled; return it unchanged when disabled.
@@ -135,11 +146,14 @@ def sandbox_wrap(argv: List[str], write_dir: Optional[str] = None) -> List[str]:
     is requested. In local/unit runs (`LEANREPO_SANDBOX` unset) this is a structural
     no-op returning ``argv`` unchanged.
 
-    PROVISIONAL flag set: the exact landrun flags below are validated against a real
-    landrun in the CI self-test built in S18-2b (with a positive control — an in-``.lake``
-    write must SUCCEED — and the escape probes minus the unsatisfiable UDP-deny). The
-    review-stage checkout must use ``persist-credentials: false`` so this ``--rox`` of
-    the working tree cannot expose ``.git/config`` credentials to elaboration."""
+    landrun forwards ONLY the env vars named with ``--env`` and confines writes to the
+    one ``--rwx`` mount, so this (a) forwards the infra/toolchain vars the child needs to
+    run, and (b) sets ``TMPDIR`` to a path under ``write_dir`` inside the sandbox (a
+    default ``/tmp`` would hit Landlock EPERM). Kept in sync with ``scripts/landrun-wrap.sh``
+    (the shell counterpart used for action.yml's ``lake build``). The exact flags are
+    validated against a real landrun by the S18-2b CI self-test; the review-stage checkout
+    must use ``persist-credentials: false`` so this ``--rox`` of the working tree cannot
+    expose ``.git/config`` credentials to elaboration."""
     if not sandbox_enabled():
         return list(argv)
     if not landrun_available():
@@ -155,7 +169,14 @@ def sandbox_wrap(argv: List[str], write_dir: Optional[str] = None) -> List[str]:
     wrapper += ["--rox", os.path.expanduser("~/.elan")]
     wrapper += ["--rox", cwd]        # source tree readable
     wrapper += ["--rwx", wdir]       # Lake build dir writable (more specific wins)
-    wrapper += ["--"]                # no network flag => egress denied by default
+    for name in _forwarded_env_names():
+        wrapper += ["--env", name]   # landrun forwards ONLY named vars to the child
+    # No network flag => egress denied by default. Set TMPDIR under wdir (the only
+    # writable mount) INSIDE the sandbox; wdir is passed as $1 (not embedded in the
+    # script) so a path with shell metacharacters cannot break out.
+    wrapper += ["--", "bash", "-c",
+                'export TMPDIR="$1/tmp"; mkdir -p "$TMPDIR"; shift; exec "$@"',
+                "landrun-wrap", wdir]
     return wrapper + list(argv)
 
 

@@ -66,13 +66,19 @@ class TestSandbox:
 
     def test_structure_when_enabled_and_available(self, monkeypatch):
         monkeypatch.setenv("LEANREPO_SANDBOX", "1")
+        monkeypatch.setenv("PATH", "/usr/bin")               # a forwarded toolchain var
         monkeypatch.setattr(lean_tools, "landrun_available", lambda: True)
         wrapped = lean_tools.sandbox_wrap(["lake", "env", "lean", "--stdin"], write_dir="/w/.lake")
         assert wrapped[0] == "landrun"
         assert "--rwx" in wrapped and "/w/.lake" in wrapped   # build dir writable
         assert "--net" not in wrapped                         # egress denied by default
-        i = wrapped.index("--")                               # command follows the separator
-        assert wrapped[i + 1:] == ["lake", "env", "lean", "--stdin"]
+        assert "--env" in wrapped and "PATH" in wrapped       # toolchain env forwarded to the child
+        assert wrapped[-4:] == ["lake", "env", "lean", "--stdin"]   # original command preserved as the tail
+        # a bash shim sets TMPDIR under the writable dir INSIDE the sandbox (a default
+        # /tmp would hit Landlock EPERM) and passes wdir as $1, not embedded in the script.
+        assert "bash" in wrapped and "-c" in wrapped
+        script = wrapped[wrapped.index("-c") + 1]
+        assert "TMPDIR" in script and 'exec "$@"' in script
 
     def test_enabled_accepts_common_truthy_values(self, monkeypatch):
         for v in ("1", "true", "yes", "on", "require", "enabled", "TRUE"):
