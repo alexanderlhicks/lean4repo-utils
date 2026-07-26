@@ -33,12 +33,22 @@ Read this before wiring the action on a public repository.
 | `pull_request_target` | **Yes** | base workflow, but a checkout is the PR head |
 | `issue_comment` | **Yes** | base workflow, in the base repo context |
 
-**Why review is ChatOps-only.** The review pipeline *builds and elaborates the PR's Lean code* (`lake build`, and — with `lean_tools: true` — model-directed `lake env lean`). That is arbitrary code execution. On `issue_comment` the run holds the `OPENROUTER_KEY` and a write token, so building an outside contributor's PR would run attacker-controlled Lean/lakefile code next to those credentials (cf. CVE-2025-47928, CVSS 9.1). The action ships defense-in-depth for this (a resolved-PR-head checkout with `persist-credentials: false`, a scrubbed child env for model-directed Lean, path confinement on every PR-controlled read), but the **two-stage secret-free build split (S2) and full `lean_tools` sandbox (S7) are not yet live**. Until they are:
+**Why review is ChatOps-only.** The review pipeline *builds and elaborates the PR's Lean code* (`lake build`, and — with `lean_tools: true` — model-directed `lake env lean`). That is arbitrary code execution. On `issue_comment` the run holds the `OPENROUTER_KEY` and a write token, so building an outside contributor's PR would run attacker-controlled Lean/lakefile code next to those credentials (cf. CVE-2025-47928, CVSS 9.1). The action ships defense-in-depth for this (a resolved-PR-head checkout with `persist-credentials: false`, a scrubbed child env for model-directed Lean, path confinement on every PR-controlled read). The **two-stage secret-free build split (S2) and the landrun `lean_tools`/build sandbox (S7) now ship as opt-in templates** (see [Two-stage split for outside-PR review](#two-stage-split-for-outside-pr-review-opt-in) below), but are **not yet validated in live CI**. Until you adopt the two-stage workflow:
 
 - **Restrict the trigger to repo members** (`OWNER`/`MEMBER`/`COLLABORATOR`) — the template below does this. The **comment author**, not the PR author, is the trust boundary: a maintainer is expected to look at a fork PR's diff before typing `/review` on it.
-- **Do not** wire review as an auto-run on `pull_request`/`pull_request_target` for a public repo, and **do not** drop the author gate, until S2/S7 land.
+- **Do not** wire review as an auto-run on `pull_request`/`pull_request_target` for a public repo, and **do not** drop the author gate, until you adopt the two-stage split.
 
 **Summary is different and safe on every PR** (see the [summary action](../summary/README.md)): it never builds or executes PR code — it reads the diff and committed source as data and reads its policy file from the base ref (S4) — so it runs under `pull_request_target` on every push.
+
+### Two-stage split for outside-PR review (opt-in)
+
+`review/` now ships the mechanism to review **untrusted fork PRs** safely, as templates a downstream repo adopts (`pr-build.yml`, `review.yml`, and the guard/sandbox scripts). These templates are new and **not yet validated in live CI**; the per-repo caller migration is tracked separately. The design:
+
+- **Stage 1 — untrusted, sandboxed build (`pr-build.yml`).** Runs on `pull_request_target` with **no secrets** and only `contents: read` + `statuses: write`. It checks out the trusted base and the PR head into separate credential-free dirs, overlays **only** the PR's source dir onto the base — a fail-closed **scope guard** (`scope_guard.sh`) routes any PR touching the lakefile / toolchain / `scripts/` / `.github/`, at any depth, to a human — builds under **landrun** (a Landlock sandbox: offline, writes confined to `.lake`, proven to enforce by a self-test *before* any PR code runs), and posts a commit **status**. No build artifacts cross the trust boundary; only the status does.
+- **Stage 2 — trusted review (`review.yml`).** Fires on `workflow_run` **after** the build's commit status is `success` (never merely on the workflow *concluding* — a guard-routed PR skips the build yet the workflow still concludes success), or on an authorized `/review` comment (`authorize.sh` — repo-permission API with an `author_association` fallback and **distinct** exit codes so an API error is never mistaken for a grant). Secrets enter **only** here, only after the untrusted build passed. The provider key is staged to a **file** (`API_KEY_FILE`) that `review.py` reads and **unlinks before the model loop**, so no `*_KEY`/`*_TOKEN` remains in the environment; and with `LEANREPO_SANDBOX=1` the action's *own* `lake build` and every model-directed `lake env lean` seam run under landrun too (the review stage re-builds the PR code to ground the reviewer, so that build must be confined as well).
+- **A fork build is NOT "trusted".** The `/review` authorization gate governs **cost and identity** (who may spend the budget), not code safety — code safety is the sandbox's job.
+
+Key protection rests on **env hygiene + the key-file lifecycle + filesystem confinement**, not on network egress (landrun's Landlock is TCP-only on current runners, an accepted residual). The sandboxed build is offline, so an adopting repo pre-populates dependencies by trusted means. Until you adopt this two-stage workflow, keep the member-gated ChatOps posture below.
 
 ### Recommended: ChatOps Workflow (`/review`)
 
@@ -243,9 +253,11 @@ Tune to your project's characteristics:
 > **Actions logs are public** on public repos: exception detail (class + status +
 > truncated message) goes to the log, never into the PR comment. **Security:** the
 > reviewer's `lean_tools` execute model-directed Lean IO in the workspace, and the
-> Lean build step runs the PR branch's `lakefile` code. Until full `lean_tools`
-> sandboxing lands (tracked separately), do **not** wire this action under
-> `pull_request_target` with a privileged token on an untrusted-fork PR.
+> Lean build step runs the PR branch's `lakefile` code. Do **not** wire this
+> composite action *directly* under `pull_request_target` with a privileged token
+> on an untrusted-fork PR — use the opt-in [two-stage split](#two-stage-split-for-outside-pr-review-opt-in)
+> (which sandboxes the build under landrun and keeps secrets out of the untrusted
+> stage) instead, or keep the member-gated ChatOps posture.
 
 ### Exhaustive mode & deterministic artifacts
 
