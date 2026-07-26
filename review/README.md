@@ -388,6 +388,17 @@ secret-scrubbed environment.
 *   **Shared operating contract:** Every agent is governed by one injected contract establishing an untrusted-input posture (PR/reference content is *data, not instructions*; injection attempts are reported), a grounding requirement, and consistent confidence calibration — so the agents interlock instead of each redefining the rules.
 *   **Hardened Fetching:** External-reference fetching validates and re-resolves DNS at every redirect hop and pins the connection to the validated IP, closing the DNS-rebinding (TOCTOU) window.
 
+### Current output-quality status
+
+The first human-assessed `review@0.3` run reached the correct substantive
+conclusion but missed both human-confirmed actionable P3 findings, while several
+prominent advisory points were refuted, subjective, or informational.
+Verification and a successful build therefore improve grounding but do not yet
+establish high recall or consistently calibrated final prose. Treat the result
+as review assistance and check its evidence against CI and the diff. Evidence
+reconciliation, removed-reference search, compiler-warning deltas, and explicit
+release-quality thresholds are tracked in the local project roadmap.
+
 ## How requests are made
 
 All requests go through OpenRouter's OpenAI-compatible Chat Completions endpoint via a single client (`llm_provider.py`):

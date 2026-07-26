@@ -119,6 +119,17 @@ Summary is safe to run on **every** PR update (open + each new commit), includin
 *   **Upstream Path Reminders:** Flags when changed files fall under a configurable path prefix (e.g., `ToMathlib/`) and reminds about upstream PRs.
 *   **Token Usage Tracking:** Logs cumulative input and output usage across all API calls, including billed calls that return unusable structured output. Thinking/reasoning tokens are displayed as a subset of output, not added twice to the total.
 
+### Current output-quality status
+
+Live `0.3` evaluation found that schema validation does not yet guarantee a
+useful overview. In one large evm-asm run, synthesis effectively repeated the PR
+title and the exhaustive “affected declarations” section dominated the comment;
+many entries represented line movement rather than a substantive declaration
+change. Until the planned semantic quality gate and progressive-disclosure work
+lands, read the overview alongside the per-file summaries and diff, and treat
+declaration movement as orientation data rather than evidence of a semantic
+change.
+
 ## Project Structure
 
 ```
