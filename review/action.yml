@@ -181,6 +181,19 @@ runs:
         test: false
         lint: ${{ inputs.lint }}
 
+    # When the build below will be landrun-confined (LEANREPO_SANDBOX set, i.e. the
+    # two-stage secret-bearing review job), pre-fetch deps WITH network first, since the
+    # sandboxed build runs offline. A NO-OP when LEANREPO_SANDBOX is unset — existing
+    # deployments build exactly as before.
+    - name: Warm Lean deps for the offline sandboxed build (no-op unless sandboxing)
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "$(printf '%s' "${LEANREPO_SANDBOX:-}" | tr '[:upper:]' '[:lower:]')" in
+          1|true|yes|on|require|enabled)
+            ( lake exe cache get ) || echo "::notice::lake cache get unavailable/missed — the sandboxed build must resolve deps offline" ;;
+        esac
+
     - name: Build Lean project with captured diagnostics
       id: lean_build
       shell: bash
@@ -190,7 +203,10 @@ runs:
       run: |
         set +e
         build_log="$BUILD_LOG_PATH"
-        lake build 2>&1 | tee "$build_log"
+        # Confine the build of untrusted PR Lean under landrun when LEANREPO_SANDBOX is
+        # set (secret-bearing review stage); pass through unchanged otherwise. The wrapper
+        # fails CLOSED if landrun is missing while confinement was requested.
+        bash "${{ github.action_path }}/scripts/landrun-wrap.sh" "$PWD/.lake" -- lake build 2>&1 | tee "$build_log"
         build_rc=${PIPESTATUS[0]}
 
         # Keep the model-facing output bounded while retaining the complete log
