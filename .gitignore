@@ -24,3 +24,16 @@ build/
 # while this is a solo effort — untracked via `git rm --cached`).
 ROADMAP.md
 SESSIONS.md
+# Session-scoped analysis artifacts. Local only where nothing tracked depends on them and
+# the durable record lives elsewhere. Deliberately NOT listed here (kept tracked) after the
+# S18r Gate-1 review:
+#   - BOOTSTRAP_toolkit-gaps.md ...... shipped code cites it as the source-ledger /
+#                                      coverage-matrix schema spec
+#   - PHASE0_S18_outside-pr-unlock.md  S18-completion is required to restate residual risk
+#                                      in it; it is also S18's Phase-0 record
+#   - IMPROVEMENTS_FROM_ABF26_REVIEWS.md  the only originating-evidence record for prompt
+#                                      content that ships (attribution trail)
+# UPSTREAM_TAUCETI_FINDINGS's public record is TauCeti#1241 / #1242.
+review/UPSTREAM_TAUCETI_FINDINGS.md
+review/RESEARCH_2026-08_harness-improvements.md
+review/RESEARCH_2026-08_evidence.json
