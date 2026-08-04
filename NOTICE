@@ -40,8 +40,34 @@ are recorded in this file.
       build; project-specific audits left to the adopting repo).
     * review/scripts/sandbox-selftest.sh ← the inline landrun self-test in pr-build.yml
       (extracted + hardened: positive control, no unsatisfiable UDP-deny, fail-closed host).
+    * review/scripts/landrun-wrap.sh ← the `landrun` invocation in the "Build (sandboxed)"
+      step of .github/workflows/pr-build.yml (the mount/`--env` flag set and the
+      TMPDIR-inside-the-writable-mount pattern), extracted as a reusable shell wrapper and
+      changed: pass-through when sandboxing is disabled, explicit fail-closed when enabled
+      but landrun is absent, and the flag decision delegated to scripts/sandbox_flag.sh.
+      (Recorded in Session 18r: this file was previously undeclared. The upstream
+      comparison was made directly against pr-build.yml at the pinned commit.)
   landrun (github.com/Zouuup/landrun, MIT) is used as a pinned + SHA256-verified binary,
-  not vendored.
+  not vendored. The pinned version is recorded in review/pr-build.yml and review/review.yml
+  (v0.1.14 + SHA256); MIT, Copyright (c) 2025 Armin ranjbar; upstream ships no NOTICE.
+  review/scripts/sandbox_flag.sh is NOT part of the above: `LEANREPO_SANDBOX` is this
+  repository's own concept with no upstream counterpart, so that file is original work
+  even though it was factored out of landrun-wrap.sh (only the flag parser moved, none of
+  the landrun invocation that makes that file a derivative).
+
+- review/lean_tools.py's environment ALLOWLIST takes its *technique* — allowlist rather
+  than denylist for the environment handed to a child that elaborates untrusted Lean —
+  from leanprover/lean-eval (https://github.com/leanprover/lean-eval), licensed
+  Apache-2.0 (verified 2026-08-04 at commit
+  6af65bb1abb997a3cfabf3236e43ab5085a51dac; that repo ships no NOTICE, so there is no
+  Apache §4(d) content to propagate). **Concept-only reuse:** no lean-eval file is
+  copied, adapted, or distributed here, and the two allowlists are not the same — theirs
+  is minimal ({PATH, HOME, LEAN_ABORT_ON_PANIC}, tolerating LEAN_PATH and
+  LD_LIBRARY_PATH), while ours is substantially broader (toolchain, locale, TLS trust
+  roots, proxy, poppler/fontconfig) and adds a secret-name regex, a CA-path exemption,
+  and a never-forward hard floor. Recorded because the in-code comment credits the idea;
+  no §4 obligation arises from an unimplemented idea. The commit above is the tip at the
+  time of verification, NOT a claim about which revision was originally consulted.
 
 - summary/ is ported from alexanderlhicks/lean-summary-workflow
   (https://github.com/alexanderlhicks/lean-summary-workflow), port base

@@ -41,7 +41,24 @@ _ENV_ALLOWLIST = frozenset({
     # Lean / Lake / elan toolchain
     "ELAN_HOME", "ELAN_TOOLCHAIN", "RUSTUP_HOME",
     "LEAN_PATH", "LEAN_SRC_PATH", "LEAN_SYSROOT", "LEAN_CC", "LEAN_ABORT_ON_PANIC",
+    "LEAN_NUM_THREADS",
     "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+    # TLS trust roots. `lake` resolves git/HTTPS dependencies, so a deployer whose
+    # trust store is not in the default location (nix, corporate CA, container image)
+    # needs these or dependency resolution fails. NOTE several are also matched by
+    # `_SECRET_ENV_RE` ("CERT") — see `_SECRET_ENV_EXEMPT` below; listing them here is
+    # NOT sufficient on its own.
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    # Proxy configuration, for the same dependency-resolution reason. Read from the
+    # operator's environment, never from PR content. Both spellings: curl reads the
+    # lowercase names, most other tooling the uppercase ones.
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+    # poppler / fontconfig, for the `pdftotext` seam in paper_lean_evidence. Without
+    # these the extractor can silently produce EMPTY text rather than failing loudly,
+    # which quietly degrades PDF-derived paper evidence.
+    "FONTCONFIG_PATH", "FONTCONFIG_FILE", "POPPLER_DATADIR", "XDG_DATA_DIRS",
     # CI marker (harmless; some tools branch on it)
     "CI", "GITHUB_ACTIONS",
 })
@@ -55,6 +72,65 @@ _SECRET_ENV_RE = re.compile(
     r'(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|BEARER|PEM|PRIVATE|CERT|SIGNING)',
     re.IGNORECASE,
 )
+
+# Names that are allowlisted AND deliberately exempted from `_SECRET_ENV_RE`. The regex
+# matches the fragment "CERT", so a TLS *trust-root path* (public, not a credential) is
+# otherwise dropped even when listed above — adding it to `_ENV_ALLOWLIST` alone is a
+# silent no-op. These are paths to CA bundles; none carries a private key. This set
+# relaxes ONLY the regex net: it can never admit a name that is not allowlisted, and it
+# can never override `_NEVER_FORWARD` (see `_env_allowed` for the precedence).
+# Deliberately MINIMAL: only names the regex actually blocks (i.e. containing "CERT").
+# `CURL_CA_BUNDLE` / `GIT_SSL_CAINFO` match no secret fragment, so they need no exemption
+# and listing them here would be dead config implying a constraint that does not exist.
+# The suite enforces that every member is genuinely regex-blocked.
+_SECRET_ENV_EXEMPT = frozenset({
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE",
+})
+
+# HARD FLOOR — never forwarded to a child that elaborates PR-controlled Lean, no matter
+# what any other rule says. Two escalation classes:
+#  (1) loader / interpreter hijacking: these make an attacker-chosen file execute inside
+#      an otherwise-trusted process (`LD_PRELOAD` into `git`, `BASH_ENV` into any `sh -c`,
+#      `GIT_SSH_COMMAND` into a fetch, `PYTHONPATH` into a python hook);
+#  (2) GitHub Actions command files: these are WRITABLE paths whose contents the runner
+#      executes as workflow commands after the step, so a child that can write
+#      `GITHUB_ENV`/`GITHUB_PATH` can set arbitrary env or prepend a PATH entry for
+#      LATER, secret-bearing steps.
+# None of these is in `_ENV_ALLOWLIST` today, so this is defence-in-depth: it makes the
+# dangerous direction unreachable-by-construction for a future contributor who widens the
+# allowlist while chasing a build failure. Enforced as an invariant by the test suite.
+_NEVER_FORWARD = frozenset({
+    # (1) loader / interpreter
+    "LD_PRELOAD", "LD_AUDIT", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS",
+    "PYTHONPATH", "PYTHONSTARTUP", "NODE_OPTIONS", "PERL5LIB", "RUBYOPT",
+    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_PAGER",
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    # (2) Actions command files / runner-writable paths
+    "GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_STATE",
+    "GITHUB_STEP_SUMMARY", "RUNNER_TEMP", "RUNNER_TOOL_CACHE", "GITHUB_WORKSPACE",
+})
+
+
+def _env_allowed(name: str) -> bool:
+    """The single authoritative predicate for "may this env var reach a child that
+    elaborates PR-controlled Lean?".
+
+    Precedence is deliberate and must not be reordered:
+      1. `_NEVER_FORWARD` wins absolutely — no allowlist entry or exemption can defeat it;
+      2. then membership (explicit allowlist, or an allowed prefix);
+      3. then the secret-name regex, which `_SECRET_ENV_EXEMPT` may relax for the
+         specific public CA-path names listed above.
+    Written as one predicate because `scrubbed_env` and `_forwarded_env_names` enumerate
+    DIFFERENT sources (the live environment vs. the allowlist plus present prefix
+    matches); sharing the decision is what keeps the two from drifting apart.
+    """
+    if name in _NEVER_FORWARD:
+        return False
+    if not (name in _ENV_ALLOWLIST or name.startswith(_ENV_ALLOWLIST_PREFIXES)):
+        return False
+    if _SECRET_ENV_RE.search(name) and name not in _SECRET_ENV_EXEMPT:
+        return False
+    return True
 
 # Cap on a single tool's returned text, to keep tool results from bloating the
 # conversation fed back to the model.
@@ -81,11 +157,7 @@ def scrubbed_env() -> Dict[str, str]:
     diagnostics extractors in lean_info_extractor). Landlock sandboxing of that
     Lean IO (S7) is applied on top of this by `sandbox_wrap`.
     """
-    return {
-        k: v for k, v in os.environ.items()
-        if (k in _ENV_ALLOWLIST or k.startswith(_ENV_ALLOWLIST_PREFIXES))
-        and not _SECRET_ENV_RE.search(k)
-    }
+    return {k: v for k, v in os.environ.items() if _env_allowed(k)}
 
 
 _LANDRUN_BIN = "landrun"
@@ -126,11 +198,11 @@ def _forwarded_env_names() -> List[str]:
     """Infra/toolchain env var names to forward into the landrun sandbox. landrun gives
     the confined child ONLY the vars named with ``--env``, so without these the child
     cannot even locate the Lean toolchain (PATH/HOME/ELAN_*/LEAN_*/LAKE_*/...). Same
-    allowlist as `scrubbed_env`, minus any secret-looking name."""
-    names = [n for n in _ENV_ALLOWLIST if n in os.environ and not _SECRET_ENV_RE.search(n)]
-    names += [n for n in os.environ
-              if n.startswith(_ENV_ALLOWLIST_PREFIXES) and not _SECRET_ENV_RE.search(n)]
-    return sorted(set(names))
+    allowlist as `scrubbed_env`, decided by the same `_env_allowed` predicate so the two
+    cannot drift (they enumerate different sources but must agree on every name)."""
+    names = [n for n in _ENV_ALLOWLIST if n in os.environ]
+    names += [n for n in os.environ if n.startswith(_ENV_ALLOWLIST_PREFIXES)]
+    return sorted({n for n in names if _env_allowed(n)})
 
 
 def sandbox_wrap(argv: List[str], write_dir: Optional[str] = None) -> List[str]:

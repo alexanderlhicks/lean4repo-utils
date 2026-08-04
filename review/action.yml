@@ -196,9 +196,18 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        case "$(printf '%s' "${LEANREPO_SANDBOX:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
-          ''|0|false|no|off|disabled) exit 0 ;;
-        esac
+        # ONE flag authority, shared with scripts/landrun-wrap.sh and mirrored by
+        # lean_tools.sandbox_enabled. Sourced under `set -e` so a missing/corrupt copy
+        # aborts this step rather than being misread as "sandboxing disabled".
+        . "${{ github.action_path }}/scripts/sandbox_flag.sh"
+        # A library that sources cleanly but leaves the function undefined would make bash
+        # return 127, which `if !` (exempt from `set -e`) inverts into "disabled" — so the
+        # self-test would be silently skipped. Check for the function explicitly.
+        if ! declare -F sandbox_flag_enabled >/dev/null 2>&1; then
+          echo "::error::sandbox_flag.sh did not define sandbox_flag_enabled — refusing to skip the self-test" >&2
+          exit 1
+        fi
+        if ! sandbox_flag_enabled; then exit 0; fi
         mkdir -p "$PWD/.lake"
         bash "${{ github.action_path }}/scripts/sandbox-selftest.sh" "$PWD/.lake"
 

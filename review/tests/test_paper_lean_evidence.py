@@ -1,5 +1,6 @@
 """Tests for deterministic paper/Lean evidence indexing."""
 
+import os
 import re
 
 import paper_lean_evidence as evidence
@@ -480,3 +481,96 @@ class TestCitationTag:
             "theorem g : False := sorry\n"
         ))
         assert decls["g"]["citation_tag"] == "[GH78 Thm 9]"
+
+
+# --- S18r item 4: the pdftotext seam's SILENT-degradation case -----------------------
+# Every other env-allowlist gap fails loudly (a build breaks, a review errors). This one
+# does not: `pdftotext` under an incomplete environment can emit EMPTY text and exit 0, so
+# PDF-derived paper evidence quietly degrades to nothing and the run still looks healthy.
+# The other PDF tests in this file MOCK subprocess.run, so none of them exercises the real
+# binary under the real `scrubbed_env()` policy — which is exactly the gap this closes.
+
+def _minimal_text_pdf() -> bytes:
+    """A valid, uncompressed one-page PDF whose text layer contains a theorem header.
+
+    Hand-built rather than committed as a binary fixture so the bytes are reviewable and
+    the file cannot silently rot.
+    """
+    objs = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R"
+        b"/Resources<</Font<</F1 5 0 R>>>>>>",
+    ]
+    stream = b"BT /F1 12 Tf 72 720 Td (Theorem 1 \\(Main\\) The conclusion holds.) Tj ET\n"
+    objs.append(b"<</Length " + str(len(stream)).encode() + b">>stream\n" + stream + b"\nendstream")
+    objs.append(b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for index, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += str(index).encode() + b" 0 obj" + body + b"endobj\n"
+    xref = len(out)
+    out += b"xref\n0 " + str(len(objs) + 1).encode() + b"\n0000000000 65535 f \n"
+    for off in offsets:
+        out += ("%010d 00000 n \n" % off).encode()
+    out += (b"trailer<</Size " + str(len(objs) + 1).encode() + b"/Root 1 0 R>>\nstartxref\n"
+            + str(xref).encode() + b"\n%%EOF\n")
+    return bytes(out)
+
+
+def test_real_pdftotext_under_the_real_env_policy_extracts_non_empty_text(tmp_path):
+    """The seam must still WORK under `scrubbed_env()` — not merely be secret-free.
+
+    Deliberately fails (rather than skips) when poppler is missing: a skip here would hide
+    the regression this test exists to catch. If a CI image lacks poppler, install it or
+    make the absence explicit at the call site — do not silence this.
+    """
+    import shutil as _shutil
+    assert _shutil.which("pdftotext"), (
+        "poppler's pdftotext is required to test the PDF seam; install poppler-utils "
+        "rather than skipping — a skip would mask silent extraction failure"
+    )
+
+    paper = tmp_path / "paper.pdf"
+    paper.write_bytes(_minimal_text_pdf())
+
+    warnings: list[str] = []
+    statements = evidence._pdf_statements(paper, warnings)
+
+    # POSITIVE: extraction produced a usable anchor. An empty result is the silent
+    # degradation we are guarding against, so assert on content, not just on "no error".
+    assert statements, (
+        f"real pdftotext under scrubbed_env() extracted NOTHING (warnings={warnings}); "
+        "the env allowlist is probably missing a poppler/fontconfig variable"
+    )
+    assert any("Theorem" in s.get("statement_text", "") for s in statements), (
+        f"anchor text missing from extraction: {statements}"
+    )
+    # And the extraction remains correctly labelled as untrustworthy input.
+    assert statements[0]["medium"] == "pdf"
+    assert statements[0]["requires_visual_confirmation"] is True
+
+
+def test_pdf_seam_child_env_is_the_scrubbed_policy_not_the_full_environment(tmp_path, monkeypatch):
+    """Pins that the seam passes `scrubbed_env()` (paired with the test above, which pins
+    that doing so still WORKS). Absence alone would be satisfied by an empty env."""
+    paper = tmp_path / "paper.pdf"
+    paper.write_bytes(_minimal_text_pdf())
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setenv("PATH", os.environ.get("PATH", "/usr/bin"))
+
+    captured = {}
+    real_run = evidence.subprocess.run
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(evidence.subprocess, "run", spy)
+    evidence._pdf_statements(paper, [])
+
+    assert captured, "no child env was passed at all"
+    assert "GITHUB_TOKEN" not in captured, "secret reached the pdftotext child"
+    assert "PATH" in captured, "PATH was dropped — the child could not have run"

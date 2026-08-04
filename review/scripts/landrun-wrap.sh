@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+#
+# Adapted from TauCetiProject/TauCeti@92c79e5e0a618f8c5c2b9909be1ce50f6891dde7
+# (.github/workflows/pr-build.yml, the "Build (sandboxed)" step), licensed Apache-2.0;
+# see ../../NOTICE. Apache §4(b) changes relative to upstream: extracted from an inline
+# workflow step into a reusable script; passes through unchanged when sandboxing is
+# disabled; fails CLOSED with an explicit error when sandboxing is requested but landrun
+# is absent (upstream assumes it is present); and the enable/disable decision is
+# delegated to scripts/sandbox_flag.sh rather than inlined.
+#
 # landrun-wrap.sh — run a command under landrun (Landlock) confinement when
 # LEANREPO_SANDBOX is enabled; pass through unchanged when disabled; FAIL CLOSED when
 # enabled but landrun is absent. The shell counterpart of lean_tools.sandbox_wrap — used
@@ -19,16 +28,27 @@ if [ "${1-}" != "--" ]; then echo "::error::landrun-wrap: usage: landrun-wrap.sh
 shift
 if [ -z "${1-}" ]; then echo "::error::landrun-wrap: no command given" >&2; exit 2; fi
 
-# Same enable semantics as lean_tools.sandbox_enabled: recognised truthy set enables;
-# empty/off disables; an UNRECOGNISED non-empty value fails CLOSED (enabled + warning).
-enabled=1
-case "$(printf '%s' "${LEANREPO_SANDBOX-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
-  ''|0|false|no|off|disabled) enabled=0 ;;
-  1|true|yes|on|require|enabled) enabled=1 ;;
-  *) echo "::warning::landrun-wrap: LEANREPO_SANDBOX not recognised; treating as ENABLED (fail closed)" >&2 ;;
-esac
+# Enable semantics come from ONE authority shared with action.yml and mirrored by
+# lean_tools.sandbox_enabled — see scripts/sandbox_flag.sh. SOURCED, not executed: under
+# `set -e` a missing or corrupt copy aborts this script (FAIL CLOSED), whereas testing an
+# exit status would read bash's 127/126/2 as "disabled" and run PR code unconfined.
+# The previous inline parser used `tr -d '[:space:]'`, which deleted INTERIOR whitespace:
+# LEANREPO_SANDBOX='o ff' collapsed to 'off' and silently disabled confinement here while
+# the Python side failed closed. Behavioural parity is pinned by the test suite.
+. "$(dirname "${BASH_SOURCE[0]}")/sandbox_flag.sh"
 
-if [ "$enabled" -eq 0 ]; then exec "$@"; fi
+# Sourcing alone is NOT sufficient, and assuming it was is a fail-open we shipped and then
+# caught: a library that sources CLEANLY but does not define the function (empty file,
+# truncated copy, a comments-only stub) leaves `sandbox_flag_enabled` undefined, bash
+# returns 127 for the missing command, and — because a command inside an `if !` condition
+# is EXEMPT from `set -e` — the `!` inverts 127 into "disabled" and the payload runs
+# UNCONFINED. Verify the function exists explicitly, before relying on its status.
+if ! declare -F sandbox_flag_enabled >/dev/null 2>&1; then
+  echo "::error::landrun-wrap: sandbox_flag.sh did not define sandbox_flag_enabled — refusing to run PR code unconfined" >&2
+  exit 1
+fi
+
+if ! sandbox_flag_enabled; then exec "$@"; fi
 
 if ! command -v landrun >/dev/null 2>&1; then
   echo "::error::landrun-wrap: LEANREPO_SANDBOX set but landrun not on PATH — refusing to run PR code unconfined" >&2
