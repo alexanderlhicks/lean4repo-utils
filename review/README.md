@@ -62,6 +62,13 @@ Read this before wiring the action on a public repository.
 
 Key protection rests on **env hygiene + the key-file lifecycle + filesystem confinement**, not on network egress (landrun's Landlock is TCP-only on current runners, an accepted residual). The sandboxed build is offline, so an adopting repo pre-populates dependencies by trusted means. Until you adopt this two-stage workflow, keep the member-gated ChatOps posture below.
 
+> **Private SSH dependencies:** the environment given to every Lean-invoking subprocess is a
+> strict allowlist, and `SSH_AUTH_SOCK` is **deliberately excluded** — forwarding an agent
+> socket into PR-controlled elaboration would hand the operator's SSH identity to attacker
+> code. If your lakefile pulls a private dependency over SSH (`git@…`), fetches inside any
+> Lean seam will fail: switch the `require` to HTTPS (with credentials supplied outside the
+> Lean environment) or pre-fetch dependencies by trusted means before the action runs.
+
 ### Recommended: ChatOps Workflow (`/review`)
 
 Create a workflow file at `.github/workflows/ai-review.yml`. This is the canonical safe deployment — review is triggered only by a member's `/review` comment:
