@@ -28,7 +28,8 @@ concurrency:
 env:
   SRC_DIR: MyLib                       # <-- your library source dir (the ONLY dir overlaid from the PR)
   ACTION_REPO: OWNER/lean4repo-utils   # <-- the review action repo providing the guard/sandbox scripts
-  ACTION_REF: v0.5                     # <-- pin to a release tag or SHA
+  ACTION_REF: MAIN_COMMIT_SHA          # <-- pin to a post-0.3 main SHA (the guard/sandbox scripts
+                                       #     exist only on main; no tag carries them yet)
   LANDRUN_VER: v0.1.14
   LANDRUN_SHA256: 645178e3239cd33760560834e50efea0864183a2a8a82faf199760dffee6dd71
 

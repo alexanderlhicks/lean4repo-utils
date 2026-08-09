@@ -5,13 +5,18 @@ This GitHub Action provides an AI-powered code review for Pull Requests in Lean 
 **Fastest start:** add an `OPENROUTER_KEY` Actions secret, then copy the [recommended ChatOps workflow](#recommended-chatops-workflow-review) below to `.github/workflows/ai-review.yml` in your repository. The sections below explain the workflow, every input, and how the pipeline works.
 
 - [Usage](#usage)
+  - [Security & trust model](#security--trust-model)
+  - [Two-stage split for outside-PR review (opt-in)](#two-stage-split-for-outside-pr-review-opt-in)
   - [Recommended: ChatOps Workflow (`/review`)](#recommended-chatops-workflow-review)
   - [Alternative: Minimal Push Workflow (No ChatOps)](#alternative-minimal-push-workflow-no-chatops)
   - [Recommended deployment](#recommended-deployment)
   - [Inputs](#inputs)
+  - [Exhaustive mode & deterministic artifacts](#exhaustive-mode--deterministic-artifacts)
+  - [Reviews the PR head, and shows what it used](#reviews-the-pr-head-and-shows-what-it-used)
   - [Advanced tuning (environment variables)](#advanced-tuning-environment-variables)
 - [How it Works](#how-it-works)
 - [Features](#features)
+  - [Current output-quality status](#current-output-quality-status)
 - [How requests are made](#how-requests-are-made)
 - [Project Structure](#project-structure)
 - [Customizing AI Prompts](#customizing-ai-prompts)
@@ -33,7 +38,7 @@ Read this before wiring the action on a public repository.
 | `pull_request_target` | **Yes** | base workflow, but a checkout is the PR head |
 | `issue_comment` | **Yes** | base workflow, in the base repo context |
 
-**Why review is ChatOps-only.** The review pipeline *builds and elaborates the PR's Lean code* (`lake build`, and — with `lean_tools: true` — model-directed `lake env lean`). That is arbitrary code execution. On `issue_comment` the run holds the `OPENROUTER_KEY` and a write token, so building an outside contributor's PR would run attacker-controlled Lean/lakefile code next to those credentials (cf. CVE-2025-47928, CVSS 9.1). The action ships defense-in-depth for this (a resolved-PR-head checkout with `persist-credentials: false`, a scrubbed child env for model-directed Lean, path confinement on every PR-controlled read). The **two-stage secret-free build split (S2) and the landrun `lean_tools`/build sandbox (S7) now ship as opt-in templates** (see [Two-stage split for outside-PR review](#two-stage-split-for-outside-pr-review-opt-in) below), but are **experimental, off by default, and NOT yet security-audited — do not enable them yet**. Until you adopt the two-stage workflow:
+**Why review is ChatOps-only.** The review pipeline *builds and elaborates the PR's Lean code* (`lake build`, and — with `lean_tools: true` — model-directed `lake env lean`). That is arbitrary code execution. On `issue_comment` the run holds the `OPENROUTER_KEY` and a write token, so building an outside contributor's PR would run attacker-controlled Lean/lakefile code next to those credentials (cf. CVE-2025-47928, CVSS 9.1). The action ships defense-in-depth for this (a resolved-PR-head checkout with `persist-credentials: false`, a scrubbed child env for model-directed Lean, path confinement on every PR-controlled read). The **two-stage secret-free build split (S2) and the landrun `lean_tools`/build sandbox (S7) now ship as opt-in templates** (see [Two-stage split for outside-PR review](#two-stage-split-for-outside-pr-review-opt-in) below), but are **experimental, off by default, and NOT yet security-cleared (reviewed; ~10 acceptance items still unmet) — do not enable them yet**. Until you adopt the two-stage workflow:
 
 - **Do not run `/review` on a fork PR at all yet.** This is the strongest control available today and it costs nothing. The two-stage split is not audited and is not deployed on any repository; until it is, treat `/review` as a tool for PRs whose code you are willing to execute on a runner holding your credentials. Reviewing your *own* repository's branches is unaffected.
 - **Restrict the trigger to repo members** (`OWNER`/`MEMBER`/`COLLABORATOR`) — the template below does this. The **comment author**, not the PR author, is the trust boundary: a maintainer is expected to look at a fork PR's diff before typing `/review` on it.
@@ -43,7 +48,8 @@ Read this before wiring the action on a public repository.
 
 ### Two-stage split for outside-PR review (opt-in)
 
-> **Status: MECHANISM ONLY — experimental, opt-in, NOT yet security-audited. Do not enable it.**
+> **Status: MECHANISM ONLY — experimental, opt-in, NOT yet security-cleared (it has been
+> reviewed; roughly ten acceptance items remain unmet). Do not enable it.**
 > These templates and the `LEANREPO_SANDBOX` code paths ship so the design can be reviewed and
 > rolled out, not because they are ready. Specifically: a whole-diff security review against the
 > original acceptance criteria found roughly ten unmet items that are still open; the landrun
@@ -54,7 +60,7 @@ Read this before wiring the action on a public repository.
 > code path is active. Enabling it today would give you the *appearance* of the protection
 > described below without the assurance.
 
-`review/` ships the mechanism to review **untrusted fork PRs** safely, as templates a downstream repo adopts (`pr-build.yml`, `review.yml`, and the guard/sandbox scripts). The per-repo caller migration is tracked separately. The design:
+`review/` ships the mechanism to review **untrusted fork PRs** safely, as templates a downstream repo adopts (`pr-build.yml`, `review.yml`, and the guard/sandbox scripts). These templates and scripts exist only on `main` (post-`0.3`): pin `ACTION_REPO`/`ACTION_REF` **and** the action itself to a `main` commit SHA — pinned at `0.3` (or earlier), `LEANREPO_SANDBOX` is a **silent no-op** and the secret-bearing stage rebuilds PR Lean unsandboxed. The per-repo caller migration is tracked separately. The design:
 
 - **Stage 1 — untrusted, sandboxed build (`pr-build.yml`).** Runs on `pull_request_target` with **no secrets** and only `contents: read` + `statuses: write`. It checks out the trusted base and the PR head into separate credential-free dirs, overlays **only** the PR's source dir onto the base — a fail-closed **scope guard** (`scope_guard.sh`) routes any PR touching the lakefile / toolchain / `scripts/` / `.github/`, at any depth, to a human — builds under **landrun** (a Landlock sandbox: offline, writes confined to `.lake`, proven to enforce by a self-test *before* any PR code runs), and posts a commit **status**. No build artifacts cross the trust boundary; only the status does.
 - **Stage 2 — trusted review (`review.yml`).** Fires on `workflow_run` **after** the build's commit status is `success` (never merely on the workflow *concluding* — a guard-routed PR skips the build yet the workflow still concludes success), or on an authorized `/review` comment (`authorize.sh` — repo-permission API with an `author_association` fallback and **distinct** exit codes so an API error is never mistaken for a grant). Secrets enter **only** here, only after the untrusted build passed. The provider key is staged to a **file** (`API_KEY_FILE`) that `review.py` reads and **unlinks before the model loop**, so no `*_KEY`/`*_TOKEN` remains in the environment; and with `LEANREPO_SANDBOX=1` the action's *own* `lake build` and every model-directed `lake env lean` seam run under landrun too (the review stage re-builds the PR code to ground the reviewer, so that build must be confined as well).
@@ -62,12 +68,17 @@ Read this before wiring the action on a public repository.
 
 Key protection rests on **env hygiene + the key-file lifecycle + filesystem confinement**, not on network egress (landrun's Landlock is TCP-only on current runners, an accepted residual). The sandboxed build is offline, so an adopting repo pre-populates dependencies by trusted means. Until you adopt this two-stage workflow, keep the member-gated ChatOps posture below.
 
-> **Private SSH dependencies:** the environment given to every Lean-invoking subprocess is a
-> strict allowlist, and `SSH_AUTH_SOCK` is **deliberately excluded** — forwarding an agent
-> socket into PR-controlled elaboration would hand the operator's SSH identity to attacker
-> code. If your lakefile pulls a private dependency over SSH (`git@…`), fetches inside any
-> Lean seam will fail: switch the `require` to HTTPS (with credentials supplied outside the
-> Lean environment) or pre-fetch dependencies by trusted means before the action runs.
+> **Private SSH dependencies:** `SSH_AUTH_SOCK` is **deliberately excluded** from the env
+> allowlist applied to the Python Lean seams (model-directed `lake env lean`, the diagnostics/
+> axiom extractor, `pdftotext`) on *every* deployment path, and from the five variables
+> `landrun-wrap.sh` forwards when confinement is on — forwarding an agent socket into
+> PR-controlled elaboration would hand the operator's SSH identity to attacker code. The
+> action's *own* `lake build` still inherits the full runner environment while
+> `LEANREPO_SANDBOX` is unset (today's default), so a private-SSH `require` resolves there —
+> but it will fail inside every model-directed or extractor Lean call, and the sandboxed
+> two-stage build never fetches at all (it is offline by design). Net advice: switch the
+> `require` to HTTPS (credentials supplied outside the Lean environment) or pre-populate
+> dependencies by trusted means before the action runs.
 
 ### Recommended: ChatOps Workflow (`/review`)
 
@@ -331,7 +342,9 @@ secret-scrubbed environment.
   for every trigger. The same stamp also carries a **prompts version** — a short
   content fingerprint of the shipped `prompts/*.md` set (*"prompts `…`"*) — so a posted
   review is traceable to the exact prompt revision that produced it; it is emitted on
-  every review, including the degraded-run notice.
+  every review, including the degraded-run notice. *(The prompts-version stamp and the
+  S17 checklist/operating-contract prompt revisions landed after `0.3` — a `0.3` pin
+  does not carry them; they ship in the next tag.)*
 - **"References & context used."** Each review comment ends with a collapsible manifest
   listing what actually grounded it — external references fetched, knowledge-base /
   specification files loaded, and repository dependency-graph files (context that
@@ -363,6 +376,7 @@ secret-scrubbed environment.
 | `LLM_LOUD_EXIT` | `false` | Same as the `llm_loud_exit` input. Non-zero exit on a degraded run, after the comment posts. |
 | `ENABLE_WEB_SEARCH` | `false` | Same as the `enable_web_search` input. |
 | `SPEC_REFS` | `""` | Same as the `spec_refs` input. |
+| `LEANREPO_SANDBOX` | unset | **Experimental, unaudited — do not enable.** Opt-in landrun confinement of the action's build and all model-directed Lean seams; fails closed if landrun is unavailable. See [Two-stage split for outside-PR review](#two-stage-split-for-outside-pr-review-opt-in). Requires a post-`0.3` `main` pin — on `0.3` the flag is a silent no-op. |
 
 ## How it Works
 
@@ -428,7 +442,7 @@ Verification and a successful build therefore improve grounding but do not yet
 establish high recall or consistently calibrated final prose. Treat the result
 as review assistance and check its evidence against CI and the diff. Evidence
 reconciliation, removed-reference search, compiler-warning deltas, and explicit
-release-quality thresholds are tracked in the local project roadmap.
+release-quality thresholds are tracked in the maintainer's (unpublished) roadmap.
 
 ## How requests are made
 
@@ -453,7 +467,18 @@ review/                       # workspace member of the lean4repo-utils reposito
   discover_files.py           # Dependency discovery via lake graph (BFS)
   lean_info_extractor.py      # Lean toolchain data extraction (axioms, sorry, diagnostics)
   paper_lean_evidence.py      # deterministic paper-anchor / Lean-declaration index
+  coverage_matrix.py          # coverage-matrix symbol resolution (exhaustive mode)
   lean_tools.py               # Lean toolchain tools for agents (lean_check/print/typecheck via `lake env lean`)
+  resolve_pr_head.sh          # fail-closed PR head/base SHA resolution before checkout
+  authorize.sh                # /review ChatOps authorization (repo-permission API; two-stage template)
+  scope_guard.sh              # fail-closed trusted-file-list scope guard (two-stage template)
+  pr-build.yml                # Stage-1 untrusted sandboxed build (two-stage template, opt-in)
+  review.yml                  # Stage-2 secret-bearing review (two-stage template, opt-in)
+  scripts/
+    sandbox_flag.sh           # single authoritative LEANREPO_SANDBOX parser (sourced, fail-closed)
+    landrun-wrap.sh           # landrun confinement wrapper for the action's own `lake build`
+    sandbox-build.sh          # Stage-1 sandboxed build script (two-stage template)
+    sandbox-selftest.sh       # landrun escape-probe self-test (known partly confounded; see status)
   pyproject.toml              # Project metadata + dependencies (uv workspace member)
   prompts/
     _operating_contract.md    # Shared contract injected ahead of every agent (untrusted-input posture, grounding, confidence calibration)
@@ -468,10 +493,15 @@ review/                       # workspace member of the lean4repo-utils reposito
     lean4_checklist.md        # Lean 4 best practices checklist (injected into Agent B)
     verdict_rules.md          # Hard verdict rules (injected into Agent B and Synthesis)
   tests/
+    conftest.py               # neutralises an ambient LEANREPO_SANDBOX for the suite
     test_review.py
     test_discover_files.py
     test_lean_info_extractor.py
     test_lean_tools.py
+    test_coverage_matrix.py
+    test_paper_lean_evidence.py
+    test_env_policy.py        # env allowlist / sandbox-flag parity + corruption pins
+    test_e2e_lean.py          # env-gated end-to-end (skipped by default)
 ```
 
 The OpenRouter LLM client (`llm_provider`) and the shared Lean source

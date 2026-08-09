@@ -146,9 +146,10 @@ runs:
         # Do not leave the GITHUB_TOKEN in .git/config: the Lean build step below runs
         # PR-branch lakefile code in this same workspace, and the reviewer's lean_tools
         # execute model-directed Lean IO. Nothing here pushes, so drop the credential.
-        # (Full lean_tools sandboxing is tracked as a separate roadmap item; until it
-        # lands, do not wire this action under pull_request_target with a privileged
-        # token — the HEAD checkout means untrusted PR code now builds/elaborates here.)
+        # (Full lean_tools sandboxing now ships opt-in behind LEANREPO_SANDBOX but is
+        # unaudited; until it is security-cleared, do not wire this action under
+        # pull_request_target with a privileged token — the HEAD checkout means
+        # untrusted PR code builds/elaborates here.)
         persist-credentials: false
 
     - name: Mask secrets

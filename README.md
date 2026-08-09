@@ -8,17 +8,17 @@ CLI, sharing a single OpenRouter-backed LLM layer.
 
 | Tool | What it does | Use as |
 | --- | --- | --- |
-| [`summary/`](summary/) | AI-generated summaries for Lean 4 pull requests (multi-agent pipeline: triage, per-file summaries, synthesis, optional title validation and instruction checks). | `uses: alexanderlhicks/lean4repo-utils/summary@main` |
-| [`review/`](review/) | AI code review for Lean 4 pull requests: spec-grounded per-file review, cross-file analysis, dependent-impact pass, adversarial finding verification, real Lean toolchain access for agents. | `uses: alexanderlhicks/lean4repo-utils/review@main` |
+| [`summary/`](summary/) | AI-generated summaries for Lean 4 pull requests (multi-agent pipeline: triage, per-file summaries, synthesis, optional title validation and instruction checks). | `uses: alexanderlhicks/lean4repo-utils/summary@0.3` |
+| [`review/`](review/) | AI code review for Lean 4 pull requests: spec-grounded per-file review, cross-file analysis, dependent-impact pass, adversarial finding verification, real Lean toolchain access for agents. | `uses: alexanderlhicks/lean4repo-utils/review@0.3` |
 | [`sorry-tracker/`](sorry-tracker/) | CLI that finds `sorry`/`admit` obligations in a Lean repo and opens detailed, LLM-analyzed GitHub issues for them. | `cd sorry-tracker && uv run sorry-tracker ...` |
-| [`common/`](common/) | Shared library `leanrepo-common`: the OpenRouter LLM provider (`leanrepo_common.llm_provider`) and Lean 4 source utilities (`leanrepo_common.lean_utils`). | dependency of the three tools |
+| [`common/`](common/) | Shared library `leanrepo-common`: the OpenRouter LLM provider (`leanrepo_common.llm_provider`), Lean 4 source utilities (`leanrepo_common.lean_utils`), and diff parsing (`leanrepo_common.diff_utils`). | dependency of the three tools |
 
 > **Evaluation status (`0.3`, 2026-07-25):** initial ArkLib and evm-asm runs
 > produced useful analysis, but final-output quality was inconsistent: one strong
 > summary, one title-only/noisy summary, and one review with the correct
 > high-level conclusion but 0/2 recall on the human-confirmed actionable findings.
 > Treat AI prose as reviewer assistance, not a substitute for CI or human review.
-> The local project roadmap tracks measured follow-ups and release criteria.
+> The maintainer's (unpublished) roadmap tracks measured follow-ups and release criteria.
 
 All LLM access goes through [OpenRouter](https://openrouter.ai): one API key,
 models selected by slug (e.g. `anthropic/claude-opus-4.8`,

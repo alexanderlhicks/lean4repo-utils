@@ -27,7 +27,10 @@ concurrency:
 
 env:
   ACTION_REPO: OWNER/lean4repo-utils   # <-- the review action repo (guard/authorize scripts)
-  ACTION_REF: v0.5                     # <-- pin to a release tag or SHA
+  ACTION_REF: MAIN_COMMIT_SHA          # <-- pin to a post-0.3 main SHA. The guard/sandbox scripts
+                                       #     and LEANREPO_SANDBOX support exist only on main: a 0.3
+                                       #     (or earlier) pin makes the flag a SILENT NO-OP and the
+                                       #     secret-bearing stage rebuilds PR Lean unsandboxed.
   LANDRUN_VER: v0.1.14
   LANDRUN_SHA256: 645178e3239cd33760560834e50efea0864183a2a8a82faf199760dffee6dd71
 
@@ -113,7 +116,8 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run the review action (pinned)
-        uses: OWNER/lean4repo-utils/review@v0.5    # <-- pin to a SHA in production
+        uses: OWNER/lean4repo-utils/review@MAIN_COMMIT_SHA  # <-- same post-0.3 main SHA as ACTION_REF:
+                                                            #     a 0.3 pin silently ignores LEANREPO_SANDBOX
         with:
           pr_number: ${{ needs.authorize.outputs.pr }}
           github_token: ${{ secrets.GITHUB_TOKEN }}

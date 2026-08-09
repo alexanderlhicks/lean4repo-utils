@@ -89,6 +89,11 @@ unconfined); redirect `TMPDIR`/`XDG_*` into a writable sandbox dir + grant read-
 
 ## Deliverable 3 — current-posture audit (corrected)
 
+> **Snapshot as of 2026-07-24 (pre-S18).** The holes this table records were closed in S18
+> Phase-2a/S18r: seam 3 now passes `env=scrubbed_env()`, and `scrubbed_env` was converted from
+> the denylist regex described below to the `_ENV_ALLOWLIST` allowlist (`lean_tools.py`). The
+> table is preserved as the Phase-0 record of the *pre-S18* posture.
+
 Four Lean-elaboration seams, all in the same job as the secret-bearing `run_review` step:
 
 | # | seam | env today |

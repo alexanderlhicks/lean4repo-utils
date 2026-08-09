@@ -7,6 +7,12 @@ fidelity, §2 boundary-probe recipe, §3 security-def-shape / `present-but-diffe
 definitional-chain trace, §5 carrier rubric, §6 coverage non-vacuity) are **all already landed**
 in `prompts/` (verified 2026-07-19). Those were the cheap, high-signal wins and they shipped.
 
+> **Update (`0.3`, 2026-07-25): Gaps A, B and C below have since SHIPPED** — the `exhaustive`
+> input, the deterministic `review_source_ledger.md` emitter, and the `coverage_matrix_path`
+> symbol-resolution phase (see README "Exhaustive mode & deterministic artifacts", which cites
+> this file as the schema spec). Only Gap D remains open (deliberately skipped). The text below
+> is preserved as the original bootstrap record, not a live to-do list.
+
 ## Is any of this actually needed?
 
 **No — not for the toolkit to work.** Everything below is an *optional deterministic backstop*
