@@ -40,15 +40,15 @@ jobs:
       # Trusted scripts (scope_guard.sh, scripts/sandbox-*.sh) come from the pinned
       # review action, NOT the PR — so untrusted code can never alter them.
       - name: Checkout the review action (trusted, pinned)
-        uses: actions/checkout@v4    # pin to a SHA in production
+        uses: actions/checkout@v7    # pin to a SHA in production
         with: { repository: "${{ env.ACTION_REPO }}", ref: "${{ env.ACTION_REF }}", path: rv, persist-credentials: false }
 
       - name: Checkout trusted base (credential-free)
-        uses: actions/checkout@v4    # pin to a SHA in production
+        uses: actions/checkout@v7    # pin to a SHA in production
         with: { ref: "${{ github.event.pull_request.base.ref }}", path: base, persist-credentials: false }
 
       - name: Checkout PR head into a SEPARATE dir (credential-free)
-        uses: actions/checkout@v4    # pin to a SHA in production
+        uses: actions/checkout@v7    # pin to a SHA in production
         with:
           repository: "${{ github.event.pull_request.head.repo.full_name }}"
           ref: "${{ github.event.pull_request.head.sha }}"
