@@ -3009,7 +3009,10 @@ class TestC3ActionWiring:
             "PAPER_LEAN_EVIDENCE_OUT": evidence["env"]["PAPER_LEAN_EVIDENCE_OUT"],
         }
 
-        assert cleanup["env"] == paths
+        assert cleanup["env"] == {
+            **paths,
+            "API_KEY_FILE": "${{ steps.stage_review_key.outputs.api_key_file }}",
+        }
         for name, path in paths.items():
             assert path.startswith("${{ runner.temp }}/")
             assert "github.run_id" in path and "github.run_attempt" in path

@@ -87,9 +87,12 @@ generate LLM analyses and open GitHub issues (requires an authenticated
   [uv](https://docs.astral.sh/uv/) and Lean themselves on the runner. Your
   repository needs a working `lake build` (the review action builds the
   project to query the Lean toolchain).
-- **CLI / development:** [uv](https://docs.astral.sh/uv/) only; it provisions
+- **CLI / development:** [uv](https://docs.astral.sh/uv/); it provisions
   the right Python automatically (packages require Python ≥ 3.11, pinned to
   3.12 via `.python-version`).
+- **Review tests:** Poppler's `pdftotext` executable is required for the PDF
+  extraction regressions. On Debian or Ubuntu, install it with
+  `sudo apt-get install poppler-utils`. CI installs it for the review test job.
 
 ## Development
 

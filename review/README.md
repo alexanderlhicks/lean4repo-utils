@@ -241,7 +241,7 @@ Tune to your project's characteristics:
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `github_token` | Yes | — | GitHub Token for API calls |
-| `api_key` | Yes | — | OpenRouter API key |
+| `api_key` | Unless `API_KEY_FILE` is set | — | OpenRouter API key. The action stages it in a private file for `review.py`, which reads and deletes it. A caller may instead supply a staged file through `API_KEY_FILE`. |
 | `model` | No | `z-ai/glm-5.2` | OpenRouter model slug for the deep agents. Defaults to an open-weight model; override with any slug (must support tool-calling + structured output). |
 | `pr_number` | Yes | — | The Pull Request number |
 | `spec_refs` | No | `""` | Comma-separated **local** paths (files or dirs; PDF/md/txt/tex/lean) to specification / knowledge-base documents. These drive the formalization checklist (Agent A) and ground every reviewer — the project's standing knowledge base belongs here. |
