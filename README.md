@@ -27,9 +27,11 @@ changes.
 
 ## Quick start
 
-Everything here needs one [OpenRouter API key](https://openrouter.ai/keys) —
+LLM features need one [OpenRouter API key](https://openrouter.ai/keys) —
 it reaches Claude, Gemini, GPT, DeepSeek, and other models through a single
 endpoint, so you never need per-provider credentials.
+Local tests, lint, and `sorry-tracker --dry-run` do not need an API key.
+See [requirements](#requirements) for the uv baseline used by local tools and development.
 
 ### PR summaries and AI review (GitHub Actions)
 
@@ -87,9 +89,10 @@ generate LLM analyses and open GitHub issues (requires an authenticated
   [uv](https://docs.astral.sh/uv/) and Lean themselves on the runner. Your
   repository needs a working `lake build` (the review action builds the
   project to query the Lean toolchain).
-- **CLI / development:** [uv](https://docs.astral.sh/uv/); it provisions
-  the right Python automatically (packages require Python ≥ 3.11, pinned to
-  3.12 via `.python-version`).
+- **CLI / development:** [uv](https://docs.astral.sh/uv/getting-started/installation/)
+  is a baseline requirement for local tools, tests, and lint. CI uses uv 0.13.6.
+  uv provisions Python 3.12, selected by `.python-version`; packages require
+  Python ≥ 3.11. Run the commands below from the repository root.
 - **Review tests:** Poppler's `pdftotext` executable is required for the PDF
   extraction regressions. On Debian or Ubuntu, install it with
   `sudo apt-get install poppler-utils`. CI installs it for the review test job.
@@ -100,15 +103,15 @@ This repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/
 each tool is a member project with its own README and tests.
 
 ```bash
-uv sync --all-packages        # one venv + one uv.lock at the workspace root
+uv sync --frozen --all-packages        # one venv + one uv.lock at the workspace root
 
 # Tests (per member, from its directory)
-(cd common && uv run --no-sync pytest -q)
-(cd sorry-tracker && uv run --no-sync pytest -q)
-(cd summary && uv run --no-sync pytest -q)
-(cd review && uv run --no-sync pytest -q)
+(cd common && uv run --frozen pytest tests/ -q)
+(cd sorry-tracker && uv run --frozen pytest tests/ -q)
+(cd summary && uv run --frozen pytest tests/ -q)
+(cd review && uv run --frozen pytest tests/ -q)
 
-uv run --no-sync ruff check . # lint everything
+uv run --frozen ruff check . # lint everything
 ```
 
 Dependency changes go in the member's `pyproject.toml`; re-lock with `uv lock`
