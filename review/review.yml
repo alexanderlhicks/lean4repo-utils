@@ -45,7 +45,7 @@ jobs:
       pr: ${{ steps.gate.outputs.pr }}
     steps:
       - name: Checkout the review action (trusted, pinned) for authorize.sh
-        uses: actions/checkout@v4    # pin to a SHA in production
+        uses: actions/checkout@v7    # pin to a SHA in production
         with: { repository: "${{ env.ACTION_REPO }}", ref: "${{ env.ACTION_REF }}", path: rv, persist-credentials: false }
 
       - name: Authorize + resolve PR (fail-closed; distinct exit codes)
