@@ -7,8 +7,8 @@
 # status-only handoff (no artifacts cross the trust boundary). A PR that touches anything
 # outside <SRC_DIR>/ + Lake pins routes to a human (scope_guard.sh, fail-closed).
 #
-# To adopt: set SRC_DIR to your library's source dir; pin ACTION_REPO/ACTION_REF to the
-# review action release that provides the guard + sandbox scripts; pin the action SHAs.
+# To adopt: set SRC_DIR to your library's source dir and ACTION_REPO to the action repo.
+# Track main in ACTION_REF and the review action; third-party action refs use commit SHAs.
 name: PR build (untrusted, sandboxed)
 
 on:
@@ -28,8 +28,7 @@ concurrency:
 env:
   SRC_DIR: MyLib                       # <-- your library source dir (the ONLY dir overlaid from the PR)
   ACTION_REPO: OWNER/lean4repo-utils   # <-- the review action repo providing the guard/sandbox scripts
-  ACTION_REF: MAIN_COMMIT_SHA          # <-- pin to a post-0.3 main SHA (the guard/sandbox scripts
-                                       #     exist only on main; no tag carries them yet)
+  ACTION_REF: main                    # Track the guard, authorization and sandbox scripts on main.
   LANDRUN_VER: v0.1.14
   LANDRUN_SHA256: 645178e3239cd33760560834e50efea0864183a2a8a82faf199760dffee6dd71
 
@@ -37,18 +36,18 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # Trusted scripts (scope_guard.sh, scripts/sandbox-*.sh) come from the pinned
-      # review action, NOT the PR — so untrusted code can never alter them.
-      - name: Checkout the review action (trusted, pinned)
-        uses: actions/checkout@v4    # pin to a SHA in production
+      # Trusted scripts (scope_guard.sh, scripts/sandbox-*.sh) come from the action
+      # repository's main branch, not the PR.
+      - name: Checkout the review action (trusted main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { repository: "${{ env.ACTION_REPO }}", ref: "${{ env.ACTION_REF }}", path: rv, persist-credentials: false }
 
       - name: Checkout trusted base (credential-free)
-        uses: actions/checkout@v4    # pin to a SHA in production
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { ref: "${{ github.event.pull_request.base.ref }}", path: base, persist-credentials: false }
 
       - name: Checkout PR head into a SEPARATE dir (credential-free)
-        uses: actions/checkout@v4    # pin to a SHA in production
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: "${{ github.event.pull_request.head.repo.full_name }}"
           ref: "${{ github.event.pull_request.head.sha }}"

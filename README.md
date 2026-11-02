@@ -8,8 +8,8 @@ CLI, sharing a single OpenRouter-backed LLM layer.
 
 | Tool | What it does | Use as |
 | --- | --- | --- |
-| [`summary/`](summary/) | AI-generated summaries for Lean 4 pull requests (multi-agent pipeline: triage, per-file summaries, synthesis, optional title validation and instruction checks). | `uses: alexanderlhicks/lean4repo-utils/summary@0.3` |
-| [`review/`](review/) | AI code review for Lean 4 pull requests: spec-grounded per-file review, cross-file analysis, dependent-impact pass, adversarial finding verification, real Lean toolchain access for agents. | `uses: alexanderlhicks/lean4repo-utils/review@0.3` |
+| [`summary/`](summary/) | AI-generated summaries for Lean 4 pull requests (multi-agent pipeline: triage, per-file summaries, synthesis, optional title validation and instruction checks). | `uses: alexanderlhicks/lean4repo-utils/summary@main` |
+| [`review/`](review/) | AI code review for Lean 4 pull requests: spec-grounded per-file review, cross-file analysis, dependent-impact pass, adversarial finding verification, real Lean toolchain access for agents. | `uses: alexanderlhicks/lean4repo-utils/review@main` |
 | [`sorry-tracker/`](sorry-tracker/) | CLI that finds `sorry`/`admit` obligations in a Lean repo and opens detailed, LLM-analyzed GitHub issues for them. | `cd sorry-tracker && uv run sorry-tracker ...` |
 | [`common/`](common/) | Shared library `leanrepo-common`: the OpenRouter LLM provider (`leanrepo_common.llm_provider`), Lean 4 source utilities (`leanrepo_common.lean_utils`), and diff parsing (`leanrepo_common.diff_utils`). | dependency of the three tools |
 
@@ -54,12 +54,17 @@ Because the actions live in subdirectories of this repository, workflows
 reference them with a path:
 
 ```yaml
-- uses: alexanderlhicks/lean4repo-utils/summary@0.3   # or .../review@0.3
+- uses: alexanderlhicks/lean4repo-utils/summary@main   # or .../review@main
   with:
     github_token: ${{ secrets.GITHUB_TOKEN }}
     api_key: ${{ secrets.OPENROUTER_KEY }}
     ...
 ```
+
+Callers track `@main`, so each merge here updates their CI behavior.
+These are GitHub Actions dependencies; Lean projects do not add a Lake or Python package dependency to use them.
+Third-party actions used here are fixed to commit SHAs.
+The repository administrator should protect `main` and require passing CI before merging.
 
 Each action's README documents every input:
 [`summary/README.md`](summary/README.md) ·

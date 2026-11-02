@@ -134,7 +134,7 @@ runs:
       run: bash "${{ github.action_path }}/resolve_pr_head.sh" "$GITHUB_REPOSITORY" "$PR_NUMBER"
 
     - name: Checkout repository
-      uses: actions/checkout@v7
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         # Immutable HEAD sha (not refs/pull/N/head or a branch), so the worktree, the
         # diff, discovery, and the review annotations all anchor to ONE commit. For a
@@ -162,7 +162,7 @@ runs:
         echo "::add-mask::$GH_TOKEN_TO_MASK"
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v9.0.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       with:
         enable-cache: true
         # This is a uv workspace: the sole lockfile is one directory above this
@@ -173,7 +173,7 @@ runs:
         cache-dependency-glob: "uv.lock"
 
     - name: Set up Lean and Build
-      uses: leanprover/lean-action@v1.5.0
+      uses: leanprover/lean-action@38fbc41a8c28c4cbaec22d7f7de508ec2e7c0dd9 # v1.5.0
       with:
         # Toolchain/cache setup happens here; the explicit build below captures
         # diagnostics for the review instead of leaving the output inside this
@@ -417,7 +417,7 @@ runs:
       # Post even on a non-green run (loud-exit) so the banner/partial results are still
       # delivered — but NOT when the run was cancelled or the review step never ran.
       if: ${{ !cancelled() && steps.run_review.outcome != 'skipped' }}
-      uses: actions/github-script@v9
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
       env:
         REVIEW_TEXT: ${{ steps.run_review.outputs.review_text }}
         ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}

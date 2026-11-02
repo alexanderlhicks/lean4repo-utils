@@ -92,7 +92,7 @@ runs:
   using: "composite"
   steps:
     - name: Checkout PR Code
-      uses: actions/checkout@v7
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         ref: ${{ github.event.pull_request.head.sha }}
         fetch-depth: 0 # Fetch all history to enable diffing against base
@@ -113,7 +113,7 @@ runs:
       shell: bash
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v9.0.0
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       with:
         enable-cache: true
         # This is a uv workspace: the sole lockfile is one directory above this

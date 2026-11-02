@@ -60,7 +60,7 @@ Read this before wiring the action on a public repository.
 > code path is active. Enabling it today would give you the *appearance* of the protection
 > described below without the assurance.
 
-`review/` ships the mechanism to review **untrusted fork PRs** safely, as templates a downstream repo adopts (`pr-build.yml`, `review.yml`, and the guard/sandbox scripts). These templates and scripts exist only on `main` (post-`0.3`): pin `ACTION_REPO`/`ACTION_REF` **and** the action itself to a `main` commit SHA — pinned at `0.3` (or earlier), `LEANREPO_SANDBOX` is a **silent no-op** and the secret-bearing stage rebuilds PR Lean unsandboxed. The per-repo caller migration is tracked separately. The design:
+`review/` ships the mechanism to review **untrusted fork PRs** safely, as templates a downstream repo adopts (`pr-build.yml`, `review.yml`, and the guard/sandbox scripts). These templates and scripts exist only on `main` (post-`0.3`): set `ACTION_REF` to `main` in both templates and use the action at `@main`. At `0.3` (or earlier), `LEANREPO_SANDBOX` is a **silent no-op** and the secret-bearing stage rebuilds PR Lean unsandboxed. The per-repo caller migration is tracked separately. The design:
 
 - **Stage 1 — untrusted, sandboxed build (`pr-build.yml`).** Runs on `pull_request_target` with **no secrets** and only `contents: read` + `statuses: write`. It checks out the trusted base and the PR head into separate credential-free dirs, overlays **only** the PR's source dir onto the base — a fail-closed **scope guard** (`scope_guard.sh`) routes any PR touching the lakefile / toolchain / `scripts/` / `.github/`, at any depth, to a human — builds under **landrun** (a Landlock sandbox: offline, writes confined to `.lake`, proven to enforce by a self-test *before* any PR code runs), and posts a commit **status**. No build artifacts cross the trust boundary; only the status does.
 - **Stage 2 — trusted review (`review.yml`).** Fires on `workflow_run` **after** the build's commit status is `success` (never merely on the workflow *concluding* — a guard-routed PR skips the build yet the workflow still concludes success), or on an authorized `/review` comment (`authorize.sh` — repo-permission API with an `author_association` fallback and **distinct** exit codes so an API error is never mistaken for a grant). Secrets enter **only** here, only after the untrusted build passed. The provider key is staged to a **file** (`API_KEY_FILE`) that `review.py` reads and **unlinks before the model loop**, so no `*_KEY`/`*_TOKEN` remains in the environment; and with `LEANREPO_SANDBOX=1` the action's *own* `lake build` and every model-directed `lake env lean` seam run under landrun too (the review stage re-builds the PR code to ground the reviewer, so that build must be confined as well).
@@ -133,7 +133,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - uses: alexanderlhicks/lean4repo-utils/review@0.3
+      - uses: alexanderlhicks/lean4repo-utils/review@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_KEY }}
@@ -204,7 +204,7 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: alexanderlhicks/lean4repo-utils/review@0.3
+      - uses: alexanderlhicks/lean4repo-utils/review@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_KEY }}
