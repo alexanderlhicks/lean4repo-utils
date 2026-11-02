@@ -31,6 +31,12 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Install PDF tools for review tests
+        if: matrix.project == 'review'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y poppler-utils
+
       - name: Run unit tests
         working-directory: ${{ matrix.project }}
         run: uv run --frozen pytest tests/ -q
