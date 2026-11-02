@@ -125,7 +125,8 @@ jobs:
 
           # Optional tuning overrides (read with a default, intentionally not
           # wired into action.yml) and GitHub Actions runner built-ins are exempt.
-          optional = {'MAX_FILE_REVIEW_CHARS', 'MAX_PROMPT_CHARS', 'CONTEXT_LIMIT', 'BUILD_OUTPUT', 'GITHUB_OUTPUT'}
+          # LAKE_GRAPH is the inline fallback; the action passes LAKE_GRAPH_PATH.
+          optional = {'MAX_FILE_REVIEW_CHARS', 'MAX_PROMPT_CHARS', 'CONTEXT_LIMIT', 'BUILD_OUTPUT', 'GITHUB_OUTPUT', 'LAKE_GRAPH'}
 
           missing = read_vars - env_vars - optional
           if missing:

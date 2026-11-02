@@ -5,8 +5,8 @@ inputs:
     description: 'GitHub Token for API calls'
     required: true
   api_key:
-    description: 'OpenRouter API key'
-    required: true
+    description: 'OpenRouter API key; may be omitted when API_KEY_FILE names a caller-staged key file'
+    required: false
   pr_number:
     description: 'The Pull Request number'
     required: true
@@ -299,12 +299,45 @@ runs:
         PAPER_LEAN_EVIDENCE_OUT: ${{ runner.temp }}/lean-review-evidence-${{ github.run_id }}-${{ github.run_attempt }}.json
       run: uv run --project "${{ github.action_path }}" --no-dev --frozen python "${{ github.action_path }}/paper_lean_evidence.py"
 
+    - name: Stage review API key
+      id: stage_review_key
+      shell: bash
+      env:
+        REVIEW_API_KEY: ${{ inputs.api_key }}
+      run: |
+        # Keep the input in this shell only, before starting any child process.
+        review_key="$REVIEW_API_KEY"
+        export -n review_key
+        unset REVIEW_API_KEY
+        # The two-stage caller can provide its own staged file.
+        if [ -n "${API_KEY_FILE:-}" ]; then
+          review_key_file="$API_KEY_FILE"
+          trap 'rm -f -- "$review_key_file"' EXIT
+          test -f "$review_key_file"
+          printf 'api_key_file=%s\n' "$review_key_file" >> "$GITHUB_OUTPUT"
+          trap - EXIT
+          exit 0
+        fi
+        if [ -z "$review_key" ]; then
+          echo '::error::No review API key or staged key file was provided.'
+          exit 1
+        fi
+        umask 077
+        review_key_file=$(mktemp "$RUNNER_TEMP/lean-review-key.XXXXXXXX")
+        trap 'rm -f -- "$review_key_file"' EXIT
+        printf '%s' "$review_key" > "$review_key_file"
+        unset review_key
+        printf 'api_key_file=%s\n' "$review_key_file" >> "$GITHUB_OUTPUT"
+        trap - EXIT
+
     - name: Run AI Review Script
       shell: bash
       id: run_review
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
-        API_KEY: ${{ inputs.api_key }}
+        API_KEY_FILE: ${{ steps.stage_review_key.outputs.api_key_file }}
+        # Clear any inherited legacy key; Python reads and unlinks the staged file.
+        API_KEY: ''
         MODEL: ${{ inputs.model }}
         PR_NUMBER: ${{ inputs.pr_number }}
         # Pin the diff + the reviewed-at stamp to the checked-out SHAs (S1).
@@ -611,9 +644,14 @@ runs:
       if: always()
       shell: bash
       env:
+        API_KEY_FILE: ${{ steps.stage_review_key.outputs.api_key_file }}
         BUILD_LOG_PATH: ${{ runner.temp }}/lean-review-build-${{ github.run_id }}-${{ github.run_attempt }}.log
         LAKE_GRAPH_OUT: ${{ runner.temp }}/lean-review-graph-${{ github.run_id }}-${{ github.run_attempt }}.json
         PAPER_LEAN_EVIDENCE_OUT: ${{ runner.temp }}/lean-review-evidence-${{ github.run_id }}-${{ github.run_attempt }}.json
       run: |
+        # Also remove the key if review never reached its loader.
+        if [ -n "$API_KEY_FILE" ]; then
+          rm -f -- "$API_KEY_FILE"
+        fi
         rm -f "$BUILD_LOG_PATH" "$LAKE_GRAPH_OUT" "$PAPER_LEAN_EVIDENCE_OUT"
         rm -f ./review_annotations.json ./review_comments.json ./review_health.json
