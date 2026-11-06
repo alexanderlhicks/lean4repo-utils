@@ -173,7 +173,7 @@ runs:
         cache-dependency-glob: "uv.lock"
 
     - name: Set up Lean and Build
-      uses: leanprover/lean-action@v1.5.0
+      uses: leanprover/lean-action@v1.7.0
       with:
         # Toolchain/cache setup happens here; the explicit build below captures
         # diagnostics for the review instead of leaving the output inside this
